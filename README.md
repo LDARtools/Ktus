@@ -73,7 +73,7 @@ The following optional [Tus protocol extensions](https://tus.io/protocols/resuma
 * [Checksum](https://tus.io/protocols/resumable-upload#checksum)
 * [Termination](https://tus.io/protocols/resumable-upload#termination)
 * [Concatenation](https://tus.io/protocols/resumable-upload#concatenation)
-* File read locks (optional) are not supported by `OkioTusFile` because file read locks are not supported by Okio. If you want this feature, please upvote https://github.com/square/okio/issues/1464.
+* File read locks (optional) are not supported by `OkioTusFile` because file read locks are not supported by Okio. If you want this feature, please upvote this issue https://github.com/square/okio/issues/1464.
 * File locks (optional) are volatile. They will survive an application restart.
 
 ## Documentation
@@ -123,7 +123,7 @@ Whatever the source of the `ITusFile`, it MUST be re-readable. By its nature, Tu
 
 While Ktus does provide an `ITusFile` implementation built using [Okio](https://github.com/square/okio).
 This implementation should work for all platforms supported by Okio.
-In order to keep the dependencies of Ktus at minimum, the `OkioTusFile` is provided in a seperate module.
+In order to keep the dependencies of Ktus at minimum, the `OkioTusFile` is provided in a separate module.
 
 ### File locks
 
@@ -131,10 +131,24 @@ The `uploadTus` function has a parameter that enables a file lock. This will loc
 
 ## Future Work
 
-- [ ] Update README.md
-- [ ] Create an icon for Ktus
-- [ ] Remove Fibonacci code
+- [x] Update README.md
+- [x] Create an icon for Ktus
+- [ ] Remove Fibonacci example code
 - [ ] Add Unit tests
 - [ ] Publish alpha version
 
 ---
+
+## Other resources
+
+* Please find the detailed guide [here](https://www.jetbrains.com/help/kotlin-multiplatform-dev/multiplatform-publish-libraries.html).
+* [Publishing via the Central Portal](https://central.sonatype.org/publish-ea/publish-ea-guide/)
+* [Gradle Maven Publish Plugin \- Publishing to Maven Central](https://vanniktech.github.io/gradle-maven-publish-plugin/central/)
+
+## What is it?
+
+This repository contains a simple library project, intended to demonstrate a [Kotlin Multiplatform](https://kotlinlang.org/docs/multiplatform.html) library that is deployable to [Maven Central](https://central.sonatype.com/).
+
+The library has only one function: generate the [Fibonacci sequence](https://en.wikipedia.org/wiki/Fibonacci_sequence) starting from platform-provided numbers. Also, it has a test for each platform just to be sure that tests run.
+
+Note that no other actions or tools usually required for the library development are set up, such as [tracking of backwards compatibility](https://kotlinlang.org/docs/jvm-api-guidelines-backward-compatibility.html#tools-designed-to-enforce-backward-compatibility), explicit API mode, licensing, contribution guideline, code of conduct and others. You can find a guide for best practices for designing Kotlin libraries [here](https://kotlinlang.org/docs/api-guidelines-introduction.html).
