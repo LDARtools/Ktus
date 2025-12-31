@@ -7,7 +7,7 @@ plugins {
     alias(libs.plugins.vanniktech.mavenPublish)
 }
 
-group = "io.github.ldartools"
+group = "com.ldartools"
 version = "1.0.0"
 
 kotlin {
@@ -53,11 +53,11 @@ mavenPublishing {
 
     signAllPublications()
 
-    coordinates(group.toString(), "library", version.toString())
+    coordinates(group.toString(), "ktus", version.toString())
 
     pom {
         name = "Ktus"
-        description = "A library."
+        description = "Ktus is a multiplatform client library for uploading files using the tus resumable upload protocol to any remote server supporting it. It is build on top of the Ktor client library and supports all platforms supported by Ktor."
         inceptionYear = "2025"
         url = "https://github.com/LDARtools/Ktus"
         licenses {
@@ -72,6 +72,11 @@ mavenPublishing {
                 id = "ldartools"
                 name = "LDARtools, Inc."
                 url = "https://github.com/LDARtools"
+            }
+            developer {
+                id = "chrisg32"
+                name = "Chris Gonzales"
+                url = "https://github.com/chrisg32"
             }
         }
         scm {

@@ -29,3 +29,7 @@ replay_pid*
 /Source/.idea
 /Source/library/build
 /Source/build
+/.gradle
+/.idea
+/build
+/library/build
