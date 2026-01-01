@@ -32,3 +32,5 @@ replay_pid*
 /.idea
 /build
 /library/build
+/ktus-okio/build
+/ktus/build
