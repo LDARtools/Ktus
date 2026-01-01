@@ -1,4 +1,4 @@
-package io.github.ldartools.ktus
+package com.ldartools.ktus
 
 import io.ktor.utils.io.ByteReadChannel
 

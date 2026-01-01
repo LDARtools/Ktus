@@ -15,3 +15,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "ktus"
 include(":ktus")
+include(":ktus-okio")

@@ -1,4 +1,4 @@
-package io.github.ldartools.ktus
+package com.ldartools.ktus
 
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.ClientRequestException

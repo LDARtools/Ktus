@@ -1,4 +1,4 @@
-package io.github.ldartools.ktus
+package com.ldartools.ktus
 import kotlinx.io.IOException
 
 open class TusProtocolException(message: String) : IOException(message)

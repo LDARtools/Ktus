@@ -1,4 +1,4 @@
-package io.github.ldartools.ktus
+package com.ldartools.ktus
 
 import io.ktor.http.ContentType
 import io.ktor.http.content.OutgoingContent
