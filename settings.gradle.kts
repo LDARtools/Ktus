@@ -14,4 +14,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "ktus"
-include(":library")
+include(":ktus")
