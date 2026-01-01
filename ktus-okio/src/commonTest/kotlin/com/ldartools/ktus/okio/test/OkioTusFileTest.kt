@@ -1,18 +1,18 @@
-package com.ldartools.ktus.okio.test
+package com.ldartools.ktus.okio.test.com.ldartools.ktus.okio.test
 
+import com.ldartools.ktus.okio.toTusFile
+import io.ktor.utils.io.core.readBytes
+import io.ktor.utils.io.readRemaining
+import kotlinx.coroutines.test.runTest
+import okio.FileSystem
+import okio.Path.Companion.toPath
+import okio.SYSTEM
+import okio.buffer
+import okio.use
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 import kotlin.test.fail
-import kotlinx.coroutines.test.runTest
-import okio.FileSystem
-import okio.Path.Companion.toPath
-import okio.buffer
-import okio.use
-import com.ldartools.ktus.okio.toTusFile
-import io.ktor.utils.io.readRemaining
-import io.ktor.utils.io.core.readBytes
-import okio.SYSTEM
 
 class OkioTusFileTest {
 
@@ -25,7 +25,7 @@ class OkioTusFileTest {
 
         try {
             // Write file
-            FileSystem.SYSTEM.sink(path).buffer().use { sink ->
+            FileSystem.Companion.SYSTEM.sink(path).buffer().use { sink ->
                 sink.write(content)
             }
 
@@ -43,7 +43,7 @@ class OkioTusFileTest {
             assertTrue(content.contentEquals(read))
         } finally {
             try {
-                if (FileSystem.SYSTEM.exists(path)) FileSystem.SYSTEM.delete(path)
+                if (FileSystem.Companion.SYSTEM.exists(path)) FileSystem.Companion.SYSTEM.delete(path)
             } catch (_: Exception) {
                 // ignore cleanup errors
             }
@@ -56,7 +56,7 @@ class OkioTusFileTest {
         val content = ByteArray(512) { (it and 0xFF).toByte() } // 512 bytes
 
         try {
-            FileSystem.SYSTEM.sink(path).buffer().use { it.write(content) }
+            FileSystem.Companion.SYSTEM.sink(path).buffer().use { it.write(content) }
 
             val tusFile = path.toTusFile()
 
@@ -78,7 +78,7 @@ class OkioTusFileTest {
             assertTrue(read2.size < requestLength)
         } finally {
             try {
-                if (FileSystem.SYSTEM.exists(path)) FileSystem.SYSTEM.delete(path)
+                if (FileSystem.Companion.SYSTEM.exists(path)) FileSystem.Companion.SYSTEM.delete(path)
             } catch (_: Exception) {
                 // ignore cleanup errors
             }
@@ -89,7 +89,7 @@ class OkioTusFileTest {
     fun testFileReadLockThrowsNotImplemented() = runTest {
         val path = makeTestPath("okio_tus_test_lock.bin")
         try {
-            FileSystem.SYSTEM.sink(path).buffer().use { it.write(byteArrayOf(1, 2, 3)) }
+            FileSystem.Companion.SYSTEM.sink(path).buffer().use { it.write(byteArrayOf(1, 2, 3)) }
 
             val tusFile = path.toTusFile()
 
@@ -101,7 +101,7 @@ class OkioTusFileTest {
             }
         } finally {
             try {
-                if (FileSystem.SYSTEM.exists(path)) FileSystem.SYSTEM.delete(path)
+                if (FileSystem.Companion.SYSTEM.exists(path)) FileSystem.Companion.SYSTEM.delete(path)
             } catch (_: Exception) {
                 // ignore cleanup errors
             }
