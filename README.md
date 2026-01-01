@@ -9,6 +9,9 @@
 ## Usage
 
 ```kotlin
+import com.ldartools.ktus.uploadTus
+import com.ldartools.ktus.okio.OkioTusFile
+
 //Create an ITusFile instance. Here we use the OkioTusFile as an example.
 val file = OkioTusFile(filePath)
 
