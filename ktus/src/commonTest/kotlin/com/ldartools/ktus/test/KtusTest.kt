@@ -1,6 +1,7 @@
 package com.ldartools.ktus.test
 
-import com.ldartools.ktus.uploadTus
+import com.ldartools.ktus.TusUploadOptions
+import com.ldartools.ktus.createAndUploadTus
 import io.ktor.client.*
 import io.ktor.client.engine.mock.*
 import io.ktor.http.*
@@ -65,11 +66,10 @@ class KtusTest {
         val client = HttpClient(engine)
 
         // Call the function under test; it should complete successfully and advance to file size
-        client.uploadTus(
+        client.createAndUploadTus(
             createUrl = "https://example.com/files",
             file = testFile,
-            chunkSize = 256L,
-            checkServerCapabilities = true
+            options = TusUploadOptions(chunkSize = 256L, checkServerCapabilities = true),
         )
 
         // After upload, serverOffset should equal file size
