@@ -13,7 +13,7 @@ internal suspend fun <T> retryWithBackoff(
     block: suspend () -> T
 ): T {
     var currentDelay = options.initialDelayMillis
-    repeat(options.times - 1) {
+    repeat(options.maxRetries - 1) {
         try {
             return block()
         } catch (e: ClientRequestException) {
