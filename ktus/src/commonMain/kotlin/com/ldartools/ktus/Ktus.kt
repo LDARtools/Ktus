@@ -46,42 +46,46 @@ private suspend fun HttpClient.createTus(createUrl: String,
                                  block: suspend HttpRequestBuilder.() -> Unit = {},
                                  fileLockHandled: Boolean
                                  ) : String {
-    if (options.checkServerCapabilities) {
-        // Optional: Before the "Create Upload" phase
-        val optionsResponse = retryWithBackoff(options.retryOptions) { this.options(urlString = createUrl) {
-            tusVersionHeader()
-            block()
+    val fileLock = if (options.useFileLock && !fileLockHandled) file.fileReadLock() else AutoCloseable {}
+    fileLock.use {
+        if (options.checkServerCapabilities) {
+            // Optional: Before the "Create Upload" phase
+            val optionsResponse = retryWithBackoff(options.retryOptions) {
+                this.options(urlString = createUrl) {
+                    tusVersionHeader()
+                    block()
+                }
+            }
+            if (optionsResponse.headers["Tus-Resumable"] == null) {
+                throw TusProtocolException("Server does not support tus protocol.")
+            }
+            //todo You could also check for supported versions if the server returns Tus-Version
         }
+
+        val createResponse = retryWithBackoff(options.retryOptions) {
+            this.post(urlString = createUrl) {
+                header("Upload-Length", file.size.toString())
+                tusVersionHeader()
+                header("Upload-Metadata", encodeMetadata(metadata))
+                block()
+            }
         }
-        if (optionsResponse.headers["Tus-Resumable"] == null) {
-            throw TusProtocolException("Server does not support tus protocol.")
+
+        if (createResponse.status != HttpStatusCode.Created) {
+            throw TusProtocolException("Failed to create upload: ${createResponse.status}")
         }
-        //todo You could also check for supported versions if the server returns Tus-Version
-    }
 
-    val createResponse = retryWithBackoff(options.retryOptions) {
-        this.post(urlString = createUrl) {
-            header("Upload-Length", file.size.toString())
-            tusVersionHeader()
-            header("Upload-Metadata", encodeMetadata(metadata))
-            block()
+        var uploadUrl = createResponse.headers["Location"]
+            ?: throw TusProtocolException("Server did not provide a Location header")
+
+        //need to append the uploadUrl to the root of the createUrl
+        val serverRoot = createUrl.getRootUrl() ?: ""
+        if (!uploadUrl.startsWith(serverRoot, ignoreCase = true)) {
+            uploadUrl = "$serverRoot$uploadUrl"
         }
+
+        return uploadUrl
     }
-
-    if (createResponse.status != HttpStatusCode.Created) {
-        throw TusProtocolException("Failed to create upload: ${createResponse.status}")
-    }
-
-    var uploadUrl = createResponse.headers["Location"]
-        ?: throw TusProtocolException("Server did not provide a Location header")
-
-    //need to append the uploadUrl to the root of the createUrl
-    val serverRoot = createUrl.getRootUrl() ?: ""
-    if (!uploadUrl.startsWith(serverRoot, ignoreCase = true)) {
-        uploadUrl = "$serverRoot$uploadUrl"
-    }
-
-    return uploadUrl
 }
 
 /**
@@ -126,58 +130,61 @@ private suspend fun HttpClient.uploadTus(
     block: suspend HttpRequestBuilder.() -> Unit = {},
     fileLockHandled: Boolean
 ) {
-    var offset: Long
+    val fileLock = if (options.useFileLock && !fileLockHandled) file.fileReadLock() else AutoCloseable {}
+    fileLock.use {
+        var offset: Long
 
-    //initial head check to see if file is already uploaded
-    offset = retryWithBackoff(options.retryOptions) { headRequest(this, uploadUrl, block) }
+        //initial head check to see if file is already uploaded
+        offset = retryWithBackoff(options.retryOptions) { headRequest(this, uploadUrl, block) }
 
-    /*
+        /*
      * Phase 2: Upload Chunks
      */
-    while (offset < file.size) {
-        // 1. Calculate chunk size
-        val bytesRemaining = file.size - offset
-        val currentChunkSize = min(options.chunkSize, bytesRemaining)
+        while (offset < file.size) {
+            // 1. Calculate chunk size
+            val bytesRemaining = file.size - offset
+            val currentChunkSize = min(options.chunkSize, bytesRemaining)
 
-        // 2. Prepare the stream
-        val chunk = file.readSection(offset, currentChunkSize)
+            // 2. Prepare the stream
+            val chunk = file.readSection(offset, currentChunkSize)
 
-        // 3. Send PATCH request
-        val patchResponse = retryWithBackoff(options.retryOptions) {
-            this.patch(urlString = uploadUrl) {
-                tusVersionHeader()
-                header("Upload-Offset", offset.toString())
-                header("Content-Length", currentChunkSize.toString())
-                setBody(TusPatchContent(chunk, currentChunkSize))
+            // 3. Send PATCH request
+            val patchResponse = retryWithBackoff(options.retryOptions) {
+                this.patch(urlString = uploadUrl) {
+                    tusVersionHeader()
+                    header("Upload-Offset", offset.toString())
+                    header("Content-Length", currentChunkSize.toString())
+                    setBody(TusPatchContent(chunk, currentChunkSize))
 
-                // Progress listener hook (Ktor capability)
-                onUpload { bytesSentTotal, _ ->
-                    onProgress?.invoke(offset + bytesSentTotal, file.size)
+                    // Progress listener hook (Ktor capability)
+                    onUpload { bytesSentTotal, _ ->
+                        onProgress?.invoke(offset + bytesSentTotal, file.size)
+                    }
+                    block()
                 }
-                block()
             }
+
+            // 4. Verify Response
+            if (patchResponse.status != HttpStatusCode.NoContent) {
+
+                // Handle failure
+                offset = retryWithBackoff(options.retryOptions) { headRequest(this, uploadUrl, block) }
+
+                continue
+            }
+
+            // 5. Update Offset
+            val serverOffset = patchResponse.headers["Upload-Offset"]?.toLongOrNull()
+                ?: throw TusProtocolException("Missing Upload-Offset in PATCH response")
+
+            // Validate offset advancement
+            if (serverOffset <= offset) {
+                // This implies no data was written. Potential infinite loop if not handled.
+                throw TusOffsetMismatchException("Server returned an invalid offset: $serverOffset")
+            }
+
+            offset = serverOffset
         }
-
-        // 4. Verify Response
-        if (patchResponse.status != HttpStatusCode.NoContent) {
-
-            // Handle failure
-            offset = retryWithBackoff(options.retryOptions) { headRequest(this, uploadUrl, block) }
-
-            continue
-        }
-
-        // 5. Update Offset
-        val serverOffset = patchResponse.headers["Upload-Offset"]?.toLongOrNull()
-            ?: throw TusProtocolException("Missing Upload-Offset in PATCH response")
-
-        // Validate offset advancement
-        if (serverOffset <= offset) {
-            // This implies no data was written. Potential infinite loop if not handled.
-            throw TusOffsetMismatchException("Server returned an invalid offset: $serverOffset")
-        }
-
-        offset = serverOffset
     }
 }
 
