@@ -211,7 +211,7 @@ suspend fun HttpClient.createAndUploadTus(
         /*
          * Phase 1: Create Upload
          */
-        val uploadUrl = createTus(createUrl, file, metadata, options, fileLockHandled = true)
+        val uploadUrl = createTus(createUrl, file, metadata, options, block, fileLockHandled = true)
         onCreate?.invoke(uploadUrl)
 
         /*
