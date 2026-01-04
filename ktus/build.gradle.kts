@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "com.ldartools"
-version = "1.0.0_alpha1"
+version = "1.0.0_beta1"
 
 kotlin {
     jvm()
