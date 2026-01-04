@@ -73,7 +73,7 @@ httpClient.createAndUploadTus(createUrl = url, file = file, options = options, o
 
 ### Persisting the upload URL for continuation
 
-Ktus does not have a built -in persistence mechanism, but it provides the necessary hooks to allow you to persist the upload URL so that uploads can be resumed later.
+Ktus does not have a built-in persistence mechanism, but it provides the necessary hooks to allow you to persist the upload URL so that uploads can be resumed later.
 
 You can save the returned `uploadUrl` (for example, to local storage or a database) and later resume the upload by calling `uploadTus` with that URL.
 
