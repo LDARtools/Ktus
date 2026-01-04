@@ -53,6 +53,7 @@ Customize upload behavior (chunk size, retries, protocol extensions, file lockin
 
 ```kotlin
 // import com.ldartools.ktus.TusUploadOptions
+// import com.ldartools.ktus.RetryOptions
 
 val options = TusUploadOptions(
     checkServerCapabilities = true,
