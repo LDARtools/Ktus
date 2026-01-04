@@ -8,27 +8,162 @@
 
 ## Usage
 
-```kotlin
-import com.ldartools.ktus.uploadTus
-import com.ldartools.ktus.okio.OkioTusFile
+Below are several usage examples showing basic and advanced flows.
 
-//Create an ITusFile instance. Here we use the OkioTusFile as an example.
+### Basic
+
+Ktus has a convenience function that combines both the create and upload phases of a Tus upload into a single call.
+
+```kotlin
+// import com.ldartools.ktus.createAndUploadTus
+// import com.ldartools.ktus.okio.OkioTusFile
+
 val file = OkioTusFile(filePath)
 
-//Create an object for holding any metadata (optional)
-val metadata = mapOf(
-    "fileCreated" to fileCreatedDate.toString(),
-    "meaningOfLife" to 42.toString(),
-    //...
-)
-
-//uploadTus is an extension function on the Ktor HttpClient
-httpClient.uploadTus(createUrl = url, file = file, metadata = metadata, onProgress = onProgress){
-    //here you can call any Ktor domain functions just like any other Ktor client API call
+httpClient.createAndUploadTus(createUrl = url, file = file, metadata = mapOf("filename" to file.name)) { 
+    // optional per-request configuration
     setAuthorizationHeader(anonymous = false)
-    //...
 }
 ```
+
+### Create and upload separately
+
+You can also split the create and upload phases into separate calls. This is useful for persisting the upload URL for later continuation or other advanced use cases where upload might not need to start right away.
+
+```kotlin
+// import com.ldartools.ktus.createTus
+// import com.ldartools.ktus.uploadTus
+// import com.ldartools.ktus.okio.OkioTusFile
+
+val file = OkioTusFile(filePath)
+
+// 1) Create the upload on the server and get the upload URL
+val uploadUrl = httpClient.createTus(createUrl = url, file = file, metadata = mapOf("filename" to file.name))
+
+// 2) Upload the file to the returned upload URL
+httpClient.uploadTus(uploadUrl = uploadUrl, file = file) {
+    // optional per-request configuration
+    setAuthorizationHeader(anonymous = false)
+}
+```
+
+### Passing options
+
+Customize upload behavior (chunk size, retries, protocol extensions, file locking, etc.) via `TusUploadOptions`.
+
+```kotlin
+// import com.ldartools.ktus.TusUploadOptions
+// import com.ldartools.ktus.RetryOptions
+
+val options = TusUploadOptions(
+    checkServerCapabilities = true,
+    chunkSize = 4 * 1024 * 1024, // 4 MB
+    useFileLock = false,
+    retryOptions = RetryOptions(
+        maxRetries = 5,
+        initialDelayMillis = 1_000L,
+        maxDelayMillis = 60_000L,
+        factor = 2.0
+    )
+)
+
+httpClient.createAndUploadTus(createUrl = url, file = file, options = options, onProgress = { sent, total ->
+    println("Uploaded $sent / $total")
+})
+```
+
+### Persisting the upload URL for continuation
+
+Ktus does not have a built-in persistence mechanism, but it provides the necessary hooks to allow you to persist the upload URL so that uploads can be resumed later.
+
+You can save the returned `uploadUrl` (for example, to local storage or a database) and later resume the upload by calling `uploadTus` with that URL.
+
+```kotlin
+// Persist the uploadUrl after creation
+val uploadUrl = httpClient.createTus(createUrl = url, file = file)
+saveToLocalStore("pendingUploadUrl", uploadUrl)
+
+// Later (possibly after app restart) retrieve and resume
+val persisted = loadFromLocalStore("pendingUploadUrl")
+if (persisted != null) {
+    httpClient.uploadTus(uploadUrl = persisted, file = file)
+}
+```
+
+If you prefer a single call that still allows persisting the upload URL immediately after creation, use `createAndUploadTus` with an `onCreate` callback.
+
+```kotlin
+httpClient.createAndUploadTus(createUrl = url, file = file, onCreate = { uploadUrl ->
+    // Persist the upload URL so you can resume later if needed
+    saveToLocalStore("pendingUploadUrl", uploadUrl)
+}, onProgress = { sent, total ->
+    println("Uploaded $sent / $total")
+})
+```
+
+### Pause and resume uploads
+
+If you want to pause and resume uploads, you can achieve this by managing the upload coroutine job yourself.
+
+```kotlin
+//import kotlinx.coroutines.*
+
+val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+var persistedUploadUrl: String? = null
+lateinit var uploadJob: Job
+
+// Start (create + upload) and persist uploadUrl immediately via onCreate
+fun startUpload(httpClient: HttpClient, createUrl: String, file: ITusFile, options: TusUploadOptions) {
+    uploadJob = scope.launch {
+        try {
+            httpClient.createAndUploadTus(
+                createUrl = createUrl,
+                file = file,
+                options = options,
+                onProgress = { sent, total -> println("Uploaded $sent / $total") },
+                onCreate = { url ->
+                    // persist the url to disk/db if you want durable resume across restarts
+                    persistedUploadUrl = url
+                }
+            )
+        } catch (e: CancellationException) {
+            // paused by caller — safe to ignore or log
+        } catch (t: Throwable) {
+            // handle other errors
+        }
+    }
+}
+
+// Pause (cancel the running job)
+suspend fun pauseUpload() {
+    if (::uploadJob.isInitialized && uploadJob.isActive) {
+        uploadJob.cancelAndJoin() // stops the upload coroutine and waits for cleanup
+    }
+}
+
+// Resume (use persistedUploadUrl)
+fun resumeUpload(httpClient: HttpClient, file: ITusFile, options: TusUploadOptions) {
+    val url = persistedUploadUrl ?: throw IllegalStateException("No persisted upload URL")
+    scope.launch {
+        try {
+            httpClient.uploadTus(
+                uploadUrl = url,
+                file = file,
+                options = options,
+                onProgress = { sent, total -> println("Uploaded $sent / $total") }
+            )
+        } catch (e: CancellationException) {
+            // paused again
+        } catch (t: Throwable) {
+            // handle other errors
+        }
+    }
+}
+```
+
+Notes:
+- `OkioTusFile` is a convenient `ITusFile` implementation; you can implement `ITusFile` differently for other platforms.
+- `onProgress` receives (sent, total) bytes and can be used to update UI progress bars.
 
 ## Installation
 
