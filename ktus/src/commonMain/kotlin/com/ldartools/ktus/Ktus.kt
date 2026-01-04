@@ -87,10 +87,15 @@ private suspend fun HttpClient.createTus(createUrl: String,
 /**
  * Upload the provided [file] to an existing tus upload at [uploadUrl].
  *
- * This is a convenience overload that performs the upload using the configured
- * [options], reporting progress via [onProgress] and allowing request
- * customization via [block]. It delegates to the private implementation that
- * accepts an explicit `fileLockHandled` flag (set to `false` here).
+ * This is the primary entry point for performing a resumable tus upload with
+ * the given [options]. It handles creating and sending chunked PATCH requests,
+ * resuming from the server-reported offset when possible, and validating
+ * protocol-specific headers and status codes.
+ *
+ * Progress can be observed via [onProgress], which is invoked with the number
+ * of bytes sent and the total size of [file]. The [block] parameter can be
+ * used to customize each underlying HTTP request (for example, to add custom
+ * headers or authentication).
  *
  * @receiver HttpClient Ktor HTTP client used for requests.
  * @param uploadUrl Absolute URL of the tus upload resource (returned by server on create).
