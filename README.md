@@ -1,5 +1,7 @@
 # Ktus ([Kotlin Multiplatform](https://kotlinlang.org/multiplatform/) + [Ktor](https://ktor.io/) + [Tus](https://tus.io))
 
+[![Maven Central](https://img.shields.io/maven-central/v/com.ldartools/ktus.svg)](https://search.maven.org/artifact/com.ldartools/ktus)
+
 <img alt="Ktus Logo" height="100" src="./Ktus.svg" title="Logo"/>
 
 > tus is a protocol based on HTTP for resumable file uploads. Resumable means that an upload can be interrupted at any moment and can be resumed without re-uploading the previous data again. An interruption may happen willingly, if the user wants to pause, or by accident in case of a network issue or server outage.
