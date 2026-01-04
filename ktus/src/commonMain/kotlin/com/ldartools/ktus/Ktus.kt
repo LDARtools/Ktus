@@ -77,7 +77,7 @@ private suspend fun HttpClient.createTus(createUrl: String,
 
     //need to append the uploadUrl to the root of the createUrl
     val serverRoot = createUrl.getRootUrl() ?: ""
-    if(!uploadUrl.startsWith(serverRoot, ignoreCase = true)) {
+    if (!uploadUrl.startsWith(serverRoot, ignoreCase = true)) {
         uploadUrl = "$serverRoot$uploadUrl"
     }
 
