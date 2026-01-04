@@ -10,7 +10,7 @@ package com.ldartools.ktus
  */
 data class RetryOptions(
     val times:Int = 3,
-    val initialDelayMillis:Long = 500,
-    val maxDelayMillis:Long = 10000,
+    val initialDelayMillis:Long = 500L,
+    val maxDelayMillis:Long = 10_000L,
     val factor: Double = 2.0
 )
