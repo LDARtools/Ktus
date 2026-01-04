@@ -46,7 +46,7 @@ private suspend fun HttpClient.createTus(createUrl: String,
                                  block: suspend HttpRequestBuilder.() -> Unit = {},
                                  fileLockHandled: Boolean
                                  ) : String {
-    if(options.checkServerCapabilities) {
+    if (options.checkServerCapabilities) {
         // Optional: Before the "Create Upload" phase
         val optionsResponse = retryWithBackoff(options.retryOptions) { this.options(urlString = createUrl) {
             tusVersionHeader()
