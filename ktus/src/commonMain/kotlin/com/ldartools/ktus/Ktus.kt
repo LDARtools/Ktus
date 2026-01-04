@@ -206,7 +206,7 @@ suspend fun HttpClient.createAndUploadTus(
     onCreate: ((uploadUrl: String) -> Unit)? = null,
     block: suspend HttpRequestBuilder.() -> Unit = {}
 ) {
-    val fileLock = if(options.useFileLock) file.fileReadLock() else AutoCloseable {}
+    val fileLock = if (options.useFileLock) file.fileReadLock() else AutoCloseable {}
     fileLock.use {
         /*
          * Phase 1: Create Upload
