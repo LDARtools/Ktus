@@ -14,6 +14,22 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.util.encodeBase64
 import kotlin.math.min
 
+/**
+ * Create a new tus upload on the server and return the upload URL.
+ *
+ * Performs the "Create Upload" step of the tus protocol by sending a POST to [createUrl].
+ * If [options.checkServerCapabilities] is true, an OPTIONS request is sent first to verify
+ * the server supports the tus protocol.
+ *
+ * @receiver HttpClient The Ktor HTTP client used to send requests.
+ * @param createUrl The endpoint used to create the upload (server create URL).
+ * @param file The file to be uploaded; its size is sent as the `Upload-Length` header.
+ * @param metadata Optional metadata sent as `Upload-Metadata`.
+ * @param options Upload options controlling retries, chunk size and capability checks.
+ * @param block Optional lambda to customize the underlying HTTP request builder.
+ * @return The upload URL returned by the server (from the `Location` header).
+ * @throws TusProtocolException If the server does not support tus, creation fails, or the server omits a valid Location header.
+ */
 suspend fun HttpClient.createTus(createUrl: String,
                                  file: ITusFile,
                                  metadata: Map<String, String> = emptyMap(),
@@ -23,7 +39,6 @@ suspend fun HttpClient.createTus(createUrl: String,
     return createTus(createUrl, file, metadata, options, block, fileLockHandled = false)
 }
 
-//TODO docs
 private suspend fun HttpClient.createTus(createUrl: String,
                                  file: ITusFile,
                                  metadata: Map<String, String> = emptyMap(),
@@ -69,6 +84,25 @@ private suspend fun HttpClient.createTus(createUrl: String,
     return uploadUrl
 }
 
+/**
+ * Upload the provided [file] to an existing tus upload at [uploadUrl].
+ *
+ * This is a convenience overload that performs the upload using the configured
+ * [options], reporting progress via [onProgress] and allowing request
+ * customization via [block]. It delegates to the private implementation that
+ * accepts an explicit `fileLockHandled` flag (set to `false` here).
+ *
+ * @receiver HttpClient Ktor HTTP client used for requests.
+ * @param uploadUrl Absolute URL of the tus upload resource (returned by server on create).
+ * @param file The file to upload; must implement [ITusFile].
+ * @param options Upload options controlling retries, chunk size and capability checks.
+ * @param onProgress Optional progress callback invoked with `(sent, total)` bytes.
+ * @param block Optional lambda to customize the underlying HTTP request builder for each request.
+ *
+ * @throws TusProtocolException When the server response does not follow the tus protocol.
+ * @throws TusUploadExpiredException If the server reports the upload as expired or missing.
+ * @throws TusOffsetMismatchException If the server returns a non-advancing offset.
+ */
 suspend fun HttpClient.uploadTus(
     uploadUrl: String,
     file: ITusFile,
@@ -79,7 +113,6 @@ suspend fun HttpClient.uploadTus(
     uploadTus(uploadUrl, file, options, onProgress, block, fileLockHandled = false)
 }
 
-//TODO docs
 private suspend fun HttpClient.uploadTus(
     uploadUrl: String,
     file: ITusFile,
@@ -143,7 +176,27 @@ private suspend fun HttpClient.uploadTus(
     }
 }
 
-//TODO docs
+
+/**
+ * Create a new tus upload on the server and upload the provided [file].
+ *
+ * This function performs both phases of the tus flow:
+ * 1. Creates the upload on the server by calling [createTus] and invokes [onCreate] with the returned upload URL.
+ * 2. Uploads the file in chunks by calling [uploadTus], reporting progress via [onProgress].
+ *
+ * @receiver HttpClient The Ktor HTTP client used to perform requests.
+ * @param createUrl The server endpoint used to create the upload.
+ * @param file The file to upload; must implement [ITusFile].
+ * @param metadata Optional metadata sent as `Upload-Metadata` during creation.
+ * @param options Upload options controlling retries, chunk size and capability checks.
+ * @param onProgress Optional callback invoked with `(sent, total)` bytes during upload.
+ * @param onCreate Optional callback invoked with the upload URL returned by the server after creation.
+ * @param block Optional lambda to customize the underlying [HttpRequestBuilder] for requests.
+ *
+ * @throws TusProtocolException If the server responses do not follow the tus protocol.
+ * @throws TusUploadExpiredException If the server reports the upload as expired or missing.
+ * @throws TusOffsetMismatchException If the server returns a non-advancing offset during upload.
+ */
 suspend fun HttpClient.createAndUploadTus(
     createUrl: String,
     file: ITusFile,
