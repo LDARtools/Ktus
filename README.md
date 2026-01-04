@@ -100,6 +100,66 @@ httpClient.createAndUploadTus(createUrl = url, file = file, onCreate = { uploadU
 })
 ```
 
+### Pause and resume uploads
+
+If you want to pause and resume uploads, you can achieve this by managing the upload coroutine job yourself.
+
+```kotlin
+//import kotlinx.coroutines.*
+
+val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+var persistedUploadUrl: String? = null
+lateinit var uploadJob: Job
+
+// Start (create + upload) and persist uploadUrl immediately via onCreate
+fun startUpload(httpClient: HttpClient, createUrl: String, file: ITusFile, options: TusUploadOptions) {
+    uploadJob = scope.launch {
+        try {
+            httpClient.createAndUploadTus(
+                createUrl = createUrl,
+                file = file,
+                options = options,
+                onProgress = { sent, total -> println("Uploaded $sent / $total") },
+                onCreate = { url ->
+                    // persist the url to disk/db if you want durable resume across restarts
+                    persistedUploadUrl = url
+                }
+            )
+        } catch (e: CancellationException) {
+            // paused by caller — safe to ignore or log
+        } catch (t: Throwable) {
+            // handle other errors
+        }
+    }
+}
+
+// Pause (cancel the running job)
+suspend fun pauseUpload() {
+    if (::uploadJob.isInitialized && uploadJob.isActive) {
+        uploadJob.cancelAndJoin() // stops the upload coroutine and waits for cleanup
+    }
+}
+
+// Resume (use persistedUploadUrl)
+fun resumeUpload(httpClient: HttpClient, file: ITusFile, options: TusUploadOptions) {
+    val url = persistedUploadUrl ?: throw IllegalStateException("No persisted upload URL")
+    scope.launch {
+        try {
+            httpClient.uploadTus(
+                uploadUrl = url,
+                file = file,
+                options = options,
+                onProgress = { sent, total -> println("Uploaded $sent / $total") }
+            )
+        } catch (e: CancellationException) {
+            // paused again
+        } catch (t: Throwable) {
+            // handle other errors
+        }
+    }
+}
+```
+
 Notes:
 - `OkioTusFile` is a convenient `ITusFile` implementation; you can implement `ITusFile` differently for other platforms.
 - `onProgress` receives (sent, total) bytes and can be used to update UI progress bars.
