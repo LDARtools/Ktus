@@ -100,15 +100,17 @@ class RetryTest {
     @Test
     fun `exponential backoff delays are correct`() = runTest {
         var attempts = 0
+        var expectedElapsed = 0.0
         val startTime = currentTime
         assertFailsWith<IOException> {
             retryWithBackoff(defaultOptions) {
                 attempts++
                 if (attempts > 1) {
-                    val expectedDelay = defaultOptions.initialDelayMillis * defaultOptions.factor.pow((attempts - 2).toDouble())
+                    val stepDelay = defaultOptions.initialDelayMillis * defaultOptions.factor.pow((attempts - 2).toDouble())
+                    expectedElapsed += stepDelay
                     val elapsedTime = currentTime - startTime
-                    // Loosely check if the time elapsed is around the expected delay
-                    assertTrue(elapsedTime >= expectedDelay.toLong())
+                    // Loosely check if the total time elapsed is at least the cumulative expected delay
+                    assertTrue(elapsedTime >= expectedElapsed.toLong())
                 }
                 throw IOException("Network error")
             }

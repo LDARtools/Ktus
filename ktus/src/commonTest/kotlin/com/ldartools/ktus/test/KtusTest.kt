@@ -61,7 +61,7 @@ class KtusTest {
             options = TusUploadOptions(checkServerCapabilities = true)
         )
 
-        // Verify all requests (except maybe the initial OPTIONS) have Tus-Resumable header
+        // Verify all requests have Tus-Resumable header
         requestHeaders.forEach { (method, header) ->
             assertEquals("1.0.0", header, "Request $method should have Tus-Resumable header")
         }
@@ -335,7 +335,7 @@ class KtusTest {
                 HttpMethod.Patch -> {
                     val requestOffset = request.headers["Upload-Offset"]?.toLongOrNull()
                     assertNotNull(requestOffset)
-                    patchOffsets.add(requestOffset)
+                    patchOffsets.add(requestOffset!!)
 
                     val bodyChannel = (request.body as? OutgoingContent.ReadChannelContent)?.readFrom()
                     val bytes = bodyChannel?.readRemaining()?.readByteArray() ?: ByteArray(0)
@@ -810,9 +810,9 @@ class KtusTest {
             }
         )
 
-        assertNotNull(lastProgress)
-        assertEquals(500L, lastProgress.first)
-        assertEquals(500L, lastProgress.second)
+        val finalProgress = assertNotNull(lastProgress)
+        assertEquals(500L, finalProgress.first)
+        assertEquals(500L, finalProgress.second)
         client.close()
     }
 
@@ -870,7 +870,7 @@ class KtusTest {
         )
 
         assertNotNull(createdUrl)
-        assertTrue(createdUrl.contains("/uploads/abc123"))
+        assertTrue(createdUrl!!.contains("/uploads/abc123"))
         client.close()
     }
 
