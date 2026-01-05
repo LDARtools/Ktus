@@ -189,11 +189,16 @@ class KtusTest {
     @Test
     fun testBasicUpload_emptyFile() = runTest {
         val testFile = InMemoryTusFile("empty.bin", ByteArray(0))
-        val serverOffset = 0L
+
+        var optionsReceived = false
+        var postReceived = false
+        var headReceived = false
+        var patchReceived = false
 
         val engine = MockEngine { request ->
             when (request.method) {
                 HttpMethod.Options -> {
+                    optionsReceived = true
                     respond(
                         content = "",
                         status = HttpStatusCode.OK,
@@ -201,6 +206,7 @@ class KtusTest {
                     )
                 }
                 HttpMethod.Post -> {
+                    postReceived = true
                     assertEquals("0", request.headers["Upload-Length"])
                     respond(
                         content = "",
@@ -209,6 +215,7 @@ class KtusTest {
                     )
                 }
                 HttpMethod.Head -> {
+                    headReceived = true
                     respond(
                         content = "",
                         status = HttpStatusCode.OK,
@@ -216,6 +223,7 @@ class KtusTest {
                     )
                 }
                 HttpMethod.Patch -> {
+                    patchReceived = true
                     fail("Should not send PATCH for empty file")
                 }
                 else -> respondError(HttpStatusCode.NotFound)
@@ -230,7 +238,11 @@ class KtusTest {
             options = TusUploadOptions(checkServerCapabilities = true)
         )
 
-        assertEquals(0L, serverOffset)
+        assertTrue(optionsReceived, "Expected OPTIONS request for capability check")
+        assertTrue(postReceived, "Expected POST request to create upload")
+        assertTrue(headReceived, "Expected HEAD request to check offset")
+        assertFalse(patchReceived, "Did not expect PATCH for empty file")
+
         client.close()
     }
 
