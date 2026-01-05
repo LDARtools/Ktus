@@ -273,20 +273,6 @@ The `uploadTus` function has a parameter that enables a file lock. This will loc
 
 ## Future Work
 
-- [ ] Add Unit tests
-    - [ ] Test Tus features
-      - [ ] Core Protocol
-        - [ ] Basic Upload
-        - [ ] Resume Upload
-        - [ ] Upload Offset (rewind)
-        - [ ] Error Handling
-      - [ ] Metadata
-      - [ ] Progress
-      - [ ] Creation
-      - [ ] Creation With Upload
-      - [ ] File read locks
-      - [ ] Retries with exponential backoff
-    - [x] Test `OkioTusFile` implementation
 - [ ] Add `ITusFile` implementations for common platforms (e.g., Android, iOS, JVM)
 - [ ] Add support for more Tus protocol extensions
     - [ ] Expiration
