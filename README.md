@@ -271,6 +271,44 @@ In order to keep the dependencies of Ktus at minimum, the `OkioTusFile` is provi
 
 The `uploadTus` function has a parameter that enables a file lock. This will lock the file, provided the `ITusFile` implementation supports it, in order to ensure that bytes are not mutated while an upload is in progress.
 
+## Comparison with Official TUS Clients
+
+Ktus was built and validated against the [TUS 1.0.0 protocol specification](https://tus.io/protocols/resumable-upload) and compared with the official TUS client implementations to ensure correctness and feature parity.
+
+| Feature | [tus-js-client](https://github.com/tus/tus-js-client) | [tus-java-client](https://github.com/tus/tus-java-client) | [TUSKit (Swift)](https://github.com/tus/TUSKit) | **Ktus** |
+|---|:---:|:---:|:---:|:---:|
+| Core protocol (HEAD/PATCH) | Yes | Yes | Yes | Yes |
+| Creation (POST) | Yes | Yes | Yes | Yes |
+| OPTIONS capability check | Yes | No | Yes | Yes |
+| Chunked uploads | Yes | Yes | Yes | Yes |
+| Metadata encoding | Yes | Yes | Yes | Yes |
+| Metadata key validation | No | No | Yes | Yes |
+| Retry with backoff | Fixed delays | No (caller) | Counter only | Exponential backoff |
+| 5xx retry | Yes | No (caller) | Yes (system) | Yes |
+| 409 Conflict recovery | No | No | HEAD + retry | HEAD + retry |
+| Offset advancement check | No | No | No | Yes |
+| PATCH failure loop protection | Retry counter | No | Retry counter | Consecutive failure counter + offset check |
+| 404/410 expired handling | Re-creates upload | Exception | Re-creates upload | Exception |
+| Upload URL persistence | Built-in | Built-in | Built-in | Caller-managed ([see usage](#persisting-the-upload-url-for-continuation)) |
+| Creation-with-upload | Yes | No | No | No |
+| Upload-Defer-Length | Yes | No | No | No |
+| Concatenation / parallel | Yes | No | No | No |
+| Relative URL resolution | RFC 3986 | RFC 2396 | RFC 3986 | RFC 3986 |
+| Cross-platform | Browser + Node | JVM | Apple | JVM, Android, iOS, Linux, + all Ktor targets |
+
+### Where Ktus differs
+
+**Strengths:**
+- **Exponential backoff** with configurable parameters (`initialDelayMillis`, `maxDelayMillis`, `factor`) is more robust than fixed delay arrays or no retries at all.
+- **Offset advancement validation** prevents infinite loops when the server returns the same offset after a successful PATCH — a scenario that other clients don't guard against.
+- **409 Conflict recovery** via HEAD matches TUSKit's approach and is more correct than tus-js-client which retries blindly.
+- **Ktor DSL integration** gives full control over every HTTP request (auth headers, timeouts, logging, etc.) through a familiar Kotlin builder.
+- **True multiplatform** — a single library covers JVM, Android, iOS, Linux, and all other Ktor-supported targets.
+
+**Trade-offs:**
+- **No built-in URL persistence.** Official clients have a "URL store" for resuming uploads across app restarts. Ktus provides hooks (`onCreate` callback, separate `createTus`/`uploadTus` calls) so callers can persist URLs however they prefer.
+- **No auto re-creation on expiry.** tus-js-client and TUSKit automatically create a new upload when the old one returns 404/410. Ktus throws `TusUploadExpiredException` so callers can decide how to handle it.
+
 ## Future Work
 
 - [ ] Add `ITusFile` implementations for common platforms (e.g., Android, iOS, JVM)
