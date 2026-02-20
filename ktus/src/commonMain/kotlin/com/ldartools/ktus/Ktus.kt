@@ -140,6 +140,7 @@ private suspend fun HttpClient.uploadTus(
         /*
      * Phase 2: Upload Chunks
      */
+        var consecutiveFailures = 0
         while (offset < file.size) {
             // 1. Calculate chunk size
             val bytesRemaining = file.size - offset
@@ -164,12 +165,18 @@ private suspend fun HttpClient.uploadTus(
 
             // 4. Verify Response
             if (patchResponse.status != HttpStatusCode.NoContent) {
+                consecutiveFailures++
+                if (consecutiveFailures > options.retryOptions.maxRetries) {
+                    throw TusProtocolException("Upload failed after $consecutiveFailures consecutive PATCH failures (last status: ${patchResponse.status})")
+                }
 
-                // Handle failure
+                // Handle failure by re-checking offset via HEAD
                 offset = retryWithBackoff(options.retryOptions) { headRequest(this, uploadUrl, block) }
 
                 continue
             }
+
+            consecutiveFailures = 0
 
             // 5. Update Offset
             val serverOffset = patchResponse.headers["Upload-Offset"]?.toLongOrNull()
