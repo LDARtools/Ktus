@@ -843,6 +843,121 @@ class BugFixTest {
     }
 
     // ==========================================================================
+    // URL Resolution: relative Location header handling
+    //
+    // The old getRootUrl() approach only prepended scheme://host:port, which
+    // broke relative paths like "uploads/123" when the creation URL had a path
+    // (e.g. /api/v1/files). The fix uses proper RFC 3986 URL resolution.
+    // ==========================================================================
+
+    @Test
+    fun testUrlResolution_absoluteUrl() = runTest {
+        val testFile = InMemoryTusFile("test.bin", ByteArray(10))
+        var resolvedUrl: String? = null
+
+        val engine = MockEngine { request ->
+            when (request.method) {
+                HttpMethod.Post -> {
+                    respond(
+                        content = "",
+                        status = HttpStatusCode.Created,
+                        headers = headersOf("Location" to listOf("https://cdn.example.com/uploads/abc"))
+                    )
+                }
+                HttpMethod.Head -> {
+                    respond(content = "", status = HttpStatusCode.OK,
+                        headers = headersOf("Upload-Offset" to listOf("10")))
+                }
+                else -> respondError(HttpStatusCode.NotFound)
+            }
+        }
+
+        val client = HttpClient(engine)
+        client.createAndUploadTus(
+            createUrl = "https://example.com/api/v1/files",
+            file = testFile,
+            options = TusUploadOptions(checkServerCapabilities = false),
+            onCreate = { resolvedUrl = it }
+        )
+
+        assertEquals("https://cdn.example.com/uploads/abc", resolvedUrl,
+            "Absolute Location URL should be used as-is")
+        client.close()
+    }
+
+    @Test
+    fun testUrlResolution_absolutePath() = runTest {
+        val testFile = InMemoryTusFile("test.bin", ByteArray(10))
+        var resolvedUrl: String? = null
+
+        val engine = MockEngine { request ->
+            when (request.method) {
+                HttpMethod.Post -> {
+                    respond(
+                        content = "",
+                        status = HttpStatusCode.Created,
+                        headers = headersOf("Location" to listOf("/uploads/abc"))
+                    )
+                }
+                HttpMethod.Head -> {
+                    respond(content = "", status = HttpStatusCode.OK,
+                        headers = headersOf("Upload-Offset" to listOf("10")))
+                }
+                else -> respondError(HttpStatusCode.NotFound)
+            }
+        }
+
+        val client = HttpClient(engine)
+        client.createAndUploadTus(
+            createUrl = "https://example.com/api/v1/files",
+            file = testFile,
+            options = TusUploadOptions(checkServerCapabilities = false),
+            onCreate = { resolvedUrl = it }
+        )
+
+        assertEquals("https://example.com/uploads/abc", resolvedUrl,
+            "Absolute path should resolve against the origin only")
+        client.close()
+    }
+
+    @Test
+    fun testUrlResolution_relativePath() = runTest {
+        val testFile = InMemoryTusFile("test.bin", ByteArray(10))
+        var resolvedUrl: String? = null
+
+        val engine = MockEngine { request ->
+            when (request.method) {
+                HttpMethod.Post -> {
+                    respond(
+                        content = "",
+                        status = HttpStatusCode.Created,
+                        headers = headersOf("Location" to listOf("uploads/abc"))
+                    )
+                }
+                HttpMethod.Head -> {
+                    respond(content = "", status = HttpStatusCode.OK,
+                        headers = headersOf("Upload-Offset" to listOf("10")))
+                }
+                else -> respondError(HttpStatusCode.NotFound)
+            }
+        }
+
+        val client = HttpClient(engine)
+        client.createAndUploadTus(
+            createUrl = "https://example.com/api/v1/files",
+            file = testFile,
+            options = TusUploadOptions(checkServerCapabilities = false),
+            onCreate = { resolvedUrl = it }
+        )
+
+        // Per RFC 3986, "uploads/abc" relative to "/api/v1/files"
+        // resolves to "/api/v1/uploads/abc" (replaces last segment of base path)
+        assertEquals("https://example.com/api/v1/uploads/abc", resolvedUrl,
+            "Relative path should resolve against the base URL's parent directory")
+        client.close()
+    }
+
+    // ==========================================================================
     // Helper functions
     // ==========================================================================
 

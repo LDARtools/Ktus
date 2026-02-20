@@ -78,16 +78,10 @@ private suspend fun HttpClient.createTus(createUrl: String,
             throw TusProtocolException("Failed to create upload: ${createResponse.status}")
         }
 
-        var uploadUrl = createResponse.headers["Location"]
+        val location = createResponse.headers["Location"]
             ?: throw TusProtocolException("Server did not provide a Location header")
 
-        //need to append the uploadUrl to the root of the createUrl
-        val serverRoot = createUrl.getRootUrl() ?: ""
-        if (!uploadUrl.startsWith(serverRoot, ignoreCase = true)) {
-            uploadUrl = "$serverRoot$uploadUrl"
-        }
-
-        return uploadUrl
+        return createUrl.resolveUrl(location)
     }
 }
 
