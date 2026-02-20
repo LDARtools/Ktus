@@ -1,6 +1,7 @@
 package com.ldartools.ktus
 
 import io.ktor.client.HttpClient
+import io.ktor.client.plugins.ClientRequestException
 import io.ktor.client.plugins.onUpload
 import io.ktor.client.request.HttpRequestBuilder
 import io.ktor.client.request.head
@@ -147,20 +148,34 @@ private suspend fun HttpClient.uploadTus(
             val currentChunkSize = min(options.chunkSize, bytesRemaining)
 
             // 2. Send PATCH request (readSection inside retry so a fresh channel is created per attempt)
-            val patchResponse = retryWithBackoff(options.retryOptions) {
-                val chunk = file.readSection(offset, currentChunkSize)
-                this.patch(urlString = uploadUrl) {
-                    tusVersionHeader()
-                    header("Upload-Offset", offset.toString())
-                    header("Content-Length", currentChunkSize.toString())
-                    setBody(TusPatchContent(chunk, currentChunkSize))
+            val patchResponse = try {
+                retryWithBackoff(options.retryOptions) {
+                    val chunk = file.readSection(offset, currentChunkSize)
+                    this.patch(urlString = uploadUrl) {
+                        tusVersionHeader()
+                        header("Upload-Offset", offset.toString())
+                        header("Content-Length", currentChunkSize.toString())
+                        setBody(TusPatchContent(chunk, currentChunkSize))
 
-                    // Progress listener hook (Ktor capability)
-                    onUpload { bytesSentTotal, _ ->
-                        onProgress?.invoke(offset + bytesSentTotal, file.size)
+                        // Progress listener hook (Ktor capability)
+                        onUpload { bytesSentTotal, _ ->
+                            onProgress?.invoke(offset + bytesSentTotal, file.size)
+                        }
+                        block()
                     }
-                    block()
                 }
+            } catch (e: ClientRequestException) {
+                // 409 Conflict means offset mismatch — recover via HEAD per TUS spec.
+                // Other ClientRequestExceptions (4xx) are not recoverable.
+                if (e.response.status != HttpStatusCode.Conflict) throw e
+
+                consecutiveFailures++
+                if (consecutiveFailures > options.retryOptions.maxRetries) {
+                    throw TusProtocolException("Upload failed after $consecutiveFailures consecutive PATCH failures (last status: ${e.response.status})")
+                }
+
+                offset = retryWithBackoff(options.retryOptions) { headRequest(this, uploadUrl, block) }
+                continue
             }
 
             // 4. Verify Response
