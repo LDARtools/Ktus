@@ -53,7 +53,7 @@ private suspend fun HttpClient.createTus(createUrl: String,
             // Optional: Before the "Create Upload" phase
             val optionsResponse = retryWithBackoff(options.retryOptions) {
                 this.options(urlString = createUrl) {
-                    tusVersionHeader()
+                    // Per TUS spec, Tus-Resumable MUST NOT be included in OPTIONS requests.
                     block()
                 }
             }
@@ -67,7 +67,9 @@ private suspend fun HttpClient.createTus(createUrl: String,
             this.post(urlString = createUrl) {
                 header("Upload-Length", file.size.toString())
                 tusVersionHeader()
-                header("Upload-Metadata", encodeMetadata(metadata))
+                if (metadata.isNotEmpty()) {
+                    header("Upload-Metadata", encodeMetadata(metadata))
+                }
                 block()
             }
         }
@@ -274,6 +276,8 @@ private fun HttpMessageBuilder.tusVersionHeader(): Unit = this.header("Tus-Resum
 
 private fun encodeMetadata(metadata: Map<String, String>): String {
     return metadata.entries.joinToString(",") { (key, value) ->
-        "$key ${value.encodeBase64()}"
+        require(key.isNotEmpty()) { "Metadata key must not be empty" }
+        require(!key.contains(' ') && !key.contains(',')) { "Metadata key must not contain spaces or commas: \"$key\"" }
+        if (value.isEmpty()) key else "$key ${value.encodeBase64()}"
     }
 }
