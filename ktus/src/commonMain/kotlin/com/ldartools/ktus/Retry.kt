@@ -28,6 +28,9 @@ internal suspend fun <T> retryWithBackoff(
                 throw e
             }
             // For 5xx server errors, we allow retrying.
+        } catch (e: TusProtocolException) {
+            // Protocol errors (expired uploads, missing headers) are not transient — fail immediately.
+            throw e
         } catch (e: IOException) {
             // General network errors, allow retrying.
         }
