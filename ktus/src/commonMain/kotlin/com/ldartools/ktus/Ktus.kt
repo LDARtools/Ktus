@@ -145,11 +145,9 @@ private suspend fun HttpClient.uploadTus(
             val bytesRemaining = file.size - offset
             val currentChunkSize = min(options.chunkSize, bytesRemaining)
 
-            // 2. Prepare the stream
-            val chunk = file.readSection(offset, currentChunkSize)
-
-            // 3. Send PATCH request
+            // 2. Send PATCH request (readSection inside retry so a fresh channel is created per attempt)
             val patchResponse = retryWithBackoff(options.retryOptions) {
+                val chunk = file.readSection(offset, currentChunkSize)
                 this.patch(urlString = uploadUrl) {
                     tusVersionHeader()
                     header("Upload-Offset", offset.toString())
