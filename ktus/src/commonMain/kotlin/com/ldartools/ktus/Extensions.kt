@@ -2,7 +2,6 @@ package com.ldartools.ktus
 
 import io.ktor.http.URLBuilder
 import io.ktor.http.Url
-import io.ktor.http.appendPathSegments
 
 /**
  * Resolves a possibly-relative [location] URL against this URL as the base,
@@ -24,6 +23,11 @@ internal fun String.resolveUrl(location: String): String {
     return try {
         val base = Url(this)
         val builder = URLBuilder(base)
+
+        // Clear query parameters and fragment from the base URL — only
+        // the scheme, host, port, and (possibly) path are used for resolution.
+        builder.parameters.clear()
+        builder.fragment = ""
 
         if (location.startsWith("/")) {
             // Absolute path — replace the entire path, keep scheme+host+port
