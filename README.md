@@ -175,7 +175,7 @@ Add the following libraries to your `.toml` file.
 
 ```toml
 [versions]
-ktus = "1.0.0"
+ktus = "1.0.1"
 
 [libraries]
 ktus = {module = "com.ldartools.ktus" , version.ref = "ktus"}
