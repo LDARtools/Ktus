@@ -1,6 +1,6 @@
 # Ktus ([Kotlin Multiplatform](https://kotlinlang.org/multiplatform/) + [Ktor](https://ktor.io/) + [Tus](https://tus.io))
 [![CI](https://github.com/LDARtools/Ktus/actions/workflows/ci.yml/badge.svg)](https://github.com/LDARtools/Ktus/actions/workflows/ci.yml)
-[![Maven Central](https://img.shields.io/maven-central/v/com.ldartools/ktus.svg)](https://search.maven.org/artifact/com.ldartools/ktus)
+[![Maven Central](https://img.shields.io/maven-central/v/com.ldartools/ktus?filter=!*_*)](https://central.sonatype.com/artifact/com.ldartools/ktus)
 [![Release](https://img.shields.io/github/v/release/LDARtools/Ktus?include_prereleases)](https://github.com/LDARtools/Ktus/releases/latest)
 ![GitHub License](https://img.shields.io/github/license/LDARtools/Ktus)
 
