@@ -1,6 +1,7 @@
 package com.ldartools.ktus
 
 import io.ktor.client.HttpClient
+import io.ktor.client.plugins.ClientRequestException
 import io.ktor.client.plugins.onUpload
 import io.ktor.client.request.HttpRequestBuilder
 import io.ktor.client.request.head
@@ -52,7 +53,7 @@ private suspend fun HttpClient.createTus(createUrl: String,
             // Optional: Before the "Create Upload" phase
             val optionsResponse = retryWithBackoff(options.retryOptions) {
                 this.options(urlString = createUrl) {
-                    tusVersionHeader()
+                    // Per TUS spec, Tus-Resumable MUST NOT be included in OPTIONS requests.
                     block()
                 }
             }
@@ -66,7 +67,9 @@ private suspend fun HttpClient.createTus(createUrl: String,
             this.post(urlString = createUrl) {
                 header("Upload-Length", file.size.toString())
                 tusVersionHeader()
-                header("Upload-Metadata", encodeMetadata(metadata))
+                if (metadata.isNotEmpty()) {
+                    header("Upload-Metadata", encodeMetadata(metadata))
+                }
                 block()
             }
         }
@@ -75,16 +78,10 @@ private suspend fun HttpClient.createTus(createUrl: String,
             throw TusProtocolException("Failed to create upload: ${createResponse.status}")
         }
 
-        var uploadUrl = createResponse.headers["Location"]
+        val location = createResponse.headers["Location"]
             ?: throw TusProtocolException("Server did not provide a Location header")
 
-        //need to append the uploadUrl to the root of the createUrl
-        val serverRoot = createUrl.getRootUrl() ?: ""
-        if (!uploadUrl.startsWith(serverRoot, ignoreCase = true)) {
-            uploadUrl = "$serverRoot$uploadUrl"
-        }
-
-        return uploadUrl
+        return createUrl.resolveUrl(location)
     }
 }
 
@@ -140,38 +137,57 @@ private suspend fun HttpClient.uploadTus(
         /*
      * Phase 2: Upload Chunks
      */
+        var consecutiveFailures = 0
         while (offset < file.size) {
             // 1. Calculate chunk size
             val bytesRemaining = file.size - offset
             val currentChunkSize = min(options.chunkSize, bytesRemaining)
 
-            // 2. Prepare the stream
-            val chunk = file.readSection(offset, currentChunkSize)
+            // 2. Send PATCH request (readSection inside retry so a fresh channel is created per attempt)
+            val patchResponse = try {
+                retryWithBackoff(options.retryOptions) {
+                    val chunk = file.readSection(offset, currentChunkSize)
+                    this.patch(urlString = uploadUrl) {
+                        tusVersionHeader()
+                        header("Upload-Offset", offset.toString())
+                        header("Content-Length", currentChunkSize.toString())
+                        setBody(TusPatchContent(chunk, currentChunkSize))
 
-            // 3. Send PATCH request
-            val patchResponse = retryWithBackoff(options.retryOptions) {
-                this.patch(urlString = uploadUrl) {
-                    tusVersionHeader()
-                    header("Upload-Offset", offset.toString())
-                    header("Content-Length", currentChunkSize.toString())
-                    setBody(TusPatchContent(chunk, currentChunkSize))
-
-                    // Progress listener hook (Ktor capability)
-                    onUpload { bytesSentTotal, _ ->
-                        onProgress?.invoke(offset + bytesSentTotal, file.size)
+                        // Progress listener hook (Ktor capability)
+                        onUpload { bytesSentTotal, _ ->
+                            onProgress?.invoke(offset + bytesSentTotal, file.size)
+                        }
+                        block()
                     }
-                    block()
                 }
+            } catch (e: ClientRequestException) {
+                // 409 Conflict means offset mismatch — recover via HEAD per TUS spec.
+                // Other ClientRequestExceptions (4xx) are not recoverable.
+                if (e.response.status != HttpStatusCode.Conflict) throw e
+
+                consecutiveFailures++
+                if (consecutiveFailures > options.retryOptions.maxRetries) {
+                    throw TusProtocolException("Upload failed after $consecutiveFailures consecutive PATCH failures (last status: ${e.response.status})")
+                }
+
+                offset = retryWithBackoff(options.retryOptions) { headRequest(this, uploadUrl, block) }
+                continue
             }
 
             // 4. Verify Response
             if (patchResponse.status != HttpStatusCode.NoContent) {
+                consecutiveFailures++
+                if (consecutiveFailures > options.retryOptions.maxRetries) {
+                    throw TusProtocolException("Upload failed after $consecutiveFailures consecutive PATCH failures (last status: ${patchResponse.status})")
+                }
 
-                // Handle failure
+                // Handle failure by re-checking offset via HEAD
                 offset = retryWithBackoff(options.retryOptions) { headRequest(this, uploadUrl, block) }
 
                 continue
             }
+
+            consecutiveFailures = 0
 
             // 5. Update Offset
             val serverOffset = patchResponse.headers["Upload-Offset"]?.toLongOrNull()
@@ -254,6 +270,8 @@ private fun HttpMessageBuilder.tusVersionHeader(): Unit = this.header("Tus-Resum
 
 private fun encodeMetadata(metadata: Map<String, String>): String {
     return metadata.entries.joinToString(",") { (key, value) ->
-        "$key ${value.encodeBase64()}"
+        require(key.isNotEmpty()) { "Metadata key must not be empty" }
+        require(!key.contains(' ') && !key.contains(',')) { "Metadata key must not contain spaces or commas: \"$key\"" }
+        if (value.isEmpty()) key else "$key ${value.encodeBase64()}"
     }
 }

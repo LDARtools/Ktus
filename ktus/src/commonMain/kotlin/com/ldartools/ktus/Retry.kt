@@ -1,6 +1,7 @@
 package com.ldartools.ktus
 
 import io.ktor.client.plugins.ClientRequestException
+import io.ktor.client.plugins.ServerResponseException
 import io.ktor.http.HttpStatusCode
 import kotlinx.coroutines.delay
 import kotlinx.io.IOException
@@ -17,17 +18,17 @@ internal suspend fun <T> retryWithBackoff(
         try {
             return block()
         } catch (e: ClientRequestException) {
-            // Immediately fail on 4xx errors, except for specific ones we might handle elsewhere if needed
+            // 4xx errors: fail fast except for expired uploads
             val statusCode = e.response.status.value
-            if (statusCode in 400..499) {
-                // Special case for expired uploads, which is a recoverable client error
-                if (statusCode == HttpStatusCode.NotFound.value || statusCode == HttpStatusCode.Gone.value) {
-                    throw TusUploadExpiredException()
-                }
-                // For other 4xx errors, fail fast as they are not typically retry-able
-                throw e
+            if (statusCode == HttpStatusCode.NotFound.value || statusCode == HttpStatusCode.Gone.value) {
+                throw TusUploadExpiredException()
             }
-            // For 5xx server errors, we allow retrying.
+            throw e
+        } catch (e: ServerResponseException) {
+            // 5xx server errors are transient — allow retrying.
+        } catch (e: TusProtocolException) {
+            // Protocol errors (expired uploads, missing headers) are not transient — fail immediately.
+            throw e
         } catch (e: IOException) {
             // General network errors, allow retrying.
         }

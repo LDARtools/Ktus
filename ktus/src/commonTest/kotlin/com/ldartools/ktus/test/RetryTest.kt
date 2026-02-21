@@ -60,7 +60,7 @@ class RetryTest {
         var attempts = 0
         val result = retryWithBackoff(defaultOptions) {
             attempts++
-            if (attempts < 2) throw mockClientRequestException(HttpStatusCode.InternalServerError)
+            if (attempts < 2) throw mockServerResponseException(HttpStatusCode.InternalServerError)
             "success"
         }
         assertEquals("success", result)
@@ -125,5 +125,14 @@ class RetryTest {
         val client = HttpClient(engine)
         val response = client.request("")
         return ClientRequestException(response, "Error")
+    }
+
+    private suspend fun mockServerResponseException(statusCode: HttpStatusCode): ServerResponseException {
+        val engine = MockEngine { _ ->
+            respond(content = "", status = statusCode, headers = headersOf(HttpHeaders.ContentType, ContentType.Text.Plain.toString()))
+        }
+        val client = HttpClient(engine)
+        val response = client.request("")
+        return ServerResponseException(response, "Error")
     }
 }

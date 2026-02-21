@@ -61,9 +61,14 @@ class KtusTest {
             options = TusUploadOptions(checkServerCapabilities = true)
         )
 
-        // Verify all requests have Tus-Resumable header
+        // Verify all requests except OPTIONS have Tus-Resumable header.
+        // Per TUS spec, OPTIONS requests MUST NOT include Tus-Resumable.
         requestHeaders.forEach { (method, header) ->
-            assertEquals("1.0.0", header, "Request $method should have Tus-Resumable header")
+            if (method == HttpMethod.Options) {
+                assertNull(header, "OPTIONS request should NOT have Tus-Resumable header")
+            } else {
+                assertEquals("1.0.0", header, "Request $method should have Tus-Resumable header")
+            }
         }
 
         client.close()
@@ -726,7 +731,7 @@ class KtusTest {
             options = TusUploadOptions(checkServerCapabilities = true)
         )
 
-        assertEquals("", receivedMetadata)
+        assertNull(receivedMetadata, "Upload-Metadata header should be omitted when metadata is empty")
         client.close()
     }
 
