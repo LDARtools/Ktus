@@ -98,6 +98,30 @@ class RetryTest {
     }
 
     @Test
+    fun `retries on 401 and succeeds`() = runTest {
+        var attempts = 0
+        val result = retryWithBackoff(defaultOptions) {
+            attempts++
+            if (attempts < 2) throw mockClientRequestException(HttpStatusCode.Unauthorized)
+            "success"
+        }
+        assertEquals("success", result)
+        assertEquals(2, attempts)
+    }
+
+    @Test
+    fun `fails after max retries with persistent 401`() = runTest {
+        var attempts = 0
+        assertFailsWith<ClientRequestException> {
+            retryWithBackoff(defaultOptions) {
+                attempts++
+                throw mockClientRequestException(HttpStatusCode.Unauthorized)
+            }
+        }
+        assertEquals(defaultOptions.maxRetries, attempts)
+    }
+
+    @Test
     fun `exponential backoff delays are correct`() = runTest {
         var attempts = 0
         var expectedElapsed = 0.0
