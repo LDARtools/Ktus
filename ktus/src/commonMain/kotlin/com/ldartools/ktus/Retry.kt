@@ -24,7 +24,7 @@ internal suspend fun <T> retryWithBackoff(
                 throw TusUploadExpiredException()
             }
             if (statusCode == HttpStatusCode.Unauthorized.value) {
-                // 401 is retryable — the block() lambda will refresh the auth token on next attempt
+                // 401 is retryable — allowing the caller's block() lambda to refresh the auth token on the next attempt
             } else {
                 throw e
             }
