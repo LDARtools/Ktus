@@ -18,12 +18,16 @@ internal suspend fun <T> retryWithBackoff(
         try {
             return block()
         } catch (e: ClientRequestException) {
-            // 4xx errors: fail fast except for expired uploads
+            // 4xx errors: fail fast except for expired uploads and auth failures
             val statusCode = e.response.status.value
             if (statusCode == HttpStatusCode.NotFound.value || statusCode == HttpStatusCode.Gone.value) {
                 throw TusUploadExpiredException()
             }
-            throw e
+            if (statusCode == HttpStatusCode.Unauthorized.value) {
+                // 401 is retryable — the block() lambda will refresh the auth token on next attempt
+            } else {
+                throw e
+            }
         } catch (e: ServerResponseException) {
             // 5xx server errors are transient — allow retrying.
         } catch (e: TusProtocolException) {
