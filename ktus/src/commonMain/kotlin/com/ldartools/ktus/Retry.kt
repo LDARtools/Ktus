@@ -1,5 +1,6 @@
 package com.ldartools.ktus
 
+import io.ktor.client.network.sockets.ConnectTimeoutException
 import io.ktor.client.network.sockets.SocketTimeoutException
 import io.ktor.client.plugins.HttpRequestTimeoutException
 import io.ktor.client.plugins.ResponseException
@@ -246,6 +247,8 @@ internal fun parseHttpDate(value: String): Long? = try {
 private fun Throwable.isTimeout(): Boolean {
     var current: Throwable? = this
     while (current != null) {
+        // A connect timeout says nothing about the chunk size.
+        if (current is ConnectTimeoutException) return false
         if (current is HttpRequestTimeoutException || current is SocketTimeoutException) return true
         // Engines differ in which timeout type they surface (for example java.net.SocketTimeoutException).
         if (current::class.simpleName?.contains("Timeout") == true) return true

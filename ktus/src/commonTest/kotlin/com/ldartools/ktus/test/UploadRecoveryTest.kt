@@ -270,7 +270,8 @@ class UploadRecoveryTest {
     @Test
     fun otherFailures_doNotShrinkTheChunk() = runTest {
         val server = server(2048)
-        server.script(HttpMethod.Patch, Reply.Status(500), Reply.Status(503), Reply.Throw(IOException("reset")), Reply.Status(409))
+        server.script(HttpMethod.Patch, Reply.Status(500), Reply.Status(503), Reply.Throw(IOException("reset")), Reply.Status(409),
+            Reply.Throw(io.ktor.client.network.sockets.ConnectTimeoutException("connect timed out")))
         server.client().uploadTus(url, InMemoryTusFile("f", testBytes(2048)), options = TusUploadOptions(
             chunkSize = 1024, minChunkSize = 256, retryOptions = retry(maxRetries = 10)))
         assertTrue(server.patchSizes().all { it == 1024 }, "${server.patchSizes()}")
