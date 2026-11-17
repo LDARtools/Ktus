@@ -96,7 +96,7 @@ internal class Backoff(
     ): Boolean {
         val start = runStart ?: options.timeSource.markNow().also { runStart = it }
         failures++
-        if (attemptsForOperation >= options.maxRetries.coerceAtLeast(1)) return false
+        if (attemptsForOperation >= options.maxRetries) return false // maxRetries <= 0: one attempt, as in 1.0.x
         val remaining = options.maxElapsedMillis - start.elapsedNow().inWholeMilliseconds
         if (remaining <= 0) return false
 
