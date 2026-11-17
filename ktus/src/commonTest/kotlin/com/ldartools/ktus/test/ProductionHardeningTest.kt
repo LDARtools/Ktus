@@ -273,6 +273,16 @@ class ProductionHardeningTest {
     }
 
     @Test
+    fun repeated423OnPatch_isNotCountedAgainstMaxRetries() = runTest {
+        val server = ScriptedTusServer().apply { uploadLength = 100 }
+        repeat(6) { server.script(HttpMethod.Patch, Reply.Status(423)) }
+        server.client().uploadTus(url, InMemoryTusFile("f", testBytes(100)),
+            options = TusUploadOptions(retryOptions = retry(maxRetries = 3)))
+        assertEquals(100, server.offset)
+        assertEquals(7, server.count(HttpMethod.Patch))
+    }
+
+    @Test
     fun aLockOutlastingTheBudget_fails() = runTest {
         val server = ScriptedTusServer(clock = { currentTime }).apply { uploadLength = 100; lockedUntil = Long.MAX_VALUE }
         val error = assertFailsWith<TusHttpException> {
