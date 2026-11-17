@@ -77,7 +77,7 @@ internal suspend fun copyExactly(source: ByteReadChannel, channel: ByteWriteChan
     while (remaining > 0) {
         val read = source.readAvailable(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
         if (read == -1) {
-            throw TusProtocolException(
+            throw TusLocalFileException(
                 "File ended early: expected $length bytes at offset $offset, got ${length - remaining}")
         }
         channel.writeFully(buffer, 0, read)

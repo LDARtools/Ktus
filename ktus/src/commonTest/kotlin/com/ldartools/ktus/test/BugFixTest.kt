@@ -322,7 +322,8 @@ class BugFixTest {
                 uploadUrl = "https://example.com/files/uploads/123",
                 file = testFile,
                 options = TusUploadOptions(
-                    chunkSize = 200L,
+                    chunkSize = 100L, // Not the final chunk: an exhausted final PATCH is TusUploadOutcomeUnknownException (see ProductionHardeningTest).
+                    
                     retryOptions = RetryOptions(maxRetries = maxRetries, initialDelayMillis = 1, maxDelayMillis = 10)
                 )
             )
@@ -566,7 +567,8 @@ class BugFixTest {
                 uploadUrl = "https://example.com/files/uploads/123",
                 file = testFile,
                 options = TusUploadOptions(
-                    chunkSize = 200L,
+                    chunkSize = 100L, // Not the final chunk: an exhausted final PATCH is TusUploadOutcomeUnknownException (see ProductionHardeningTest).
+                    
                     retryOptions = RetryOptions(maxRetries = 3, initialDelayMillis = 1, maxDelayMillis = 10)
                 )
             )

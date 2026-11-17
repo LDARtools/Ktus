@@ -250,7 +250,7 @@ class StatusPolicyTest {
         repeat(10) { server.script(HttpMethod.Patch, Reply.Throw(IOException("offline $it"))) }
         val error = assertFailsWith<IOException> {
             server.client().uploadTus("https://example.com/files/abc", InMemoryTusFile("f", testBytes(fileSize)),
-                options = TusUploadOptions(retryOptions = fastRetry(maxRetries = 3)))
+                options = TusUploadOptions(chunkSize = 100, retryOptions = fastRetry(maxRetries = 3)))
         }
         assertFalse(error is TusProtocolException, "an exhausted network failure must stay a network error, was $error")
         assertEquals(3, server.count(HttpMethod.Patch))
@@ -274,7 +274,7 @@ class StatusPolicyTest {
             val server = server()
             repeat(20) { server.script(method, Reply.Status(503)) }
             val error = assertFailsWith<TusHttpException>("$method") {
-                runOperation(server.client(), method, TusUploadOptions(retryOptions = fastRetry(maxRetries = 4)),
+                runOperation(server.client(), method, TusUploadOptions(chunkSize = 100, retryOptions = fastRetry(maxRetries = 4)),
                     InMemoryTusFile("f", testBytes(fileSize)))
             }
             assertEquals(503, error.statusCode)

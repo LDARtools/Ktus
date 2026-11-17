@@ -1,6 +1,6 @@
 package com.ldartools.ktus.okio
 import com.ldartools.ktus.ITusFile
-import com.ldartools.ktus.TusProtocolException
+import com.ldartools.ktus.TusLocalFileException
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.ByteWriteChannel
 import io.ktor.utils.io.writeFully
@@ -86,7 +86,7 @@ class OkioTusFile(private val path: Path, private val fileSystem: FileSystem) : 
             val toRead = minOf(buffer.size.toLong(), remaining).toInt()
             val read = source.read(buffer, 0, toRead)
             if (read == -1) {
-                throw TusProtocolException(
+                throw TusLocalFileException(
                     "File \"${path.name}\" ended early: expected $length bytes at offset $offset, got ${length - remaining}")
             }
             write(buffer, read)

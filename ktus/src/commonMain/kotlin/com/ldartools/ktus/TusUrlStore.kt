@@ -10,11 +10,16 @@ import kotlinx.coroutines.sync.withLock
  * @property uploadLength the `Upload-Length` the upload was created with: the file size in bytes.
  * @property expiresAt when the server will discard an unfinished upload, in epoch milliseconds, from the
  *   `Upload-Expires` header of the creation response; null when the server did not say.
+ * @property finalSentAt set (epoch milliseconds) by [resumeOrCreateAndUploadTus] just before it sends the PATCH
+ *   carrying the last bytes, and cleared only when a HEAD shows the server does not have them. While it is
+ *   set the upload's outcome may be unknown: Ktus never re-creates the upload, and a 404/410 throws
+ *   [TusUploadOutcomeUnknownException]. Persist it with the rest of the entry.
  */
 data class TusUpload(
     val uploadUrl: String,
     val uploadLength: Long,
     val expiresAt: Long? = null,
+    val finalSentAt: Long? = null,
 )
 
 /**

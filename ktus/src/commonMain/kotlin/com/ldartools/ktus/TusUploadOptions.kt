@@ -19,6 +19,9 @@ package com.ldartools.ktus
  *   of the following PATCH requests, never below [minChunkSize] (default true).
  * @param minChunkSize the smallest chunk [adaptiveChunkSize] shrinks to (default 256 KiB). It is never
  *   above [chunkSize].
+ * @param activityHeartbeatMillis while a request is in flight, call `onActivity` this often from a side job
+ *   that is cancelled with the request (default 5 s; null turns it off). Also the longest gap between
+ *   `onActivity` calls while Ktus waits to retry.
  */
 data class TusUploadOptions(
     val checkServerCapabilities: Boolean = true,
@@ -30,6 +33,7 @@ data class TusUploadOptions(
     val omitEmptyMetadataValues: Boolean = true,
     val adaptiveChunkSize: Boolean = true,
     val minChunkSize: Long = 256 * 1024,
+    val activityHeartbeatMillis: Long? = 5_000,
 ) {
     init {
         require(chunkSize > 0) { "chunkSize must be positive" }

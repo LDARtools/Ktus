@@ -13,7 +13,9 @@ import io.ktor.http.fromHttpToGmtDate
 import io.ktor.util.date.GMTDate
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.io.IOException
@@ -65,6 +67,7 @@ internal sealed class Outcome {
 internal class Backoff(
     private val options: RetryOptions,
     private val onActivity: (() -> Unit)? = null,
+    private val heartbeatMillis: Long = HEARTBEAT_MILLIS,
 ) {
     private var failures = 0
     private var runStart: TimeMark? = null
@@ -81,15 +84,16 @@ internal class Backoff(
      *
      * @param attemptsForOperation attempts made so far for the operation that just failed.
      * @param retryAfterMillis the server's `Retry-After`, if any.
+     * @param floorMillis the shortest wait allowed, whatever the jitter draws.
      */
-    suspend fun awaitRetry(attemptsForOperation: Int, retryAfterMillis: Long?): Boolean {
+    suspend fun awaitRetry(attemptsForOperation: Int, retryAfterMillis: Long?, floorMillis: Long = 0L): Boolean {
         val start = runStart ?: options.timeSource.markNow().also { runStart = it }
         failures++
         if (attemptsForOperation >= options.maxRetries) return false
         val remaining = options.maxElapsedMillis - start.elapsedNow().inWholeMilliseconds
         if (remaining <= 0) return false
 
-        var wait = nextDelayMillis(failures)
+        var wait = maxOf(nextDelayMillis(failures), floorMillis)
         if (retryAfterMillis != null && options.honorRetryAfter) {
             // Honour the server, but never wait longer than max(maxDelayMillis, 60 s) for one retry.
             wait = maxOf(wait, min(retryAfterMillis, maxOf(options.maxDelayMillis, MAX_RETRY_AFTER_MILLIS)))
@@ -98,12 +102,12 @@ internal class Backoff(
         return true
     }
 
-    /** Waits [millis], reporting activity at the start and at least every [HEARTBEAT_MILLIS]. */
+    /** Waits [millis], reporting activity at the start and at least every [heartbeatMillis]. */
     private suspend fun sleepWithHeartbeat(millis: Long) {
         onActivity?.invoke()
         var left = millis
         while (left > 0) {
-            val slice = min(left, HEARTBEAT_MILLIS)
+            val slice = min(left, heartbeatMillis.coerceAtLeast(1))
             delay(slice)
             left -= slice
             onActivity?.invoke()
@@ -119,8 +123,11 @@ internal class Backoff(
     }
 }
 
-/** The longest gap between `onActivity` calls while Ktus waits to retry. */
+/** The longest gap between `onActivity` calls while Ktus waits to retry, when no heartbeat is configured. */
 internal const val HEARTBEAT_MILLIS = 5_000L
+
+/** The shortest wait before retrying a 423 Locked answer, which is not counted against maxRetries. */
+internal const val LOCKED_MIN_DELAY_MILLIS = 250L
 
 /** The longest single wait a `Retry-After` can impose, unless [RetryOptions.maxDelayMillis] is larger. */
 internal const val MAX_RETRY_AFTER_MILLIS = 60_000L
@@ -140,13 +147,16 @@ internal suspend fun attemptTus(
     options: RetryOptions,
     client: HttpClient? = null,
     onActivity: (() -> Unit)? = null,
+    heartbeatMillis: Long? = null,
     send: suspend () -> HttpResponse,
 ): Outcome {
+    // Callbacks run outside the try below: whatever they throw reaches the caller as it is.
     onActivity?.invoke()
-    return try {
-        val response = send()
-        onActivity?.invoke()
+    val outcome = try {
+        val response = withHeartbeat(onActivity, heartbeatMillis) { send() }
         classifyResponse(op, targetUrl, response, options, cause = null)
+    } catch (e: CallbackFailure) {
+        throw e
     } catch (e: CancellationException) {
         // Only a cancelled caller is a cancellation. An engine can also throw CancellationException when
         // its own call or connection is torn down; for an active caller that is a network failure.
@@ -162,6 +172,30 @@ internal suspend fun attemptTus(
     } catch (e: Throwable) {
         client?.closedError(e)?.let { return Outcome.Fail(it) }
         classifyThrowable(e)
+    }
+    onActivity?.invoke()
+    return outcome
+}
+
+/**
+ * Runs [block] (one request), calling [onActivity] every [heartbeatMillis] from a side job while it is in
+ * flight. The ticker is a child of the request's scope and is cancelled with it; an exception from
+ * [onActivity] cancels the request and is rethrown.
+ */
+private suspend fun <T> withHeartbeat(onActivity: (() -> Unit)?, heartbeatMillis: Long?, block: suspend () -> T): T {
+    if (onActivity == null || heartbeatMillis == null || heartbeatMillis <= 0) return block()
+    return coroutineScope {
+        val ticker = launch {
+            while (true) {
+                delay(heartbeatMillis)
+                onActivity() // a CallbackFailure here fails this scope, cancelling the request
+            }
+        }
+        try {
+            block()
+        } finally {
+            ticker.cancel()
+        }
     }
 }
 
@@ -334,19 +368,21 @@ internal suspend fun <T> retryTusOperation(
     backoff: Backoff,
     client: HttpClient? = null,
     onActivity: (() -> Unit)? = null,
+    heartbeatMillis: Long? = null,
     send: suspend () -> HttpResponse,
     onSuccess: suspend (HttpResponse) -> T,
 ): T {
     var attempts = 0
     while (true) {
         attempts++
-        when (val outcome = attemptTus(op, targetUrl, options, client, onActivity, send)) {
+        when (val outcome = attemptTus(op, targetUrl, options, client, onActivity, heartbeatMillis, send)) {
             is Outcome.Ok -> return onSuccess(outcome.response)
             is Outcome.Fail -> throw outcome.error
             is Outcome.Retry -> {
                 // 423 Locked (tusdotnet's per-file lock) is bounded by the elapsed budget only.
-                if (outcome.statusCode == 423) attempts--
-                if (!backoff.awaitRetry(attempts, outcome.retryAfterMillis)) {
+                val locked = outcome.statusCode == 423
+                if (locked) attempts--
+                if (!backoff.awaitRetry(attempts, outcome.retryAfterMillis, if (locked) LOCKED_MIN_DELAY_MILLIS else 0L)) {
                     throw retriesExhausted(op, targetUrl, outcome, attempts)
                 }
             }

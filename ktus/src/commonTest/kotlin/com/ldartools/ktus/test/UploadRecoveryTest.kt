@@ -104,7 +104,7 @@ class UploadRecoveryTest {
         repeat(20) { server.script(HttpMethod.Patch, Reply.Status(503)) }
         val error = assertFailsWith<TusHttpException> {
             server.client().uploadTus(url, InMemoryTusFile("f", testBytes(100)),
-                options = TusUploadOptions(retryOptions = retry(maxRetries = 4)))
+                options = TusUploadOptions(chunkSize = 50, retryOptions = retry(maxRetries = 4)))
         }
         assertEquals(503, error.statusCode)
         assertEquals("PATCH", error.method)

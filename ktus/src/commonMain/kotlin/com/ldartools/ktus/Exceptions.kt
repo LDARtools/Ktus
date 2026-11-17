@@ -52,21 +52,37 @@ class TusHttpException(
 ) : TusProtocolException(message, cause)
 
 /**
- * The response to the PATCH that carried the last bytes of the file was lost, and the server then answered
- * the follow-up HEAD with 404/410. The server may have stored the whole file and finished (and, like
- * tusdotnet, removed) the upload, or the upload may really have expired. Ktus cannot tell which.
- *
- * Check on the server (by the file's id, checksum or name) whether the file arrived before uploading it
- * again. It is deliberately not a [TusUploadExpiredException], so code that re-creates expired uploads
- * does not upload the file twice.
- *
- * @property uploadUrl the upload whose final response was lost.
+ * A problem with the local file rather than the server: it changed size during the upload, or it held fewer
+ * bytes than its size while a chunk was read. Uploading the same file again will not help until it is fixed.
  */
-class TusUploadPossiblyCompleteException(
+open class TusLocalFileException(message: String) : TusProtocolException(message)
+
+/**
+ * Ktus sent the PATCH carrying the last bytes of the file, did not learn whether the server stored them, and
+ * then could not find out. The server may hold the complete file (tusdotnet removes an upload once it is
+ * complete, so a later HEAD or PATCH answers 404), or it may not.
+ *
+ * Thrown instead of any other failure (including [TusUploadExpiredException], exhausted retries and HTTP
+ * errors) once that is the case; the original failure is the [cause].
+ *
+ * **Check on your server whether the file arrived before uploading it again.** Uploading again blindly can
+ * make the server receive and process the file twice.
+ *
+ * It deliberately does not extend [IOException][kotlinx.io.IOException] or [TusProtocolException], so a
+ * generic "network error, retry later" or "expired, re-create" handler does not swallow it.
+ * [resumeOrCreateAndUploadTus] never re-creates an upload after it, and keeps the stored entry (marked as
+ * outcome-unknown) so later calls keep throwing it until you resolve the entry and remove it from the store.
+ *
+ * @property uploadUrl the upload whose outcome is unknown.
+ */
+class TusUploadOutcomeUnknownException(
     val uploadUrl: String,
     cause: Throwable? = null,
-) : TusProtocolException(
-    "The final PATCH response for $uploadUrl was lost and the upload is now gone (404/410); the server may " +
-        "already have the complete file. Verify on the server before uploading again.",
+) : Exception(
+    "The outcome of the final PATCH to $uploadUrl is unknown; the server may already have the complete file. " +
+        "Verify on the server before uploading again.",
     cause,
 )
+
+/** Carries an exception thrown by one of the caller's callbacks (or store) so it is never reclassified. */
+internal class CallbackFailure(val error: Throwable) : RuntimeException(error)

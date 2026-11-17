@@ -76,14 +76,15 @@ class ProductionHardeningTest {
     // ---------------------------------------------------------------- F1/F2 lost final 204
 
     @Test
-    fun aLostFinal204_thenHead404_isPossiblyComplete_notExpired() = runTest {
+    fun aLostFinal204_thenHead404_isOutcomeUnknown_notExpired() = runTest {
         val bytes = testBytes(1000)
         val server = CompletingServer(1000)
-        val error = assertFailsWith<TusUploadPossiblyCompleteException> {
+        val error = assertFailsWith<TusUploadOutcomeUnknownException> {
             server.client().createAndUploadTus(createUrl, InMemoryTusFile("f", bytes),
                 options = TusUploadOptions(chunkSize = 500, retryOptions = retry()))
         }
-        assertFalse((error as Throwable) is TusUploadExpiredException)
+        assertFalse((error as Throwable) is IOException, "must not look like a retryable network error")
+        assertIs<TusUploadExpiredException>(error.cause)
         assertEquals("https://example.com/files/u0", error.uploadUrl)
         assertEquals(listOf("OPTIONS", "POST", "HEAD", "PATCH", "PATCH", "HEAD"), server.methods, "no extra POST or PATCH")
         assertContentEquals(bytes, server.processed.single())
@@ -94,28 +95,36 @@ class ProductionHardeningTest {
         val bytes = testBytes(1000)
         val server = CompletingServer(1000)
         val store = InMemoryTusUrlStore()
-        assertFailsWith<TusUploadPossiblyCompleteException> {
+        assertFailsWith<TusUploadOutcomeUnknownException> {
             server.client().resumeOrCreateAndUploadTus(createUrl, InMemoryTusFile("f", bytes), "fp", store,
                 options = TusUploadOptions(chunkSize = 500, retryOptions = retry()))
         }
         assertEquals(1, server.processed.size)
         assertEquals(1, server.methods.count { it == "POST" })
         assertEquals(2, server.methods.count { it == "PATCH" })
-        assertTrue(store.snapshot().isEmpty(), "the entry is removed; the caller verifies on the server")
+        val entry = assertNotNull(store.get("fp"), "the entry is kept until the caller has checked the server")
+        assertNotNull(entry.finalSentAt)
+        // A second call does not upload again either.
+        assertFailsWith<TusUploadOutcomeUnknownException> {
+            server.client().resumeOrCreateAndUploadTus(createUrl, InMemoryTusFile("f", bytes), "fp", store,
+                options = TusUploadOptions(chunkSize = 500, retryOptions = retry()))
+        }
+        assertEquals(1, server.processed.size)
+        assertEquals(1, server.methods.count { it == "POST" })
     }
 
     @Test
-    fun resumeOrCreate_resumingAStoredUpload_whoseFinal204IsLost_isPossiblyComplete() = runTest {
+    fun resumeOrCreate_resumingAStoredUpload_whoseFinal204IsLost_isOutcomeUnknown() = runTest {
         val bytes = testBytes(1000)
         val server = CompletingServer(1000)
         server.uploads["old"] = bytes.copyOfRange(0, 500)
         val store = InMemoryTusUrlStore().apply { set("fp", TusUpload("https://example.com/files/old", 1000, null)) }
-        assertFailsWith<TusUploadPossiblyCompleteException> {
+        assertFailsWith<TusUploadOutcomeUnknownException> {
             server.client().resumeOrCreateAndUploadTus(createUrl, InMemoryTusFile("f", bytes), "fp", store,
                 options = TusUploadOptions(chunkSize = 500, retryOptions = retry()))
         }
         assertEquals(listOf("HEAD", "PATCH", "HEAD"), server.methods, "no re-creation")
-        assertTrue(store.snapshot().isEmpty())
+        assertNotNull(store.get("fp")?.finalSentAt)
     }
 
     @Test
@@ -235,7 +244,7 @@ class ProductionHardeningTest {
             val server = ScriptedTusServer().apply { uploadLength = 100 }
             repeat(10) { server.script(method, Reply.Status(503)) }
             val client = server.client(expectSuccess = true)
-            val options = TusUploadOptions(retryOptions = retry(maxRetries = 3))
+            val options = TusUploadOptions(chunkSize = 50, retryOptions = retry(maxRetries = 3))
             val error = assertFailsWith<TusHttpException>("$method") {
                 when (method) {
                     HttpMethod.Options, HttpMethod.Post -> client.createTusUpload(createUrl, InMemoryTusFile("f", testBytes(100)), options = options)
