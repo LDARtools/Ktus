@@ -112,6 +112,13 @@ internal fun sameOrigin(a: Url, b: Url): Boolean =
         a.host.equals(b.host, ignoreCase = true) &&
         a.port == b.port
 
+/**
+ * True when [a] is the same request target as [b]: same origin, path and query. A different answer URL means
+ * the client followed a redirect, even within the same origin.
+ */
+internal fun sameTarget(a: Url, b: Url): Boolean =
+    sameOrigin(a, b) && a.encodedPath.ifEmpty { "/" } == b.encodedPath.ifEmpty { "/" } && a.encodedQuery == b.encodedQuery
+
 private fun parseHttpUrl(value: String): Url? {
     val parts = parseUriReference(value) ?: return null
     val scheme = parts.scheme?.lowercase() ?: return null

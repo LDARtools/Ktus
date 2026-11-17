@@ -132,8 +132,10 @@ httpClient.createAndUploadTus(
   must then exceed the engine's socket/request timeout plus about 10 s. The in-flight ticker runs in a side job
   that is cancelled with the request.
 - Because the in-flight ticker keeps `onActivity` alive, a watchdog fed by it cannot catch a request that never
-  completes. Bound that with the engine's timeouts (Ktor `HttpTimeout`: socket/request timeout): Ktus then
-  gives up, at worst, about `maxElapsedMillis` + one request timeout after the failures start. Size
+  completes. Bound that with the engine's timeouts (Ktor `HttpTimeout`: socket/request timeout): once the
+  budget is spent Ktus sends no further request, so it gives up, at worst, about the duration of the first
+  failing request + `maxElapsedMillis` + one request timeout (a request already in flight when the budget runs
+  out is allowed to finish). Size
   `maxElapsedMillis` to what you can really wait, or put a finite outer limit (`withTimeout`) around the call.
 - Callbacks can run on different threads: the in-flight ticker on the caller's dispatcher, and
   `onProgress`/`onActivity` during the body write on the engine's thread. Ktus never runs `onActivity`
@@ -269,24 +271,28 @@ completes), or by a definitive refusal of the final PATCH (see above). A HEAD ne
 answered by a stale server instance). A malformed answer to the final PATCH (a `2xx` with a missing or impossible
 `Upload-Offset`) is an unknown outcome too.
 
-**What to do with `TusUploadOutcomeUnknownException`:**
-1. **If the upload URL is gone** (`e.isUploadGone`: the cause is a 404/410 or a `TusUploadExpiredException`, or
-   there is no cause because the marked entry could not be resumed at all: it expired, its length no longer
-   matches the file, or its host is no longer allowed), typically because the server finished and removed the
-   upload, ask your server whether the file arrived, for example by id or by a hash of the content it stored.
-   Check this first: `TusHttpException` and `TusUploadExpiredException` are `IOException`s too, so do not test
-   `e.cause is IOException` for it.
-   **The same applies when the server keeps refusing the upload** (`e.isServerRefusal`: a non-retried 4xx such as
-   403 or 400, a `TusUploadLengthMismatchException`, a persistent `TusOffsetMismatchException`): check the server,
-   then remove the entry. Retrying these will not help, and the entry would otherwise keep failing until it
-   expires.
-2. **Otherwise, just call `resumeOrCreateAndUploadTus` again later.** It is safe: it sends HEAD to the same
-   upload URL, finds the upload complete or sends what the server is missing (a server that disagrees about
-   the offset answers 409, which protects the data), and never re-creates a marked entry. If the cause was a
-   network failure (`e.isNetworkFailure`: an `IOException` that is not a `TusProtocolException`), do not call your
-   server-check API while offline.
-3. **Remove the entry (`store.remove(fingerprint)`) only once the server has answered:** it has the file (report
-   success), or it does not and the upload URL is gone (start a fresh upload).
+**What to do with `TusUploadOutcomeUnknownException`:** every one has exactly one `e.kind`
+(`TusUploadOutcomeUnknownException.Kind`, also exposed as `isUploadGone`, `isNetworkFailure`, `isServerRefusal`),
+computed from the cause and the retry policy in use:
+
+| `e.kind` | Meaning | What to do |
+|---|---|---|
+| `UPLOAD_GONE` | 404/410 or `TusUploadExpiredException`, or no cause because the marked entry could not be resumed at all (expired, length no longer matches the file, host no longer allowed). Typically the server finished and removed the upload. | Ask your server whether the file arrived, then remove the entry. |
+| `SERVER_REFUSAL` | A 4xx your retry policy does not retry (such as 403 or 400, whether Ktor threw it or not), or a different `Upload-Length`. Retrying will not help. | Ask your server whether the file arrived, then remove the entry. |
+| `NETWORK_FAILURE` | Offline, a timeout, a connection lost. | Call `resumeOrCreateAndUploadTus` again later. Do not call your server-check API while offline. |
+| `UNKNOWN` | Anything else: an exhausted 5xx or 423, an offset mismatch (a stale server instance can cause it), a protocol error, a closed client. | Call again later. |
+
+Calling again is always safe: it sends HEAD to the same upload URL, finds the upload complete or sends what the
+server is missing (a server that disagrees about the offset answers 409, which protects the data), and never
+re-creates a marked entry.
+
+**When you check the server**, treat "received" and "still processing" as present. The PATCH whose outcome is
+unknown may still be running on some server instance, so do not check right after it unless the upload URL is
+gone; and remove the entry (`store.remove(fingerprint)`) only once the server has answered: it has the file
+(report success), or it does not and the upload URL is gone (start a fresh upload).
+
+Ktus is conservative here: a 423 or 409 answered to the final PATCH also leaves its outcome unknown (the server
+was busy with, or disagreed about, that very upload), which can cost one extra call or server check.
 
 If removing the entry fails after an upload completed, the call still succeeds and the entry stays marked; the
 next call finds the upload complete or gone, and the same steps resolve it.
@@ -352,13 +358,18 @@ try {
     httpClient.resumeOrCreateAndUploadTus(createUrl = url, file = file, fingerprint = fp, store = store) { auth() }
     markUploaded(file)
 } catch (e: TusUploadOutcomeUnknownException) {
-    when {
-        // Offline, a flaky network or a transient server error: resuming the same upload later is safe.
-        !e.isUploadGone && !e.isServerRefusal -> scheduleRetry(file)
+    when (e.kind) {
+        // Offline, a flaky network, a transient server error or a stale answer: resuming later is safe.
+        TusUploadOutcomeUnknownException.Kind.NETWORK_FAILURE,
+        TusUploadOutcomeUnknownException.Kind.UNKNOWN -> scheduleRetry(file)
         // The upload URL is gone, or the server keeps refusing it: only the server can say whether the file
-        // arrived.
-        api.serverHasFile(fileId) -> { store.remove(fp); markUploaded(file) }
-        else -> { store.remove(fp); scheduleRetry(file) } // the next call creates a fresh upload
+        // arrived ("received" or "still processing" both count as arrived).
+        TusUploadOutcomeUnknownException.Kind.UPLOAD_GONE,
+        TusUploadOutcomeUnknownException.Kind.SERVER_REFUSAL -> when (api.serverHasOrIsProcessing(fileId)) {
+            true -> { store.remove(fp); markUploaded(file) }
+            false -> { store.remove(fp); scheduleRetry(file) } // the next call creates a fresh upload
+            null -> scheduleRetry(file) // could not reach the server: ask again later
+        }
     }
 } catch (e: IOException) {
     scheduleRetry(file) // offline, timeouts, retryable statuses: the store entry is kept for the next attempt
@@ -366,7 +377,7 @@ try {
 ```
 
 Catch `TusUploadOutcomeUnknownException` before any catch-all `catch (e: Exception)`, and make the
-`serverHasFile` call itself handle being offline (treat a failure there as "try again later").
+server-check call itself handle being offline (treat a failure there as "try again later").
 
 **Your own callback exceptions are not wrapped.** If `onProgress`, `onActivity` or `onConfirmed` throws during or
 after the final PATCH (with `createAndUploadTus`, `uploadTus` or `resumeOrCreateAndUploadTus`), the call ends with

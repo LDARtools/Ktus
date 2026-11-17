@@ -87,8 +87,9 @@ suspend fun HttpClient.createTusUpload(
  * The file size is read once at the start. The upload fails if the size changes before it completes,
  * if the server's `Upload-Length` differs from it, or if the server reports an impossible offset.
  *
- * @receiver HttpClient Ktor HTTP client used for requests. Configure it with `followRedirects = false`;
- *   Ktus rejects redirected tus requests.
+ * @receiver HttpClient Ktor HTTP client used for requests. Configure it with `followRedirects = false`.
+ *   Ktus rejects any 3xx it sees, and any answer that came from a different URL than it asked (the client
+ *   followed a redirect), but only after the engine has followed it.
  * @param uploadUrl Absolute URL of the tus upload resource (returned by server on create).
  * @param file The file to upload; must implement [ITusFile].
  * @param options Upload options controlling retries, chunk size and capability checks.
@@ -346,7 +347,8 @@ private suspend fun HttpClient.resumeOrCreateInternal(
         if (stored.finalSentAt != null) {
             // The final PATCH of this upload may have landed. Never drop or re-create it.
             if (!isResumable(stored, total, createUrl, options, nowMillis)) {
-                throw TusUploadOutcomeUnknownException(stored.uploadUrl)
+                throw TusUploadOutcomeUnknownException(stored.uploadUrl, null,
+                    TusUploadOutcomeUnknownException.Kind.UPLOAD_GONE)
             }
             upload(stored)
             return
@@ -788,6 +790,8 @@ private suspend fun HttpClient.uploadInternal(
                             if (locked) LOCKED_MIN_DELAY_MILLIS else 0L, applyMinDelay = originMayBeBusy)) {
                         throw patchRetriesExhausted(outcome, patchAttempts)
                     }
+                    // The wait used up the rest of the budget: stop instead of sending another full request.
+                    if (backoff.budgetExhausted()) throw patchRetriesExhausted(outcome, patchAttempts)
                     // The PATCH may or may not have been applied: ask the server where it is.
                     var serverOffset = headOffset(uploadUrl, total, retry, backoff, onActivity, heartbeat, block)
                     // Below what the server already confirmed: probably a stale instance. Ask again a few times
@@ -806,6 +810,9 @@ private suspend fun HttpClient.uploadInternal(
                         // The server kept (some of) the data: that is progress, start a fresh failure run.
                         patchAttempts = 0
                         backoff.reset()
+                    } else if (backoff.budgetExhausted() && serverOffset < total) {
+                        // No progress and the HEAD took the rest of the budget: do not send another PATCH.
+                        throw patchRetriesExhausted(outcome, patchAttempts)
                     }
                     if (serverOffset < total) finalMayHaveLanded = false // persisted flag is kept
                     offset = serverOffset
@@ -825,7 +832,7 @@ private suspend fun HttpClient.uploadInternal(
         // outcome unknown; only a definitive refusal (4xx, redirect, short read) with no earlier unknown final
         // PATCH in the call is not.
         if (finalMayHaveLanded || finalEverUncertain || (finalUnresolved && !freshDefinitiveRefusal)) {
-            throw TusUploadOutcomeUnknownException(uploadUrl, e)
+            throw TusUploadOutcomeUnknownException(uploadUrl, e, classifyOutcomeUnknown(e, retry))
         }
         throw e
     }

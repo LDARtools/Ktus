@@ -607,7 +607,8 @@ class Adv6DefinitiveRefusalTest {
         for (status in listOf(400, 403, 413)) assertTrue(e(TusHttpException(status, "PATCH")).isServerRefusal, "$status")
         for (status in listOf(401, 404, 409, 410, 423, 429, 500, 503)) assertFalse(e(TusHttpException(status, "PATCH")).isServerRefusal, "$status")
         assertTrue(e(TusUploadLengthMismatchException(1, 2)).isServerRefusal)
-        assertTrue(e(TusOffsetMismatchException("x")).isServerRefusal)
+        // An offset mismatch can come from a stale instance: call again later, not a refusal.
+        assertFalse(e(TusOffsetMismatchException("x")).isServerRefusal)
         assertFalse(e(kotlinx.io.IOException("offline")).isServerRefusal)
         assertFalse(e(null).isServerRefusal)
     }

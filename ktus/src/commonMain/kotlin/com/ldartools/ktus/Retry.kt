@@ -77,6 +77,12 @@ internal class Backoff(
         runStart = null
     }
 
+    /** A run of failures is in progress and has used up [RetryOptions.maxElapsedMillis]. */
+    fun budgetExhausted(): Boolean {
+        val start = runStart ?: return false
+        return start.elapsedNow().inWholeMilliseconds >= options.maxElapsedMillis
+    }
+
     /**
      * Records a failure. When another attempt is allowed, waits the backoff delay and returns true.
      * Returns false (without waiting) when the operation has used [RetryOptions.maxRetries] attempts or
@@ -248,10 +254,10 @@ private suspend fun classifyResponse(
     // from somewhere else than the upload URL.
     val answeredUrl = response.call.request.url
     val target = try { Url(targetUrl) } catch (e: Exception) { null }
-    if (target != null && !sameOrigin(answeredUrl, target)) {
+    if (target != null && !sameTarget(answeredUrl, target)) {
         return Outcome.Fail(RedirectedAnswerException(
-            "tus ${op.method} to $targetUrl was answered by $answeredUrl; the client followed a redirect to " +
-                "another origin. Configure the HttpClient with followRedirects = false."
+            "tus ${op.method} to $targetUrl was answered by $answeredUrl; the client followed a redirect. " +
+                "Configure the HttpClient with followRedirects = false."
         ))
     }
 

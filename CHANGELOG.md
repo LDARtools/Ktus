@@ -30,8 +30,10 @@ Two new failure types are not `IOException`s, so a "network error, retry later" 
   prove nothing reached the origin (connection refused or unreachable, DNS failure, no network, connect
   timeout, TLS handshake failure, and NSURLErrorDomain -1003, -1004, -1006, -1022 and -1201 to -1206 on iOS), or to HEAD/OPTIONS/POST.
   The decision comes from the failure, not from upload progress, which some engines report before connecting.
-- `TusUploadOutcomeUnknownException.isUploadGone`, `.isServerRefusal` and `.isNetworkFailure`, to decide between
-  "check the server" and "call again later" without hand-rolled cause checks.
+- `TusUploadOutcomeUnknownException.kind` (`UPLOAD_GONE`, `SERVER_REFUSAL`, `NETWORK_FAILURE`, `UNKNOWN`, exactly one
+  per exception, computed from the cause and the retry policy in use) and the matching `isUploadGone`,
+  `isServerRefusal` and `isNetworkFailure`, to decide between "check the server" and "call again later" without
+  hand-rolled cause checks. An offset mismatch is `UNKNOWN` (a stale server instance can cause it).
 - `TusUploadOptions.activityHeartbeatMillis` (default 5 s; null turns it off): `onActivity` ticks while a
   request is in flight.
 - `onFinalPatch` callback on `uploadTus`, `createAndUploadTus` and `resumeOrCreateAndUploadTus`: called right
@@ -112,7 +114,10 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
   the host is in `allowedUploadHosts`; https to http is always rejected, and so is a `Location` with user
   information (`user@host`).
 - **Any 3xx answer is an error** (`TusProtocolException`), and an answer the client got by following a
-  redirect to another origin is rejected.
+  redirect (to any other URL, the same origin included) is rejected; on a final PATCH that is an unknown outcome.
+- **No request is sent once the retry budget is spent.** After the backoff wait, and after the recovery HEAD,
+  Ktus stops if `maxElapsedMillis` is used up, so a call gives up at most about one request timeout after the
+  budget ends.
 - **404/410 from POST or OPTIONS** is a `TusHttpException`, no longer a `TusUploadExpiredException`.
 - **Retry defaults are longer.** `maxRetries` 3 → 10, `maxDelayMillis` 10 s → 30 s, plus a new 10-minute
   `maxElapsedMillis` budget. Worst case for one operation that keeps failing: about 10 attempts with up to

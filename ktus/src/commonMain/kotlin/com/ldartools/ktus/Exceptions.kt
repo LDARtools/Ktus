@@ -80,49 +80,73 @@ open class TusLocalFileException(message: String, cause: Throwable? = null) : Tu
 class TusUploadOutcomeUnknownException(
     val uploadUrl: String,
     cause: Throwable? = null,
+    /** What to do next; see [Kind]. Computed from [cause] (and the retry policy in use) when Ktus throws it. */
+    val kind: Kind = classifyOutcomeUnknown(cause, RetryOptions()),
 ) : Exception(
     "The outcome of the final PATCH to $uploadUrl is unknown; the server may already have the complete file. " +
         "Verify on the server before uploading again.",
     cause,
 ) {
-    /**
-     * The upload URL is gone or cannot be used: the server answered 404/410 (typically because it finished and
-     * removed the upload), or there is no cause because a marked stored entry could not be resumed at all (it
-     * expired, its length no longer matches the file, or its URL is on a host that is no longer allowed). Only
-     * the server can say whether the file arrived; check it.
-     */
-    val isUploadGone: Boolean
-        get() = when (val c = cause) {
-            null -> true
-            is TusUploadExpiredException -> true
-            is TusHttpException -> c.statusCode == 404 || c.statusCode == 410
-            else -> false
-        }
+    /** Exactly one of these applies to every [TusUploadOutcomeUnknownException]. */
+    enum class Kind {
+        /**
+         * The upload URL is gone or cannot be used: the server answered 404/410 (typically because it finished
+         * and removed the upload), or there is no cause because a marked stored entry could not be resumed at all
+         * (it expired, its length no longer matches the file, or its URL is on a host that is no longer allowed).
+         * Only the server can say whether the file arrived: check it.
+         */
+        UPLOAD_GONE,
 
-    /**
-     * The last failure was a network error (offline, timeout, connection lost), not an answer from the server.
-     * Calling [resumeOrCreateAndUploadTus] again later is the right response. Note that [TusProtocolException]
-     * (and so [TusHttpException] and [TusUploadExpiredException]) also extends `IOException`; those are not
-     * network failures and are excluded here.
-     */
-    val isNetworkFailure: Boolean
-        get() = cause.let { it is kotlinx.io.IOException && it !is TusProtocolException }
+        /**
+         * The last failure was a network error (offline, timeout, connection lost), not an answer from the
+         * server. Call [resumeOrCreateAndUploadTus] again later; do not check the server while offline.
+         */
+        NETWORK_FAILURE,
 
-    /**
-     * The server keeps refusing this upload in a way retrying will not fix: a 4xx that Ktus does not retry
-     * (other than 404/410, see [isUploadGone]), a different `Upload-Length`
-     * ([TusUploadLengthMismatchException]), or an impossible offset ([TusOffsetMismatchException]). Check the
-     * server, then remove the stored entry; do not keep retrying until it expires.
-     */
-    val isServerRefusal: Boolean
-        get() = when (val c = cause) {
-            is TusHttpException -> c.statusCode in 400..499 && c.statusCode !in RETRIED_OR_GONE_4XX
-            is TusUploadLengthMismatchException, is TusOffsetMismatchException -> true
-            else -> false
-        }
+        /**
+         * The server refuses this upload in a way retrying will not fix: a 4xx that the retry policy does not
+         * retry (other than 404/410), or a different `Upload-Length` ([TusUploadLengthMismatchException]). Check
+         * the server, then remove the stored entry.
+         */
+        SERVER_REFUSAL,
 
-    private companion object {
-        val RETRIED_OR_GONE_4XX = setOf(401, 404, 408, 409, 410, 423, 429)
+        /**
+         * Anything else (an exhausted 5xx or 423, an offset mismatch that a stale server instance can cause, a
+         * protocol error, a closed client). Call again later; resuming the same upload is safe.
+         */
+        UNKNOWN,
+    }
+
+    /** [kind] is [Kind.UPLOAD_GONE]. */
+    val isUploadGone: Boolean get() = kind == Kind.UPLOAD_GONE
+
+    /** [kind] is [Kind.NETWORK_FAILURE]. */
+    val isNetworkFailure: Boolean get() = kind == Kind.NETWORK_FAILURE
+
+    /** [kind] is [Kind.SERVER_REFUSAL]. */
+    val isServerRefusal: Boolean get() = kind == Kind.SERVER_REFUSAL
+}
+
+/**
+ * The [TusUploadOutcomeUnknownException.Kind] for [cause], given the retry policy [retry] that was in use.
+ * Total: every cause maps to exactly one kind.
+ */
+internal fun classifyOutcomeUnknown(cause: Throwable?, retry: RetryOptions): TusUploadOutcomeUnknownException.Kind {
+    val status = when (cause) {
+        is TusHttpException -> cause.statusCode
+        is io.ktor.client.plugins.ResponseException -> cause.response.status.value
+        else -> null
+    }
+    return when {
+        cause == null || cause is TusUploadExpiredException -> TusUploadOutcomeUnknownException.Kind.UPLOAD_GONE
+        status == 404 || status == 410 -> TusUploadOutcomeUnknownException.Kind.UPLOAD_GONE
+        status != null && status in 400..499 && status != 409 && status !in retry.retryableStatusCodes &&
+            !(status == 401 && retry.retryOnUnauthorized) -> TusUploadOutcomeUnknownException.Kind.SERVER_REFUSAL
+        status != null -> TusUploadOutcomeUnknownException.Kind.UNKNOWN
+        cause is TusUploadLengthMismatchException -> TusUploadOutcomeUnknownException.Kind.SERVER_REFUSAL
+        cause is TusProtocolException -> TusUploadOutcomeUnknownException.Kind.UNKNOWN // includes TusOffsetMismatchException (stale HEAD)
+        cause is kotlinx.io.IOException -> TusUploadOutcomeUnknownException.Kind.NETWORK_FAILURE
+        else -> TusUploadOutcomeUnknownException.Kind.UNKNOWN
     }
 }
 
