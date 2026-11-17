@@ -15,6 +15,7 @@ import com.ldartools.ktus.copyExactly
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.concurrent.AtomicInt
 import kotlin.concurrent.AtomicLong
 import kotlin.test.*
@@ -211,6 +212,9 @@ class DarwinRealSocketTest {
                 }
             }
             assertIs<TusLocalFileException>(error, "was $error")
+            // Let the server finish with the aborted request before looking at what it stored.
+            withTimeoutOrNull(2_000) { while (server.log.count { it.method == "PATCH" } < 2) delay(20) }
+            delay(200)
             val patches = server.log.filter { it.method == "PATCH" }
             // NSURLSession may abort the second request before the server even logs it; it is never retried.
             assertTrue(patches.size in 1..2, "${server.log}")
