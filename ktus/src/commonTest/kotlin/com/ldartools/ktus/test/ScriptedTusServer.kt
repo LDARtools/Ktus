@@ -65,6 +65,9 @@ class ScriptedTusServer(
     var uploadExpires: String? = null
     var tusResumableOnOptions = true
 
+    /** Answer 423 Locked to HEAD and PATCH while `clock()` is below this (tusdotnet's per-file lock). */
+    var lockedUntil: Long = Long.MIN_VALUE
+
     val requests = mutableListOf<Recorded>()
     private val scripts = mutableMapOf<String, ArrayDeque<Reply>>()
 
@@ -101,6 +104,9 @@ class ScriptedTusServer(
             headers = request.headers.entries().associate { it.key to it.value.joinToString(",") },
         )
 
+        if ((request.method == HttpMethod.Head || request.method == HttpMethod.Patch) && clock() < lockedUntil) {
+            return respond("locked", HttpStatusCode.Locked)
+        }
         val reply = scripts[request.method.value]?.removeFirstOrNull()
         if (reply != null) {
             if (reply.apply && request.method == HttpMethod.Patch) applyPatch(request, body)

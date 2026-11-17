@@ -40,7 +40,7 @@ kotlin {
         commonMain.dependencies {
             //put your multiplatform dependencies here
             implementation(libs.ktor.client.core)
-            implementation(project(":ktus"))
+            api(project(":ktus"))
             implementation(libs.okio)
         }
 

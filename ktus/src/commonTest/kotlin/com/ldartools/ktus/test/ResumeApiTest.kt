@@ -166,13 +166,16 @@ class ResumeApiTest {
     }
 
     @Test
-    fun otherResumeFailures_propagate_andKeepTheEntry() = runTest {
+    fun transientResumeFailures_propagate_andKeepTheEntry() = runTest {
+        // A permanent refusal (403) now re-creates the upload; see ProductionHardeningTest.
         val file = InMemoryTusFile("f", testBytes(100))
         val server = ScriptedTusServer()
-        server.script(HttpMethod.Head, Reply.Status(403))
+        repeat(5) { server.script(HttpMethod.Head, Reply.Status(502)) }
         val store = InMemoryTusUrlStore().apply { set("fp", TusUpload("https://example.com/files/old", 100, null)) }
         assertFailsWith<TusHttpException> {
-            server.client().resumeOrCreateAndUploadTus(createUrl, file, "fp", store, nowMillis = { now })
+            server.client().resumeOrCreateAndUploadTus(createUrl, file, "fp", store, nowMillis = { now },
+                options = TusUploadOptions(retryOptions = RetryOptions(maxRetries = 3, initialDelayMillis = 1,
+                    timeSource = testScheduler.timeSource)))
         }
         assertEquals(0, server.count(HttpMethod.Post))
         assertNotNull(store.get("fp"))

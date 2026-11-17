@@ -50,3 +50,23 @@ class TusHttpException(
     message: String = "tus $method request failed with HTTP $statusCode",
     cause: Throwable? = null,
 ) : TusProtocolException(message, cause)
+
+/**
+ * The response to the PATCH that carried the last bytes of the file was lost, and the server then answered
+ * the follow-up HEAD with 404/410. The server may have stored the whole file and finished (and, like
+ * tusdotnet, removed) the upload, or the upload may really have expired. Ktus cannot tell which.
+ *
+ * Check on the server (by the file's id, checksum or name) whether the file arrived before uploading it
+ * again. It is deliberately not a [TusUploadExpiredException], so code that re-creates expired uploads
+ * does not upload the file twice.
+ *
+ * @property uploadUrl the upload whose final response was lost.
+ */
+class TusUploadPossiblyCompleteException(
+    val uploadUrl: String,
+    cause: Throwable? = null,
+) : TusProtocolException(
+    "The final PATCH response for $uploadUrl was lost and the upload is now gone (404/410); the server may " +
+        "already have the complete file. Verify on the server before uploading again.",
+    cause,
+)

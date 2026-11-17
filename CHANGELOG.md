@@ -9,6 +9,11 @@ and constructor signatures remain in the binary as hidden overloads, so code com
 against 1.1.0.
 
 ### Added
+- `onActivity` callback on `uploadTus`, `createAndUploadTus` and `resumeOrCreateAndUploadTus`: fires on every
+  request, on body progress and at least every 5 s while waiting to retry. Use it for stall watchdogs;
+  `onProgress` is silent during retry waits.
+- `TusUploadPossiblyCompleteException`: the final PATCH response was lost and the upload is gone; verify on
+  the server before uploading again.
 - `createTusUpload(...)`: creates an upload and returns a `TusUpload` (URL, length, `expiresAt` parsed from
   `Upload-Expires`).
 - `TusUrlStore`, `InMemoryTusUrlStore` and `resumeOrCreateAndUploadTus(...)`: resume a stored upload when it is
@@ -37,7 +42,14 @@ against 1.1.0.
 - 404/410 from POST or OPTIONS is now a `TusHttpException`, not a `TusUploadExpiredException`; 404/410 from
   HEAD or PATCH is still `TusUploadExpiredException`.
 - Any other 4xx/5xx is a `TusHttpException` carrying the status. With `expectSuccess = true` Ktor's own
-  `ClientRequestException`/`ServerResponseException` is still rethrown, as in 1.0.x.
+  `ClientRequestException`/`ServerResponseException` is still rethrown for these non-retried statuses, as in
+  1.0.x. When retries of a retryable status run out, every method throws `TusHttpException`, with Ktor's
+  exception as its `cause` when the client threw one.
+- 423 Locked is not counted against `maxRetries`; only the elapsed budget bounds a lock.
+- A closed `HttpClient` fails at once with `IllegalStateException` instead of being retried.
+- `resumeOrCreateAndUploadTus` drops a stored upload whose resume fails permanently (a protocol error or a
+  non-retried status such as 403) and creates a new one, once.
+- `ktus-okio` exposes `ktus` as an `api` dependency, since `ITusFile` is part of its public API.
 - After every PATCH whose outcome is unknown (network error, timeout, retryable status, 409, any 2xx other than
   204) Ktus backs off, sends HEAD, and continues from the server's offset. 1.0.x re-sent the same chunk at the
   old offset after a network error (and, with `expectSuccess = true`, after a 5xx).
@@ -87,18 +99,23 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
 - **HEAD before every re-PATCH.** After any PATCH whose outcome is unknown, Ktus waits, sends HEAD and
   continues from the server's offset, so a retry costs one extra request. If that HEAD reports an offset below
   one the server already confirmed, the upload fails with `TusOffsetMismatchException` instead of rewinding.
-- **A lost final response can look like an expired upload.** If the server stores the last chunk but its `204`
-  never reaches the client, the follow-up HEAD can answer 404/410 because the server has already finished
-  (and, on some servers, removed or moved) the upload. That surfaces as `TusUploadExpiredException`.
-  When it is thrown while the last chunk was in flight, check on your server whether the file arrived before
-  uploading it again.
+- **A lost final response is reported separately.** If the server stores the last chunk but its `204` never
+  reaches the client, the follow-up HEAD can answer 404/410 because the server has already finished (and, like
+  tusdotnet, removed) the upload. Ktus throws the new `TusUploadPossiblyCompleteException` (not a
+  `TusUploadExpiredException`), and `resumeOrCreateAndUploadTus` removes the stored entry and rethrows it
+  rather than uploading the file again. **Callers must check on the server whether the file arrived before
+  uploading it again.** A 404/410 after an earlier chunk is still `TusUploadExpiredException`.
+- **The size check stops once the server has every byte**, and an edit that keeps the file's size is never
+  detected.
 - **Exceptions thrown by `onProgress`** are rethrown as they are and end the upload; they are never treated as
   network errors and retried.
 
 ### Build and CI
 - Every GitHub Action is pinned to a full commit SHA; workflows default to `permissions: contents: read`.
 - Publishing runs only for full releases, runs the JVM tests first, checks that the release tag equals the
-  Gradle version, and reads its secrets from the `maven-central` environment.
+  Gradle version, and runs in the `maven-central` GitHub environment. The maintainer must create that
+  environment with required reviewers and move the Maven Central and signing secrets into it; secrets left at
+  repository level would bypass the protection.
 - Gradle wrapper validation in every workflow, and `distributionSha256Sum` in `gradle-wrapper.properties`.
 - A macOS CI job compiles the iOS targets.
 - Build outputs are no longer committed.

@@ -68,7 +68,7 @@ suspend fun HttpClient.createTusUpload(
     block: suspend HttpRequestBuilder.() -> Unit = {}
 ): TusUpload = withFileLock(file, options) {
     val total = snapshotSize(file, options)
-    createUploadInternal(createUrl, total, metadata, options, block)
+    createUploadInternal(createUrl, total, metadata, options, null, block)
 }
 
 /**
@@ -93,10 +93,17 @@ suspend fun HttpClient.createTusUpload(
  * @param onConfirmed Optional callback invoked with `(offset, total)` each time the server confirms a
  *   larger offset (a PATCH answered 204, or a HEAD after a failure), and exactly once with
  *   `offset == total` when the upload is complete, including when the HEAD shows it was already complete.
+ * @param onActivity Optional callback invoked whenever Ktus is doing something: a request starts or gets
+ *   its response, the PATCH body makes progress, and at least every 5 seconds while it waits to retry.
+ *   Use it, not [onProgress], to feed a stall watchdog: recovery can legitimately send no body bytes for
+ *   minutes, but it always reports activity.
  * @param block Optional lambda to customize the underlying HTTP request builder for each request.
  *
  * @throws TusProtocolException When the server response does not follow the tus protocol.
  * @throws TusUploadExpiredException If the server reports the upload as expired or missing (404/410).
+ * @throws TusUploadPossiblyCompleteException If the response to the PATCH carrying the last bytes was lost
+ *   and the server then answered 404/410: it may have stored and finished the upload. Check on the server
+ *   before uploading again.
  * @throws TusUploadLengthMismatchException If the server's `Upload-Length` differs from the file size.
  * @throws TusOffsetMismatchException If the server reports an impossible offset.
  * @throws TusHttpException If the server answers with an HTTP error status Ktus does not retry, or keeps
@@ -108,11 +115,12 @@ suspend fun HttpClient.uploadTus(
     options: TusUploadOptions = TusUploadOptions(),
     onProgress: ((sent: Long, total: Long) -> Unit)? = null,
     onConfirmed: ((offset: Long, total: Long) -> Unit)? = null,
+    onActivity: (() -> Unit)? = null,
     block: suspend HttpRequestBuilder.() -> Unit = {}
 ) {
     withFileLock(file, options) {
         val total = snapshotSize(file, options)
-        uploadInternal(uploadUrl, file, total, options, onProgress, onConfirmed, block)
+        uploadInternal(uploadUrl, file, total, options, onProgress, onConfirmed, onActivity, block)
     }
 }
 
@@ -143,11 +151,13 @@ suspend fun HttpClient.uploadTus(
  * @param onProgress Optional callback invoked with `(sent, total)` bytes during upload; see [uploadTus].
  * @param onCreate Optional callback invoked with the upload URL returned by the server after creation.
  * @param onConfirmed Optional callback with the server-confirmed offset; see [uploadTus].
+ * @param onActivity Optional liveness callback for a stall watchdog; see [uploadTus].
  * @param block Optional lambda to customize the underlying [HttpRequestBuilder] for requests.
  *
  * @throws TusProtocolException If the server responses do not follow the tus protocol.
  * @throws TusUploadExpiredException If the server reports the upload as expired or missing.
  * @throws TusOffsetMismatchException If the server returns an impossible offset during upload.
+ * @throws TusUploadPossiblyCompleteException If the final response was lost; see [uploadTus].
  * @throws TusHttpException If the server answers with an HTTP error status Ktus does not retry.
  */
 suspend fun HttpClient.createAndUploadTus(
@@ -158,13 +168,14 @@ suspend fun HttpClient.createAndUploadTus(
     onProgress: ((sent: Long, total: Long) -> Unit)? = null,
     onCreate: ((uploadUrl: String) -> Unit)? = null,
     onConfirmed: ((offset: Long, total: Long) -> Unit)? = null,
+    onActivity: (() -> Unit)? = null,
     block: suspend HttpRequestBuilder.() -> Unit = {}
 ) {
     withFileLock(file, options) {
         val total = snapshotSize(file, options)
-        val upload = createUploadInternal(createUrl, total, metadata, options, block)
+        val upload = createUploadInternal(createUrl, total, metadata, options, onActivity, block)
         onCreate?.invoke(upload.uploadUrl)
-        uploadInternal(upload.uploadUrl, file, total, options, onProgress, onConfirmed, block)
+        uploadInternal(upload.uploadUrl, file, total, options, onProgress, onConfirmed, onActivity, block)
     }
 }
 
@@ -191,7 +202,14 @@ suspend fun HttpClient.createAndUploadTus(
  *    crash or cancellation mid-upload can resume next time.
  * 3. When the upload completes the entry is removed.
  *
- * Any other failure leaves the entry in place for the next attempt.
+ * If resuming the stored upload fails permanently (a protocol error, or an HTTP status that is not
+ * retried, such as 403), the entry is dropped and a new upload is created, once.
+ *
+ * If the response to the last chunk is lost and the server then answers 404/410, the server may already
+ * have the whole file: the entry is removed and [TusUploadPossiblyCompleteException] is thrown. Check on the
+ * server before uploading again; calling this function again would upload the file a second time.
+ *
+ * Network failures and exhausted retryable statuses leave the entry in place for the next attempt.
  *
  * @param fingerprint identifies this file (and this version of it) in [store]. Choose something that
  *   changes when the content changes, such as path + size + modification time, or a hash.
@@ -210,6 +228,7 @@ suspend fun HttpClient.resumeOrCreateAndUploadTus(
     onCreate: ((uploadUrl: String) -> Unit)? = null,
     onConfirmed: ((offset: Long, total: Long) -> Unit)? = null,
     nowMillis: () -> Long = { GMTDate().timestamp },
+    onActivity: (() -> Unit)? = null,
     block: suspend HttpRequestBuilder.() -> Unit = {}
 ) {
     withFileLock(file, options) {
@@ -219,22 +238,36 @@ suspend fun HttpClient.resumeOrCreateAndUploadTus(
         if (stored != null) {
             if (isResumable(stored, total, createUrl, options, nowMillis)) {
                 try {
-                    uploadInternal(stored.uploadUrl, file, total, options, onProgress, onConfirmed, block)
+                    uploadInternal(stored.uploadUrl, file, total, options, onProgress, onConfirmed, onActivity, block)
                     store.remove(fingerprint)
                     return@withFileLock
+                } catch (e: TusUploadPossiblyCompleteException) {
+                    store.remove(fingerprint)
+                    throw e
                 } catch (e: TusUploadExpiredException) {
                     // Gone on the server: fall through and create a new upload.
                 } catch (e: TusUploadLengthMismatchException) {
                     // The URL belongs to a different version of the file: start over.
+                } catch (e: TusProtocolException) {
+                    // A permanent refusal of the stored URL: start over (once). Transient ones keep the entry.
+                    if (!isPermanentFailure(e, options.retryOptions)) throw e
+                } catch (e: ResponseException) {
+                    // expectSuccess = true: Ktor's exception for a non-retried status.
+                    if (!isPermanentStatus(e.response.status.value, options.retryOptions)) throw e
                 }
             }
             store.remove(fingerprint)
         }
 
-        val upload = createUploadInternal(createUrl, total, metadata, options, block)
+        val upload = createUploadInternal(createUrl, total, metadata, options, onActivity, block)
         store.set(fingerprint, upload)
         onCreate?.invoke(upload.uploadUrl)
-        uploadInternal(upload.uploadUrl, file, total, options, onProgress, onConfirmed, block)
+        try {
+            uploadInternal(upload.uploadUrl, file, total, options, onProgress, onConfirmed, onActivity, block)
+        } catch (e: TusUploadPossiblyCompleteException) {
+            store.remove(fingerprint)
+            throw e
+        }
         store.remove(fingerprint)
     }
 }
@@ -260,6 +293,7 @@ suspend fun HttpClient.terminateTus(
         targetUrl = uploadUrl,
         options = retry,
         backoff = Backoff(retry),
+        client = this,
         send = {
             delete(uploadUrl) {
                 tusVersionHeader()
@@ -297,6 +331,13 @@ private fun ensureSizeUnchanged(file: ITusFile, total: Long) {
     }
 }
 
+private fun isPermanentStatus(status: Int, retry: RetryOptions): Boolean =
+    status != 0 && status !in retry.retryableStatusCodes && !(status == 401 && retry.retryOnUnauthorized) &&
+        status !in 500..599
+
+private fun isPermanentFailure(e: TusProtocolException, retry: RetryOptions): Boolean =
+    if (e is TusHttpException) isPermanentStatus(e.statusCode, retry) else true
+
 private fun isResumable(
     stored: TusUpload,
     total: Long,
@@ -320,6 +361,7 @@ private suspend fun HttpClient.createUploadInternal(
     total: Long,
     metadata: Map<String, String>,
     options: TusUploadOptions,
+    onActivity: (() -> Unit)?,
     block: suspend HttpRequestBuilder.() -> Unit,
 ): TusUpload {
     // Validate the metadata before touching the network.
@@ -331,7 +373,9 @@ private suspend fun HttpClient.createUploadInternal(
             op = TusOp.OPTIONS,
             targetUrl = createUrl,
             options = retry,
-            backoff = Backoff(retry),
+            backoff = Backoff(retry, onActivity),
+            client = this,
+            onActivity = onActivity,
             send = {
                 optionsRequest(urlString = createUrl) {
                     // Per TUS spec, Tus-Resumable MUST NOT be included in OPTIONS requests.
@@ -354,7 +398,9 @@ private suspend fun HttpClient.createUploadInternal(
         op = TusOp.POST,
         targetUrl = createUrl,
         options = retry,
-        backoff = Backoff(retry),
+        backoff = Backoff(retry, onActivity),
+        client = this,
+        onActivity = onActivity,
         send = {
             post(urlString = createUrl) {
                 header("Upload-Length", total.toString())
@@ -389,12 +435,13 @@ private suspend fun HttpClient.uploadInternal(
     options: TusUploadOptions,
     onProgress: ((sent: Long, total: Long) -> Unit)?,
     onConfirmed: ((offset: Long, total: Long) -> Unit)?,
+    onActivity: (() -> Unit)?,
     block: suspend HttpRequestBuilder.() -> Unit,
 ) {
     val retry = options.retryOptions
-    val backoff = Backoff(retry)
+    val backoff = Backoff(retry, onActivity)
 
-    var offset = headOffset(uploadUrl, total, retry, backoff, block)
+    var offset = headOffset(uploadUrl, total, retry, backoff, onActivity, block)
     backoff.reset()
     var confirmed = offset
     if (offset == total) {
@@ -415,7 +462,7 @@ private suspend fun HttpClient.uploadInternal(
         val body = TusPatchContent(file, start, length)
         var callbackError: Throwable? = null
         val outcome = try {
-            attemptTus(TusOp.PATCH, uploadUrl, retry) {
+            attemptTus(TusOp.PATCH, uploadUrl, retry, client = this, onActivity = onActivity) {
                 patch(urlString = uploadUrl) {
                     tusVersionHeader()
                     header("Upload-Offset", start.toString())
@@ -425,6 +472,7 @@ private suspend fun HttpClient.uploadInternal(
                     // Progress listener hook (Ktor capability): bytes handed to the engine so far.
                     onUpload { bytesSentTotal, _ ->
                         try {
+                            onActivity?.invoke()
                             onProgress?.invoke(start + bytesSentTotal, total)
                         } catch (e: Throwable) {
                             // The caller's own failure; remembered so it is not mistaken for a network error.
@@ -453,7 +501,8 @@ private suspend fun HttpClient.uploadInternal(
                 offset = serverOffset
                 patchAttempts = 0
                 backoff.reset()
-                ensureSizeUnchanged(file, total)
+                // Once the server has every byte, a later change to the file no longer matters.
+                if (offset < total) ensureSizeUnchanged(file, total)
                 if (offset > confirmed) {
                     confirmed = offset
                     onConfirmed?.invoke(offset, total)
@@ -466,11 +515,20 @@ private suspend fun HttpClient.uploadInternal(
                 if (outcome.timedOut && options.adaptiveChunkSize) {
                     chunkSize = max(minChunkSize, chunkSize / 2)
                 }
+                // 423 Locked (tusdotnet's per-file lock) is bounded by the elapsed budget only.
+                if (outcome.statusCode == 423) patchAttempts--
                 if (!backoff.awaitRetry(patchAttempts, outcome.retryAfterMillis)) {
                     throw patchRetriesExhausted(outcome, patchAttempts)
                 }
                 // The PATCH may or may not have been applied: ask the server where it is.
-                val serverOffset = headOffset(uploadUrl, total, retry, backoff, block)
+                val serverOffset = try {
+                    headOffset(uploadUrl, total, retry, backoff, onActivity, block)
+                } catch (e: TusUploadExpiredException) {
+                    // If this PATCH carried the last byte, the server may have stored it and then finished
+                    // (and removed) the upload, as tusdotnet does. That is not an expired upload.
+                    if (start + length == total) throw TusUploadPossiblyCompleteException(uploadUrl, e)
+                    throw e
+                }
                 if (serverOffset < confirmed) {
                     // The server already confirmed more than this. Rewinding would re-send data it said it
                     // stored (and a flapping offset would loop forever), so stop.
@@ -510,12 +568,15 @@ private suspend fun HttpClient.headOffset(
     total: Long,
     retry: RetryOptions,
     backoff: Backoff,
+    onActivity: (() -> Unit)?,
     block: suspend HttpRequestBuilder.() -> Unit,
 ): Long = retryTusOperation(
     op = TusOp.HEAD,
     targetUrl = uploadUrl,
     options = retry,
     backoff = backoff,
+    client = this,
+    onActivity = onActivity,
     send = {
         head(uploadUrl) {
             tusVersionHeader()

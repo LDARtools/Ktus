@@ -15,14 +15,16 @@ import kotlin.time.TimeSource
  * Retrying stops at whichever comes first:
  * - [maxElapsedMillis] — the primary cap. Time is counted from the first failure of the current run of
  *   consecutive failures; any upload progress (a PATCH the server accepted) starts a fresh run.
- * - [maxRetries] — the maximum number of **attempts** for one operation (one OPTIONS, POST, HEAD or DELETE,
- *   or the PATCHes for one chunk), including the first attempt. Despite its name it is not "retries after
- *   the first try": `maxRetries = 3` means at most 3 attempts.
+ * - [maxRetries] — the maximum number of **attempts** for one operation (one OPTIONS, POST, HEAD or
+ *   DELETE, or the PATCHes for one chunk), including the first attempt. Despite its name it is not
+ *   "retries after the first try": `maxRetries = 3` means at most 3 attempts. 423 Locked answers are not
+ *   counted: tusdotnet's per-file lock is bounded by [maxElapsedMillis] alone.
  *
  * @param maxRetries maximum attempts per operation, including the first one (default 10).
  * @param initialDelayMillis upper bound of the first backoff delay in milliseconds (default 500).
  * @param maxDelayMillis upper bound of any single computed backoff delay in milliseconds (default 30000).
- *   A server `Retry-After` may ask for longer; that is limited only by [maxElapsedMillis].
+ *   A server `Retry-After` may ask for longer; one wait is capped at max([maxDelayMillis], 60 s) and never
+ *   goes beyond the remaining [maxElapsedMillis].
  * @param factor multiplier applied to the delay bound after each failure (default 2.0).
  * @param maxElapsedMillis total time budget for a run of consecutive failures (default 10 minutes).
  * @param retryableStatusCodes HTTP statuses that are retried (default 408, 423, 429, 500, 502, 503, 504).

@@ -110,11 +110,15 @@ httpClient.createAndUploadTus(
     file = file,
     onProgress = { sent, total -> println("Handed to the network: $sent / $total") },
     onConfirmed = { offset, total -> println("Stored by the server: $offset / $total") },
+    onActivity = { watchdog.pet() },
 )
 ```
 
-- `onProgress` reports bytes handed to the HTTP engine while a PATCH body is written. It fires often, which makes
-  it a good stall-watchdog signal, but it can go backwards when a chunk has to be sent again.
+- `onProgress` reports bytes handed to the HTTP engine while a PATCH body is written. It can go backwards when a
+  chunk has to be sent again, and it is silent while Ktus waits to retry, which can legitimately last minutes
+  (a server answering `503` with `Retry-After`, or tusdotnet's `423` lock). Do not use it for a stall watchdog.
+- `onActivity` fires whenever Ktus is doing something: a request starts or gets its response, the body makes
+  progress, and at least every 5 seconds while it waits to retry. Use this one for a stall watchdog.
 - `onConfirmed` reports offsets the server has acknowledged: after each PATCH answered `204`, after a recovery
   HEAD that shows more data than before, and exactly once with `offset == total` when the upload is complete
   (including when the first HEAD shows it was already complete).
@@ -185,16 +189,21 @@ client has `expectSuccess` set:
 | 404 / 410 on POST or OPTIONS | `TusHttpException` (the endpoint is wrong; nothing expired) |
 | 404 / 410 on DELETE | Success |
 | Any 3xx | `TusProtocolException`; redirects are never followed |
-| Any other 4xx or 5xx | `TusHttpException` with the status code, method and start of the body (with `expectSuccess = true`, Ktor's own `ClientRequestException`/`ServerResponseException` is rethrown, as in 1.0) |
+| 423 | Retried like the others, but not counted against `maxRetries`: only `maxElapsedMillis` bounds a lock |
+| Any other 4xx or 5xx | `TusHttpException` with the status code, method and start of the body (with `expectSuccess = true`, Ktor's own `ClientRequestException`/`ServerResponseException` is rethrown for these non-retried statuses, as in 1.0) |
+| A closed `HttpClient` | `IllegalStateException` at once, no retries |
 
 After any PATCH whose outcome is unknown (network error, timeout, a retryable status, 409, or any 2xx other than
 `204`) Ktus backs off, sends HEAD, and continues from the offset the server reports. It never re-sends a chunk
 at the old offset blindly. If that HEAD reports less than the server has already confirmed, the upload fails
 with `TusOffsetMismatchException` rather than rewinding.
 
-If the last chunk's `204` is lost, the server may already have finished the upload, and the follow-up HEAD can
-answer 404/410 (`TusUploadExpiredException`). If that happens while the last chunk was in flight, check on your
-server whether the file arrived before uploading it again.
+If the response to the PATCH carrying the last bytes is lost, the server may have stored them and finished the
+upload; tusdotnet then removes it, so the follow-up HEAD answers 404/410. Ktus throws
+`TusUploadPossiblyCompleteException` in that case (not `TusUploadExpiredException`), and
+`resumeOrCreateAndUploadTus` removes the stored entry and rethrows it instead of uploading the file again.
+**When you get this exception, check on your server whether the file arrived before uploading it again.**
+A 404/410 after any earlier chunk is still `TusUploadExpiredException`.
 
 Backoff uses full jitter: each delay is random in `[0, min(maxDelayMillis, initialDelayMillis * factor^n)]`.
 Retrying stops at whichever comes first:
@@ -205,12 +214,18 @@ Retrying stops at whichever comes first:
   name it counts attempts, not retries.
 
 When retries run out, a network failure is rethrown as the original `IOException`; a status failure becomes a
-`TusHttpException`.
+`TusHttpException` on every method, with Ktor's `ResponseException` as its `cause` when the client has
+`expectSuccess = true`.
+
+`resumeOrCreateAndUploadTus` drops a stored upload and creates a new one (once) when resuming it fails
+permanently: a protocol error or a status that is not retried, such as 403.
 
 ## Validation
 
 - The file size is read once when the upload starts. The upload fails with `TusProtocolException` if the size
-  changes before it completes, or if the file turns out shorter than its size while a chunk is read.
+  changes before the server has every byte, or if the file turns out shorter than its size while a chunk is
+  read. Only the size is checked: an edit that keeps the size the same is not detected. Use a fingerprint that
+  includes the modification time or a hash if that matters.
 - Empty files are rejected with `IllegalArgumentException` unless `allowEmptyUpload = true`.
 - HEAD must report an `Upload-Offset` in `[0, size]`, and, when it sends `Upload-Length`, the file's size.
 - A PATCH answered `204` must report an `Upload-Offset` that moved forward by at least one byte and at most the

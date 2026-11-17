@@ -257,13 +257,14 @@ class StatusPolicyTest {
     }
 
     @Test
-    fun exhaustedServerErrors_withExpectSuccess_rethrowKtorsException() = runTest {
+    fun exhaustedServerErrors_withExpectSuccess_areTusHttpException_withKtorsExceptionAsCause() = runTest {
         val server = server()
         repeat(10) { server.script(HttpMethod.Post, Reply.Status(503)) }
-        assertFailsWith<ServerResponseException> {
+        val error = assertFailsWith<TusHttpException> {
             server.client(expectSuccess = true).createTusUpload("https://example.com/files",
                 InMemoryTusFile("f", testBytes(fileSize)), options = TusUploadOptions(retryOptions = fastRetry(maxRetries = 3)))
         }
+        assertIs<ServerResponseException>(error.cause)
         assertEquals(3, server.count(HttpMethod.Post))
     }
 
