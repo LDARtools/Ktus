@@ -31,6 +31,22 @@ class Adv12Test {
         assertContentEquals(testBytes(10), server.data)
     }
 
+    /** A client plugin that appends a query parameter after Ktus built the request is not a redirect. */
+    @Test
+    fun aPluginAddedQueryParam_isNotARedirect() = runTest {
+        val server = ScriptedTusServer().apply { uploadLength = 10 }
+        val addVersion = io.ktor.client.plugins.api.createClientPlugin("AddApiVersion") {
+            onRequest { request, _ -> request.url.parameters.append("api-version", "2") }
+        }
+        val client = HttpClient(server.engine) {
+            followRedirects = false
+            install(addVersion)
+        }
+        client.uploadTus(url, InMemoryTusFile("f", testBytes(10)), options = TusUploadOptions(activityHeartbeatMillis = null))
+        assertContentEquals(testBytes(10), server.data)
+        assertTrue(server.requests.all { "api-version=2" in it.url }, "the plugin did add it: ${server.requests.map { it.url }}")
+    }
+
     @Test
     fun defaultRequestBaseUrlOnly_isNotARedirect() = runTest {
         val server = ScriptedTusServer().apply { uploadLength = 10 }

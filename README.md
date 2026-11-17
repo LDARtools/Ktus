@@ -21,7 +21,7 @@ Ktus uses your Ktor `HttpClient`. Two settings matter:
 ```kotlin
 val httpClient = HttpClient(engine) {
     // tus requests must never be redirected. Ktus rejects any 3xx, and any answer that came from a different URL
-    // than the one it asked for (extra query parameters added by plugins such as defaultRequest are fine), but
+    // than the one it asked for (extra query parameters that client plugins add are fine), but
     // only after the client has followed it (Ktor follows HEAD redirects by default), so turn it off here.
     followRedirects = false
     // Ktus classifies responses by status itself, so expectSuccess can be either value.

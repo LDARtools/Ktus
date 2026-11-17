@@ -115,7 +115,7 @@ internal fun sameOrigin(a: Url, b: Url): Boolean =
 /**
  * True when the answered URL [answered] is the request target [target]: same origin and path, and every query
  * parameter of [target] present with the same values. Extra parameters are allowed, because client plugins
- * (`defaultRequest`, for example an api-version) add them after Ktus built the request. Anything else means the
+ * (for example an onRequest hook adding an api-version) add them after Ktus built the request. Anything else means the
  * client followed a redirect, even within the same origin.
  */
 internal fun sameTarget(answered: Url, target: Url): Boolean =
