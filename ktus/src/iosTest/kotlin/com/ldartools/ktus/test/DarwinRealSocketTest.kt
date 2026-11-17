@@ -188,7 +188,8 @@ class DarwinRealSocketTest {
                 }
             }
             assertIs<TusLocalFileException>(error, "was $error")
-            assertEquals(2, server.log.count { it.method == "PATCH" }, "${server.log}")
+            // NSURLSession may abort the second request before the server logs it; it must never be retried.
+            assertTrue(server.log.count { it.method == "PATCH" } in 1..2, "${server.log}")
             assertEquals(256 * 1024, server.data.size, "the truncated second chunk is not stored")
         }
     }

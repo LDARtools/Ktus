@@ -715,8 +715,7 @@ private suspend fun HttpClient.uploadInternal(
                 body.abandon()
             }
             if (callbackError.isCompleted) throw CallbackFailure(callbackError.getCompleted())
-            // A problem reading the file, however the engine reported it (some wrap or replace the exception).
-            val outcome = body.localFailure()?.let { Outcome.Fail(it) } ?: attemptOutcome
+            val outcome = attemptOutcome
 
             when (outcome) {
                 is Outcome.Ok -> {

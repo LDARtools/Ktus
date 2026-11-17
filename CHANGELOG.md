@@ -135,8 +135,8 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
 - **`TusUrlStore` writes must be durable when they return.**
 - **`TusOffsetMismatchException` no longer makes `resumeOrCreateAndUploadTus` drop a stored upload** (it can be
   caused by a stale HEAD); the entry is kept.
-- **A short read is reported as `TusLocalFileException` on every engine**, including Darwin, whatever exception
-  the engine raised for the aborted body. Any failure of a marked entry, including a permanent 4xx, is `TusUploadOutcomeUnknownException`;
+- **A short read is reported as `TusLocalFileException`** and is not retried; verified with real sockets on the
+  Darwin engine as well as with MockEngine and okio's FakeFileSystem. Any failure of a marked entry, including a permanent 4xx, is `TusUploadOutcomeUnknownException`;
   a marked entry is never dropped or re-created. A 2xx answer to the final PATCH with a missing or impossible
   `Upload-Offset` is an unknown outcome too, and so is a client closed while the final PATCH is in flight.
 - **`OkioTusFile` reports a missing or deleted file as `TusLocalFileException`** (not retried); it used to report
