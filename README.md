@@ -14,6 +14,21 @@
 
 Below are several usage examples showing basic and advanced flows.
 
+### Configure the HttpClient
+
+Ktus uses your Ktor `HttpClient`. Two settings matter:
+
+```kotlin
+val httpClient = HttpClient(engine) {
+    // tus requests must never be redirected; Ktus rejects any 3xx and any answer that came from another origin.
+    followRedirects = false
+    // Ktus classifies responses by status itself, so expectSuccess can be either value.
+    install(HttpTimeout) {
+        socketTimeoutMillis = 60_000 // a stalled PATCH fails, is retried, and shrinks the chunk size
+    }
+}
+```
+
 ### Basic
 
 Ktus has a convenience function that combines both the create and upload phases of a Tus upload into a single call.
@@ -25,149 +40,192 @@ Ktus has a convenience function that combines both the create and upload phases 
 val file = OkioTusFile(filePath)
 
 httpClient.createAndUploadTus(createUrl = url, file = file, metadata = mapOf("filename" to file.name)) { 
-    // optional per-request configuration
+    // optional per-request configuration; runs again for every attempt, so it can refresh a token
     setAuthorizationHeader(anonymous = false)
 }
 ```
+
+### Resuming across attempts and app restarts
+
+`resumeOrCreateAndUploadTus` remembers the upload URL in a `TusUrlStore` under a fingerprint you choose for the
+file. The next call with the same fingerprint resumes where the server is instead of starting over.
+
+```kotlin
+// import com.ldartools.ktus.resumeOrCreateAndUploadTus
+// import com.ldartools.ktus.TusUrlStore
+
+class PrefsTusUrlStore(private val prefs: MyKeyValueStore) : TusUrlStore {
+    override suspend fun get(fingerprint: String): TusUpload? = prefs.read(fingerprint)
+    override suspend fun set(fingerprint: String, upload: TusUpload) = prefs.write(fingerprint, upload)
+    override suspend fun remove(fingerprint: String) = prefs.delete(fingerprint)
+}
+
+httpClient.resumeOrCreateAndUploadTus(
+    createUrl = url,
+    file = file,
+    fingerprint = "$path:${file.size}:$lastModified", // must change when the content changes
+    store = PrefsTusUrlStore(prefs),
+    metadata = mapOf("filename" to file.name),
+)
+```
+
+What it does:
+- A stored upload is resumed when its length equals the file size, its `expiresAt` (from the server's
+  `Upload-Expires`) has not passed, and its URL is on an allowed origin (see [Security](#security)).
+- If the server answers 404/410 for it, or reports a different `Upload-Length`, a new upload is created.
+- A new upload is saved to the store right after creation, before any data is sent, and removed when the upload
+  completes. Any other failure leaves it in place for the next attempt.
+
+`InMemoryTusUrlStore` is a ready-made store for tests and for resuming within one process.
 
 ### Create and upload separately
 
-You can also split the create and upload phases into separate calls. This is useful for persisting the upload URL for later continuation or other advanced use cases where upload might not need to start right away.
+You can also split the create and upload phases. `createTusUpload` returns a `TusUpload` with the URL, the
+length and the server's expiry; `createTus` returns just the URL.
 
 ```kotlin
-// import com.ldartools.ktus.createTus
+// import com.ldartools.ktus.createTusUpload
 // import com.ldartools.ktus.uploadTus
-// import com.ldartools.ktus.okio.OkioTusFile
 
-val file = OkioTusFile(filePath)
+val upload = httpClient.createTusUpload(createUrl = url, file = file, metadata = mapOf("filename" to file.name))
+saveSomewhere(upload)
 
-// 1) Create the upload on the server and get the upload URL
-val uploadUrl = httpClient.createTus(createUrl = url, file = file, metadata = mapOf("filename" to file.name))
-
-// 2) Upload the file to the returned upload URL
-httpClient.uploadTus(uploadUrl = uploadUrl, file = file) {
-    // optional per-request configuration
+// Later, possibly after a restart. Starts with HEAD and continues from the server's offset.
+httpClient.uploadTus(uploadUrl = upload.uploadUrl, file = file) {
     setAuthorizationHeader(anonymous = false)
 }
 ```
 
-### Passing options
+`uploadTus` throws `TusUploadExpiredException` when the server no longer has the upload (404/410), and
+`TusUploadLengthMismatchException` when the URL belongs to a file of a different size; create a new upload in
+both cases (or let `resumeOrCreateAndUploadTus` do it).
 
-Customize upload behavior (chunk size, retries, protocol extensions, file locking, etc.) via `TusUploadOptions`.
+`createAndUploadTus` still accepts an `onCreate` callback that receives the upload URL right after creation.
+
+### Progress
+
+```kotlin
+httpClient.createAndUploadTus(
+    createUrl = url,
+    file = file,
+    onProgress = { sent, total -> println("Handed to the network: $sent / $total") },
+    onConfirmed = { offset, total -> println("Stored by the server: $offset / $total") },
+)
+```
+
+- `onProgress` reports bytes handed to the HTTP engine while a PATCH body is written. It fires often, which makes
+  it a good stall-watchdog signal, but it can go backwards when a chunk has to be sent again.
+- `onConfirmed` reports offsets the server has acknowledged: after each PATCH answered `204`, after a recovery
+  HEAD that shows more data than before, and exactly once with `offset == total` when the upload is complete
+  (including when the first HEAD shows it was already complete).
+
+### Terminating an upload
+
+```kotlin
+httpClient.terminateTus(uploadUrl = upload.uploadUrl) { setAuthorizationHeader(anonymous = false) }
+```
+
+Sends `DELETE` ([Termination](https://tus.io/protocols/resumable-upload#termination) extension). `204`, and
+`404`/`410` (already gone), count as success.
+
+### Passing options
 
 ```kotlin
 // import com.ldartools.ktus.TusUploadOptions
 // import com.ldartools.ktus.RetryOptions
 
 val options = TusUploadOptions(
-    checkServerCapabilities = true,
-    chunkSize = 4 * 1024 * 1024, // 4 MB
+    checkServerCapabilities = true,        // OPTIONS first: Tus-Resumable and Tus-Max-Size
+    chunkSize = 4 * 1024 * 1024,           // bytes per PATCH
     useFileLock = false,
+    allowEmptyUpload = false,              // a zero-byte file is rejected unless you allow it
+    allowedUploadHosts = setOf("uploads.example.com"), // other hosts the server may send uploads to
+    omitEmptyMetadataValues = true,        // drop metadata entries whose value is ""
+    adaptiveChunkSize = true,              // halve the chunk after a PATCH timeout / 408 / 504 ...
+    minChunkSize = 256 * 1024,             // ... down to this floor
     retryOptions = RetryOptions(
-        maxRetries = 5,
-        initialDelayMillis = 1_000L,
-        maxDelayMillis = 60_000L,
-        factor = 2.0
+        maxRetries = 10,                   // attempts per operation, including the first
+        initialDelayMillis = 500,
+        maxDelayMillis = 30_000,
+        factor = 2.0,
+        maxElapsedMillis = 10 * 60 * 1000, // total budget for one run of consecutive failures
     )
 )
-
-httpClient.createAndUploadTus(createUrl = url, file = file, options = options, onProgress = { sent, total ->
-    println("Uploaded $sent / $total")
-})
-```
-
-### Persisting the upload URL for continuation
-
-Ktus does not have a built-in persistence mechanism, but it provides the necessary hooks to allow you to persist the upload URL so that uploads can be resumed later.
-
-You can save the returned `uploadUrl` (for example, to local storage or a database) and later resume the upload by calling `uploadTus` with that URL.
-
-```kotlin
-// Persist the uploadUrl after creation
-val uploadUrl = httpClient.createTus(createUrl = url, file = file)
-saveToLocalStore("pendingUploadUrl", uploadUrl)
-
-// Later (possibly after app restart) retrieve and resume
-val persisted = loadFromLocalStore("pendingUploadUrl")
-if (persisted != null) {
-    httpClient.uploadTus(uploadUrl = persisted, file = file)
-}
-```
-
-If you prefer a single call that still allows persisting the upload URL immediately after creation, use `createAndUploadTus` with an `onCreate` callback.
-
-```kotlin
-httpClient.createAndUploadTus(createUrl = url, file = file, onCreate = { uploadUrl ->
-    // Persist the upload URL so you can resume later if needed
-    saveToLocalStore("pendingUploadUrl", uploadUrl)
-}, onProgress = { sent, total ->
-    println("Uploaded $sent / $total")
-})
 ```
 
 ### Pause and resume uploads
 
-If you want to pause and resume uploads, you can achieve this by managing the upload coroutine job yourself.
+Cancel the coroutine to pause. Cancellation stops the request and closes the file section being read. Resume
+with `uploadTus` (or call `resumeOrCreateAndUploadTus` again with the same fingerprint).
 
 ```kotlin
-//import kotlinx.coroutines.*
-
-val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-var persistedUploadUrl: String? = null
-lateinit var uploadJob: Job
-
-// Start (create + upload) and persist uploadUrl immediately via onCreate
-fun startUpload(httpClient: HttpClient, createUrl: String, file: ITusFile, options: TusUploadOptions) {
-    uploadJob = scope.launch {
-        try {
-            httpClient.createAndUploadTus(
-                createUrl = createUrl,
-                file = file,
-                options = options,
-                onProgress = { sent, total -> println("Uploaded $sent / $total") },
-                onCreate = { url ->
-                    // persist the url to disk/db if you want durable resume across restarts
-                    persistedUploadUrl = url
-                }
-            )
-        } catch (e: CancellationException) {
-            // paused by caller — safe to ignore or log
-        } catch (t: Throwable) {
-            // handle other errors
-        }
-    }
+val job = scope.launch {
+    httpClient.resumeOrCreateAndUploadTus(createUrl = url, file = file, fingerprint = fp, store = store)
 }
 
-// Pause (cancel the running job)
-suspend fun pauseUpload() {
-    if (::uploadJob.isInitialized && uploadJob.isActive) {
-        uploadJob.cancelAndJoin() // stops the upload coroutine and waits for cleanup
-    }
-}
-
-// Resume (use persistedUploadUrl)
-fun resumeUpload(httpClient: HttpClient, file: ITusFile, options: TusUploadOptions) {
-    val url = persistedUploadUrl ?: throw IllegalStateException("No persisted upload URL")
-    scope.launch {
-        try {
-            httpClient.uploadTus(
-                uploadUrl = url,
-                file = file,
-                options = options,
-                onProgress = { sent, total -> println("Uploaded $sent / $total") }
-            )
-        } catch (e: CancellationException) {
-            // paused again
-        } catch (t: Throwable) {
-            // handle other errors
-        }
-    }
+job.cancelAndJoin() // pause
+// ...
+scope.launch {        // resume
+    httpClient.resumeOrCreateAndUploadTus(createUrl = url, file = file, fingerprint = fp, store = store)
 }
 ```
 
-Notes:
-- `OkioTusFile` is a convenient `ITusFile` implementation; you can implement `ITusFile` differently for other platforms.
-- `onProgress` receives (sent, total) bytes and can be used to update UI progress bars.
+## Retries
+
+Every tus request (OPTIONS, POST, HEAD, PATCH, DELETE) is classified by its HTTP status, whether or not the
+client has `expectSuccess` set:
+
+| Response | What Ktus does |
+|---|---|
+| Network error or timeout | Retry |
+| 408, 423, 429, 500, 502, 503, 504 (`RetryOptions.retryableStatusCodes`) | Retry, waiting at least as long as a `Retry-After` header asks (delta-seconds or HTTP-date) |
+| 401 | Retry, so your request block can supply a fresh token (`retryOnUnauthorized`) |
+| 409 on PATCH | HEAD, then continue from the server's offset |
+| 404 / 410 on HEAD or PATCH | `TusUploadExpiredException` |
+| 404 / 410 on POST or OPTIONS | `TusHttpException` (the endpoint is wrong; nothing expired) |
+| 404 / 410 on DELETE | Success |
+| Any 3xx | `TusProtocolException`; redirects are never followed |
+| Any other 4xx or 5xx | `TusHttpException` with the status code, method and start of the body (with `expectSuccess = true`, Ktor's own `ClientRequestException`/`ServerResponseException` is rethrown, as in 1.0) |
+
+After any PATCH whose outcome is unknown (network error, timeout, a retryable status, 409, or any 2xx other than
+`204`) Ktus backs off, sends HEAD, and continues from the offset the server reports. It never re-sends a chunk
+at the old offset blindly.
+
+Backoff uses full jitter: each delay is random in `[0, min(maxDelayMillis, initialDelayMillis * factor^n)]`.
+Retrying stops at whichever comes first:
+- `maxElapsedMillis` (default 10 minutes), counted from the first failure of a run of consecutive failures. Any
+  progress (a PATCH the server accepted, or a HEAD showing more data) starts a fresh run, so a long upload over a
+  flaky network is not cut short while it keeps moving.
+- `maxRetries` (default 10): the maximum number of attempts for one operation, including the first. Despite the
+  name it counts attempts, not retries.
+
+When retries run out, a network failure is rethrown as the original `IOException`; a status failure becomes a
+`TusHttpException`.
+
+## Validation
+
+- The file size is read once when the upload starts. The upload fails with `TusProtocolException` if the size
+  changes before it completes, or if the file turns out shorter than its size while a chunk is read.
+- Empty files are rejected with `IllegalArgumentException` unless `allowEmptyUpload = true`.
+- HEAD must report an `Upload-Offset` in `[0, size]`, and, when it sends `Upload-Length`, the file's size.
+- A PATCH answered `204` must report an `Upload-Offset` that moved forward by at least one byte and at most the
+  bytes sent.
+- The upload succeeds only when the server's offset equals the file size.
+- With `checkServerCapabilities`, a file larger than the server's `Tus-Max-Size` fails before anything is created.
+- Metadata keys must be non-empty printable ASCII without spaces or commas (`IllegalArgumentException`
+  otherwise, before any request is sent).
+
+## Security
+
+- **Upload URL origin.** The `Location` of a creation response is resolved per RFC 3986. The result must be on the
+  creation URL's scheme, host and port, unless its host is in `TusUploadOptions.allowedUploadHosts`. Anything else
+  is rejected, so a compromised or misconfigured server cannot send your file and your request headers (for
+  example an `Authorization` header) to another host. The same check applies to URLs loaded from a `TusUrlStore`.
+- **No downgrade.** An `https` creation URL never accepts an `http` upload URL, whatever the host.
+- **No raw fallback.** An unparseable `Location` is an error; it is never used as-is.
+- **No redirects.** Any 3xx answer to a tus request is an error. Configure the client with
+  `followRedirects = false`; if the client follows a redirect anyway (Ktor does for HEAD by default), an answer
+  from another origin is rejected.
 
 ## Installation
 
@@ -175,11 +233,11 @@ Add the following libraries to your `.toml` file.
 
 ```toml
 [versions]
-ktus = "1.0.1"
+ktus = "1.1.0"
 
 [libraries]
-ktus = {module = "com.ldartools.ktus" , version.ref = "ktus"}
-ktus-okio = {module = "com.ldartools.ktus-okio" , version.ref = "ktus"}
+ktus = { module = "com.ldartools:ktus", version.ref = "ktus" }
+ktus-okio = { module = "com.ldartools:ktus-okio", version.ref = "ktus" }
 ```
 
 Add the dependencies to your common code.
@@ -199,24 +257,30 @@ If you do not wish to use `OkioTusFile`, remove the references above and provide
 ## Features
 
 * [Core Tus Protocol](https://tus.io/protocols/resumable-upload#core-protocol)
+* [Creation](https://tus.io/protocols/resumable-upload#creation)
+* [Termination](https://tus.io/protocols/resumable-upload#termination)
+* [Expiration](https://tus.io/protocols/resumable-upload#expiration) (client side: `Upload-Expires` is read and used to skip expired stored uploads)
+* [Metadata](https://tus.io/protocols/resumable-upload#upload-metadata)
+* `Tus-Max-Size` check
+* Resume across attempts and restarts (`TusUrlStore`, `resumeOrCreateAndUploadTus`)
+* Status-based retries with full-jitter exponential backoff, `Retry-After` and a total time budget
+* HEAD-before-resume after every uncertain PATCH, with offset and length validation
+* Adaptive chunk size after timeouts
+* Upload URL origin checks and redirect rejection
+* Progress (bytes sent) and confirmed progress (bytes stored by the server)
 * Full support for Ktor DSL
 * Cross platform
-* [Metadata](https://tus.io/protocols/resumable-upload#upload-metadata)
-* Progress
-* [Creation](https://tus.io/protocols/resumable-upload#creation)
-* [Creation With Upload](https://tus.io/protocols/resumable-upload#creation-with-upload)
 * File read locks (optional)
-* Retries with exponential backoff
 
 ## Limitations
 
 The following optional [Tus protocol extensions](https://tus.io/protocols/resumable-upload#protocol-extensions) **have not** been implemented.
-* [Expiration](https://tus.io/protocols/resumable-upload#expiration)
+* [Creation With Upload](https://tus.io/protocols/resumable-upload#creation-with-upload)
+* [Creation-Defer-Length](https://tus.io/protocols/resumable-upload#upload-defer-length)
 * [Checksum](https://tus.io/protocols/resumable-upload#checksum)
-* [Termination](https://tus.io/protocols/resumable-upload#termination)
 * [Concatenation](https://tus.io/protocols/resumable-upload#concatenation)
 * File read locks (optional) are not supported by `OkioTusFile` because file read locks are not supported by Okio. If you want this feature, please upvote this issue https://github.com/square/okio/issues/1464.
-* File locks (optional) are volatile. They will survive an application restart.
+* File locks (optional) are volatile. They will not survive an application restart.
 
 ## Documentation
 
@@ -226,50 +290,43 @@ Because Ktus is cross platform it must be told how to retrieve the bytes that ar
 You must provide an `ITusFile` implementation(s) that will work for your platform(s).
 
 ```kotlin
-/**
- * An interface abstracting the source of a file to be uploaded via TUS.
- * This allows the upload logic to be independent of whether the file is on disk,
- * in memory, or from another source.
- */
 interface ITusFile {
-    /** The total size of the file in bytes. */
+    /** The total size of the file in bytes. Read once at the start of an upload. */
     val size: Long
 
     /** The name of the file, which may be used for metadata. */
     val name: String
 
-    /**
-     * Reads a specific range of the file into a ByteReadChannel.
-     * Implementations should ensure this operation is efficient and does not load
-     * the entire file into memory, especially for large files.
-     *
-     * @param offset The byte offset to start reading from.
-     * @param length The number of bytes to read.
-     * @return A ByteReadChannel containing the specified section of the file.
-     */
+    /** Reads a range of the file into a ByteReadChannel (the 1.0 API; used by the default writeSection). */
     suspend fun readSection(offset: Long, length: Long): ByteReadChannel
 
-    /**
-     * Creates a read lock on the file that will be closed when the upload is complete.
-     * This is optional and helps prevent the file from being modified during an upload.
-     * The returned AutoCloseable will be invoked at the end of the upload process.
-     */
+    /** Creates an optional read lock that is closed when the upload ends. */
     suspend fun fileReadLock(): AutoCloseable
+
+    /**
+     * Writes exactly [length] bytes starting at [offset] to [channel]. Called inside the PATCH request, so a file
+     * opened here and closed in a finally block cannot leak when the request fails or is cancelled. Must throw
+     * TusProtocolException if the file is shorter than expected.
+     */
+    suspend fun writeSection(offset: Long, length: Long, channel: ByteWriteChannel) { /* default: copies readSection */ }
 }
 ```
 
-Note: While most use cases will be uploading a file from the file system. It is possible to upload from other sources (memory, streams, etc.) by providing a custom `ITusFile` implementation.
+Implementations written for 1.0 keep working through the default `writeSection`. New implementations should
+override `writeSection` and open the file inside it.
+
 Whatever the source of the `ITusFile`, it MUST be re-readable. By its nature, Tus will re-request bytes to be read if a chunk fails.
 
 #### OkioTusFile
 
-While Ktus does provide an `ITusFile` implementation built using [Okio](https://github.com/square/okio).
-This implementation should work for all platforms supported by Okio.
-In order to keep the dependencies of Ktus at minimum, the `OkioTusFile` is provided in a separate module.
+`OkioTusFile` is an `ITusFile` built on [Okio](https://github.com/square/okio), in a separate module to keep the
+dependencies of Ktus at a minimum. It reads each chunk with a positional read (no reading and discarding from the
+start of the file), opens the file inside the request, and closes it when the chunk is sent, fails or is
+cancelled. Pass a `FileSystem` (for example okio's `FakeFileSystem` in tests) with `OkioTusFile(path, fileSystem)`.
 
 ### File locks
 
-The `uploadTus` function has a parameter that enables a file lock. This will lock the file, provided the `ITusFile` implementation supports it, in order to ensure that bytes are not mutated while an upload is in progress.
+The `useFileLock` option takes the `ITusFile`'s read lock for the duration of the upload, provided the implementation supports it, in order to ensure that bytes are not mutated while an upload is in progress.
 
 ## Comparison with Official TUS Clients
 
@@ -279,17 +336,16 @@ Ktus was built and validated against the [TUS 1.0.0 protocol specification](http
 |---|:---:|:---:|:---:|:---:|
 | Core protocol (HEAD/PATCH) | Yes | Yes | Yes | Yes |
 | Creation (POST) | Yes | Yes | Yes | Yes |
-| OPTIONS capability check | Yes | No | Yes | Yes |
-| Chunked uploads | Yes | Yes | Yes | Yes |
+| OPTIONS capability check | Yes | No | Yes | Yes (incl. Tus-Max-Size) |
+| Chunked uploads | Yes | Yes | Yes | Yes (adaptive after timeouts) |
 | Metadata encoding | Yes | Yes | Yes | Yes |
 | Metadata key validation | No | No | Yes | Yes |
-| Retry with backoff | Fixed delays | No (caller) | Counter only | Exponential backoff |
-| 5xx retry | Yes | No (caller) | Yes (system) | Yes |
+| Retry with backoff | Fixed delays | No (caller) | Counter only | Full-jitter exponential + Retry-After + time budget |
+| 5xx retry | Yes | No (caller) | Yes (system) | Yes (408/423/429/500/502/503/504) |
 | 409 Conflict recovery | No | No | HEAD + retry | HEAD + retry |
 | Offset advancement check | No | No | No | Yes |
-| PATCH failure loop protection | Retry counter | No | Retry counter | Consecutive failure counter + offset check |
-| 404/410 expired handling | Re-creates upload | Exception | Re-creates upload | Exception |
-| Upload URL persistence | Built-in | Built-in | Built-in | Caller-managed ([see usage](#persisting-the-upload-url-for-continuation)) |
+| 404/410 expired handling | Re-creates upload | Exception | Re-creates upload | Exception, or re-create with `resumeOrCreateAndUploadTus` |
+| Upload URL persistence | Built-in | Built-in | Built-in | `TusUrlStore` (bring your own storage) |
 | Creation-with-upload | Yes | No | No | No |
 | Upload-Defer-Length | Yes | No | No | No |
 | Concatenation / parallel | Yes | No | No | No |
@@ -299,23 +355,23 @@ Ktus was built and validated against the [TUS 1.0.0 protocol specification](http
 ### Where Ktus differs
 
 **Strengths:**
-- **Exponential backoff** with configurable parameters (`initialDelayMillis`, `maxDelayMillis`, `factor`) is more robust than fixed delay arrays or no retries at all.
-- **Offset advancement validation** prevents infinite loops when the server returns the same offset after a successful PATCH — a scenario that other clients don't guard against.
-- **409 Conflict recovery** via HEAD matches TUSKit's approach and is more correct than tus-js-client which retries blindly.
+- **Status-based retries** that behave the same whether or not the client throws on errors, with full jitter, `Retry-After` and a total time budget.
+- **Never a blind re-send.** Every uncertain PATCH is followed by HEAD, and offsets and lengths reported by the server are validated.
+- **Offset advancement validation** prevents infinite loops and catches servers that report impossible offsets.
+- **Origin checks** stop a `Location` header or a stored URL from sending your file and credentials to another host.
 - **Ktor DSL integration** gives full control over every HTTP request (auth headers, timeouts, logging, etc.) through a familiar Kotlin builder.
 - **True multiplatform** — a single library covers JVM, Android, iOS, Linux, and all other Ktor-supported targets.
 
 **Trade-offs:**
-- **No built-in URL persistence.** Official clients have a "URL store" for resuming uploads across app restarts. Ktus provides hooks (`onCreate` callback, separate `createTus`/`uploadTus` calls) so callers can persist URLs however they prefer.
-- **No auto re-creation on expiry.** tus-js-client and TUSKit automatically create a new upload when the old one returns 404/410. Ktus throws `TusUploadExpiredException` so callers can decide how to handle it.
+- **Persistence is yours.** `TusUrlStore` is an interface; Ktus ships only an in-memory implementation.
+- **`uploadTus` does not re-create** an expired upload on its own; use `resumeOrCreateAndUploadTus` for that.
 
 ## Future Work
 
 - [ ] Add `ITusFile` implementations for common platforms (e.g., Android, iOS, JVM)
 - [ ] Add support for more Tus protocol extensions
-    - [ ] Expiration
     - [ ] Checksum
-    - [ ] Termination
+    - [ ] Creation With Upload
     - [ ] Concatenation
 
 PRs are welcome! :)
