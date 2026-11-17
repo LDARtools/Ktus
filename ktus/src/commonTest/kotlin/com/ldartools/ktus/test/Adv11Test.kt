@@ -162,7 +162,7 @@ class Adv11Test {
         val server = ScriptedTusServer(clock = { sched.currentTime },
             dispatcher = kotlinx.coroutines.test.StandardTestDispatcher(sched)).apply { uploadLength = 10 }
         server.script(HttpMethod.Head, ok(0, 10))
-        repeat(20_000) {
+        repeat(200) {
             server.script(HttpMethod.Patch, Reply.Custom { _, _ ->
                 if (sched.currentTime >= patchSlowFrom) delay(300_000)
                 throw kotlinx.io.IOException("fails") })
@@ -173,8 +173,8 @@ class Adv11Test {
         val start = sched.currentTime
         runCatching {
             server.client().uploadTus(url, InMemoryTusFile("f", testBytes(10)), options = TusUploadOptions(
-                activityHeartbeatMillis = null, retryOptions = RetryOptions(maxRetries = 100_000, initialDelayMillis = 100,
-                    maxDelayMillis = 100, jitter = false, timeSource = sched.timeSource)))
+                activityHeartbeatMillis = null, retryOptions = RetryOptions(maxRetries = 100_000, initialDelayMillis = 10_000,
+                    maxDelayMillis = 10_000, jitter = false, timeSource = sched.timeSource)))
         }
         return sched.currentTime - start
     }
@@ -189,7 +189,7 @@ class Adv11Test {
     /** L2: a recovery HEAD that runs past the end of the budget is not followed by another PATCH. */
     @Test
     fun noPatchIsSentAfterAHeadThatOutlivedTheBudget() = runTest {
-        val t = gaveUpAfter(headSlowFrom = 599_900, patchSlowFrom = 600_000)
+        val t = gaveUpAfter(headSlowFrom = 590_000, patchSlowFrom = 600_000)
         assertTrue(t <= 600_000 + 300_000 + 1_000, "gave up after $t ms; a PATCH after the budget would add 300 s")
     }
 }

@@ -16,7 +16,9 @@ import kotlin.test.fail
 
 class OkioTusFileTest {
 
-    private fun makeTestPath(name: String) = name.toPath()
+    // A unique file name: the JVM and Android host test tasks run in the same working directory, possibly at
+    // the same time, and must not delete each other's files.
+    private fun makeTestPath(name: String) = "${kotlin.random.Random.nextLong().toULong()}-$name".toPath()
 
     @Test
     fun testPropertiesAndFullRead() = runTest {
