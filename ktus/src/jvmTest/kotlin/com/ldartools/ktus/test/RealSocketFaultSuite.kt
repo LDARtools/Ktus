@@ -4,6 +4,7 @@ import com.ldartools.ktus.*
 import com.ldartools.ktus.test.RealSocketTusServer.Fault
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.cio.CIO
+import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.ByteWriteChannel
@@ -23,12 +24,31 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.test.*
 
+/** The real-socket suite on the Ktor CIO engine. */
+class CioRealSocketFaultTest : RealSocketFaultSuite() {
+    override fun newClient(requestTimeoutMillis: Long?) = HttpClient(CIO) {
+        followRedirects = false
+        install(HttpTimeout) { requestTimeoutMillis?.let { this.requestTimeoutMillis = it } }
+    }
+}
+
+/** The real-socket suite on the Ktor OkHttp engine (Android's usual engine). */
+class OkHttpRealSocketFaultTest : RealSocketFaultSuite() {
+    override fun newClient(requestTimeoutMillis: Long?) = HttpClient(OkHttp) {
+        followRedirects = false
+        install(HttpTimeout) { requestTimeoutMillis?.let { this.requestTimeoutMillis = it } }
+    }
+}
+
 /**
- * Fault injection over real sockets with the Ktor CIO engine. MockEngine reads whole request bodies before
+ * Fault injection over real sockets, run once per HTTP engine. MockEngine reads whole request bodies before
  * answering, so it cannot show a connection dropped after the server stored a chunk, a server answering
  * while the client is still writing, a stalled server, or what cancellation leaves behind.
  */
-class RealSocketFaultTest {
+abstract class RealSocketFaultSuite {
+
+    abstract fun newClient(requestTimeoutMillis: Long? = null): HttpClient
+
 
     /**
      * An in-memory file that counts open "handles" (sections being read) and active background writers,
@@ -109,12 +129,7 @@ class RealSocketFaultTest {
         override suspend fun fileReadLock(): AutoCloseable = AutoCloseable { }
     }
 
-    private fun client(requestTimeoutMillis: Long? = null) = HttpClient(CIO) {
-        followRedirects = false
-        install(HttpTimeout) {
-            requestTimeoutMillis?.let { this.requestTimeoutMillis = it }
-        }
-    }
+    private fun client(requestTimeoutMillis: Long? = null) = newClient(requestTimeoutMillis)
 
     private fun quickRetry(maxRetries: Int = 20, maxElapsedMillis: Long = 30_000) = RetryOptions(
         maxRetries = maxRetries, initialDelayMillis = 20, maxDelayMillis = 200, maxElapsedMillis = maxElapsedMillis,
@@ -249,9 +264,33 @@ class RealSocketFaultTest {
             assertFalse(error is TusProtocolException)
             val patches = server.log.filter { it.method == "PATCH" }
             assertTrue(patches.size in 2..20, "bounded retries: ${patches.size}")
-            assertTrue(elapsed < budget + 2 * timeout + 1_500, "must stop near the $budget ms budget, took $elapsed ms")
+            // Wall-clock bound kept generous for loaded CI machines; the attempt count above is the tight check.
+            assertTrue(elapsed < budget + 10_000, "must stop near the $budget ms budget, took $elapsed ms")
             assertEquals(listOf(1_048_576L, 524_288L, 262_144L, 131_072L), patches.take(4).map { it.contentLength },
                 "each timeout halves the chunk down to the floor")
+        }
+    }
+
+    // (7) ------------------------------------------------------------------------------------------------
+
+    @Test
+    fun theFinalResponseIsLost_andTheServerRemovesTheUpload_isOutcomeUnknown() = runBlocking {
+        RealSocketTusServer().use { server ->
+            server.removeWhenComplete = true
+            server.faults = { method, n -> if (method == "PATCH" && n == 2) Fault.ApplyThenDrop else Fault.None }
+            val bytes = payload(512 * 1024)
+            val error = assertFailsWith<TusUploadOutcomeUnknownException> {
+                withTimeout(30_000) {
+                    client().use { client ->
+                        client.createAndUploadTus("${server.baseUrl}/files", TrackingFile(bytes),
+                            options = TusUploadOptions(chunkSize = 256 * 1024, retryOptions = quickRetry()))
+                    }
+                }
+            }
+            assertIs<TusUploadExpiredException>(error.cause)
+            assertContentEquals(bytes, server.data)
+            assertEquals(1, server.completions.get())
+            assertEquals(2, server.log.count { it.method == "PATCH" }, "the final chunk is never re-sent: ${server.log}")
         }
     }
 

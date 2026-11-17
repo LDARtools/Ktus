@@ -12,8 +12,14 @@ against 1.1.0.
 - `onActivity` callback on `uploadTus`, `createAndUploadTus` and `resumeOrCreateAndUploadTus`: fires on every
   request, on body progress and at least every 5 s while waiting to retry. Use it for stall watchdogs;
   `onProgress` is silent during retry waits.
-- `TusUploadPossiblyCompleteException`: the final PATCH response was lost and the upload is gone; verify on
-  the server before uploading again.
+- `TusUploadOutcomeUnknownException` (extends `Exception`, not `IOException`): the outcome of the PATCH
+  carrying the last bytes is unknown and could not be established; verify on the server before uploading
+  again. See "When the outcome is unknown" in the README.
+- `TusUpload.finalSentAt`: set by `resumeOrCreateAndUploadTus` before the final PATCH; a marked entry is never
+  dropped or re-created.
+- `TusLocalFileException` (a `TusProtocolException`) for problems with the local file (size changed, short read).
+- `TusUploadOptions.activityHeartbeatMillis` (default 5 s; null turns it off): `onActivity` ticks while a
+  request is in flight.
 - `createTusUpload(...)`: creates an upload and returns a `TusUpload` (URL, length, `expiresAt` parsed from
   `Upload-Expires`).
 - `TusUrlStore`, `InMemoryTusUrlStore` and `resumeOrCreateAndUploadTus(...)`: resume a stored upload when it is
@@ -99,12 +105,14 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
 - **HEAD before every re-PATCH.** After any PATCH whose outcome is unknown, Ktus waits, sends HEAD and
   continues from the server's offset, so a retry costs one extra request. If that HEAD reports an offset below
   one the server already confirmed, the upload fails with `TusOffsetMismatchException` instead of rewinding.
-- **A lost final response is reported separately.** If the server stores the last chunk but its `204` never
-  reaches the client, the follow-up HEAD can answer 404/410 because the server has already finished (and, like
-  tusdotnet, removed) the upload. Ktus throws the new `TusUploadPossiblyCompleteException` (not a
-  `TusUploadExpiredException`), and `resumeOrCreateAndUploadTus` removes the stored entry and rethrows it
-  rather than uploading the file again. **Callers must check on the server whether the file arrived before
-  uploading it again.** A 404/410 after an earlier chunk is still `TusUploadExpiredException`.
+- **An unknown final outcome is reported separately.** Once the outcome of the PATCH carrying the last bytes is
+  unknown and a HEAD cannot show `offset == total` (success) or `offset < total` (continue), every failure of
+  the call becomes `TusUploadOutcomeUnknownException`, including the 404/410 that tusdotnet answers after it
+  has completed and removed an upload, exhausted retries and HTTP errors. A plain retry of such an upload
+  raised `IOException` or `TusUploadExpiredException` before. `resumeOrCreateAndUploadTus` keeps the entry
+  marked and never re-creates it. **Callers must check on the server whether the file arrived before uploading
+  it again**, then remove the store entry. A 404/410 after an earlier chunk is still
+  `TusUploadExpiredException`.
 - **The size check stops once the server has every byte**, and an edit that keeps the file's size is never
   detected.
 - **Exceptions thrown by `onProgress`** are rethrown as they are and end the upload; they are never treated as

@@ -102,9 +102,9 @@ suspend fun HttpClient.createTusUpload(
  *
  * @throws TusProtocolException When the server response does not follow the tus protocol.
  * @throws TusUploadExpiredException If the server reports the upload as expired or missing (404/410).
- * @throws TusUploadPossiblyCompleteException If the response to the PATCH carrying the last bytes was lost
- *   and the server then answered 404/410: it may have stored and finished the upload. Check on the server
- *   before uploading again.
+ * @throws TusUploadOutcomeUnknownException If the outcome of the PATCH carrying the last bytes is unknown
+ *   and could not be established: the server may have the complete file. Check on the server before
+ *   uploading again. Not an IOException.
  * @throws TusUploadLengthMismatchException If the server's `Upload-Length` differs from the file size.
  * @throws TusOffsetMismatchException If the server reports an impossible offset.
  * @throws TusHttpException If the server answers with an HTTP error status Ktus does not retry, or keeps
@@ -161,7 +161,7 @@ suspend fun HttpClient.uploadTus(
  * @throws TusProtocolException If the server responses do not follow the tus protocol.
  * @throws TusUploadExpiredException If the server reports the upload as expired or missing.
  * @throws TusOffsetMismatchException If the server returns an impossible offset during upload.
- * @throws TusUploadPossiblyCompleteException If the final response was lost; see [uploadTus].
+ * @throws TusUploadOutcomeUnknownException If the final PATCH's outcome is unknown; see [uploadTus].
  * @throws TusHttpException If the server answers with an HTTP error status Ktus does not retry.
  */
 suspend fun HttpClient.createAndUploadTus(
@@ -213,11 +213,13 @@ suspend fun HttpClient.createAndUploadTus(
  * If resuming the stored upload fails permanently (a protocol error, or an HTTP status that is not
  * retried, such as 403), the entry is dropped and a new upload is created, once.
  *
- * If the response to the last chunk is lost and the server then answers 404/410, the server may already
- * have the whole file: the entry is removed and [TusUploadPossiblyCompleteException] is thrown. Check on the
- * server before uploading again; calling this function again would upload the file a second time.
+ * Before the PATCH carrying the last bytes is sent, the entry is marked ([TusUpload.finalSentAt]). If that
+ * PATCH's outcome cannot be established, [TusUploadOutcomeUnknownException] is thrown and the marked entry is
+ * kept: later calls keep throwing it (a marked entry is never dropped or re-created) until you have checked
+ * the server and removed the entry from [store]. Only a HEAD showing the bytes are missing clears the mark.
  *
- * Network failures and exhausted retryable statuses leave the entry in place for the next attempt.
+ * Network failures, retryable statuses, 409 and local file problems ([TusLocalFileException]) leave the
+ * entry in place for the next attempt.
  *
  * @param fingerprint identifies this file (and this version of it) in [store]. Choose something that
  *   changes when the content changes, such as path + size + modification time, or a hash.

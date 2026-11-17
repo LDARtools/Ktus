@@ -72,9 +72,13 @@ httpClient.resumeOrCreateAndUploadTus(
 What it does:
 - A stored upload is resumed when its length equals the file size, its `expiresAt` (from the server's
   `Upload-Expires`) has not passed, and its URL is on an allowed origin (see [Security](#security)).
-- If the server answers 404/410 for it, or reports a different `Upload-Length`, a new upload is created.
+- If the server answers 404/410 for it, or reports a different `Upload-Length`, a new upload is created, and so
+  it is (once) when the server refuses it permanently (a protocol error, or a status such as 403).
 - A new upload is saved to the store right after creation, before any data is sent, and removed when the upload
-  completes. Any other failure leaves it in place for the next attempt.
+  completes. Network failures, retryable statuses, 409 and problems with the local file leave it in place.
+- Just before the PATCH carrying the last bytes, the entry is marked (`TusUpload.finalSentAt`). A marked entry is
+  never dropped or re-created; see [When the outcome is unknown](#when-the-outcome-is-unknown). Persist the
+  whole `TusUpload`, including that field.
 
 `InMemoryTusUrlStore` is a ready-made store for tests and for resuming within one process.
 
@@ -118,7 +122,13 @@ httpClient.createAndUploadTus(
   chunk has to be sent again, and it is silent while Ktus waits to retry, which can legitimately last minutes
   (a server answering `503` with `Retry-After`, or tusdotnet's `423` lock). Do not use it for a stall watchdog.
 - `onActivity` fires whenever Ktus is doing something: a request starts or gets its response, the body makes
-  progress, and at least every 5 seconds while it waits to retry. Use this one for a stall watchdog.
+  progress, every `TusUploadOptions.activityHeartbeatMillis` (default 5 s) while a request is in flight, and at
+  least that often while it waits to retry. Use this one for a stall watchdog. With
+  `activityHeartbeatMillis = null` it is silent while a single request is in flight, so the watchdog window
+  must then exceed the engine's socket/request timeout plus about 10 s. The in-flight ticker runs in a side job
+  that is cancelled with the request.
+- Exceptions thrown by `onProgress`, `onActivity`, `onConfirmed` or the `TusUrlStore` end the upload and reach
+  you exactly as thrown (including a `CancellationException`); they are never retried.
 - `onConfirmed` reports offsets the server has acknowledged: after each PATCH answered `204`, after a recovery
   HEAD that shows more data than before, and exactly once with `offset == total` when the upload is complete
   (including when the first HEAD shows it was already complete).
@@ -198,12 +208,52 @@ After any PATCH whose outcome is unknown (network error, timeout, a retryable st
 at the old offset blindly. If that HEAD reports less than the server has already confirmed, the upload fails
 with `TusOffsetMismatchException` rather than rewinding.
 
-If the response to the PATCH carrying the last bytes is lost, the server may have stored them and finished the
-upload; tusdotnet then removes it, so the follow-up HEAD answers 404/410. Ktus throws
-`TusUploadPossiblyCompleteException` in that case (not `TusUploadExpiredException`), and
-`resumeOrCreateAndUploadTus` removes the stored entry and rethrows it instead of uploading the file again.
-**When you get this exception, check on your server whether the file arrived before uploading it again.**
-A 404/410 after any earlier chunk is still `TusUploadExpiredException`.
+## When the outcome is unknown
+
+The one failure a retry cannot fix: Ktus sent the PATCH carrying the **last** bytes, never learned whether the
+server stored them (the connection dropped, the request timed out, a gateway answered 5xx, the response was
+lost), and could not find out afterwards. The server may hold the complete file. tusdotnet even removes an
+upload once it is complete, so every later HEAD or PATCH answers 404, which looks exactly like an expired
+upload. Uploading again from scratch can make the server receive and process the file twice.
+
+Ktus follows one rule. Once the final PATCH's outcome is unknown, the next HEAD decides:
+- it shows `offset == total`: the upload succeeded;
+- it shows `offset < total`: the bytes did not land, and the upload continues normally;
+- anything else ends the call with **`TusUploadOutcomeUnknownException`**, whatever the underlying failure was
+  (404/410, retries or budget exhausted, an HTTP error, a protocol error). The original failure is its `cause`.
+  A 404/410 later in the same call is reported the same way even after a HEAD said the bytes were missing,
+  because a HEAD answered by another server instance can be stale.
+
+`TusUploadOutcomeUnknownException` deliberately does **not** extend `IOException` or `TusProtocolException`, so a
+generic "network error, retry later" or "expired, re-create" handler does not swallow it.
+
+With `resumeOrCreateAndUploadTus`, the store entry is marked before the final PATCH is sent (`finalSentAt`). A
+marked entry is never dropped or re-created: a later call that gets 404/410 for it (or finds it expired) throws
+`TusUploadOutcomeUnknownException` again. If the caller's coroutine is cancelled while the final PATCH is in
+flight, the `CancellationException` propagates as coroutines require; the marked entry is how the next call
+knows. Only a HEAD showing `offset < total` clears the mark.
+
+**When you get this exception, check on your server whether the file arrived before uploading it again**, then
+resolve the store entry yourself:
+
+```kotlin
+try {
+    httpClient.resumeOrCreateAndUploadTus(createUrl = url, file = file, fingerprint = fp, store = store) { auth() }
+    markUploaded(file)
+} catch (e: TusUploadOutcomeUnknownException) {
+    // Ask the server whether it has this file (for example by its id or checksum).
+    if (api.serverHasFile(fileId)) {
+        store.remove(fp)
+        markUploaded(file)
+    } else {
+        // The server has nothing usable: start a fresh upload next time.
+        store.remove(fp)
+        scheduleRetry(file)
+    }
+} catch (e: IOException) {
+    scheduleRetry(file) // offline, timeouts, retryable statuses: the store entry is kept for the next attempt
+}
+```
 
 Backoff uses full jitter: each delay is random in `[0, min(maxDelayMillis, initialDelayMillis * factor^n)]`.
 Retrying stops at whichever comes first:

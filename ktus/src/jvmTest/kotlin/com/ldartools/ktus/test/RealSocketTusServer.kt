@@ -55,6 +55,11 @@ class RealSocketTusServer : AutoCloseable {
     /** Answer 423 to HEAD and PATCH until this time (ms since start), like tusdotnet's per-file lock. */
     @Volatile var lockedUntilMillis: Long = 0
 
+    /** Like tusdotnet: once the upload is complete it is processed and removed, so HEAD/PATCH answer 404. */
+    @Volatile var removeWhenComplete = false
+    @Volatile var removed = false
+    val completions = AtomicInteger()
+
     /** Chooses the fault for each request: (method, 1-based count of requests with that method). */
     @Volatile var faults: (method: String, n: Int) -> Fault = { _, _ -> Fault.None }
 
@@ -159,6 +164,12 @@ class RealSocketTusServer : AutoCloseable {
         }
 
         val locked = (head.method == "HEAD" || head.method == "PATCH") && nowMillis() < lockedUntilMillis
+        if (removed && (head.method == "HEAD" || head.method == "PATCH")) {
+            if (head.method == "PATCH") readBody(input, contentLength ?: 0)
+            log("404")
+            respond(output, 404, emptyMap())
+            return true
+        }
         when (head.method) {
             "OPTIONS" -> {
                 log("204")
@@ -187,6 +198,7 @@ class RealSocketTusServer : AutoCloseable {
                     is Fault.Status -> { log("${fault.status}"); respond(output, fault.status, fault.headers); return true }
                     Fault.ApplyThenDrop -> {
                         synchronized(lock) { if (requestOffset == offset) stored.write(body) }
+                        checkComplete()
                         log("applied+dropped")
                         socket.close()
                         return false
@@ -201,6 +213,7 @@ class RealSocketTusServer : AutoCloseable {
                     }
                     stored.write(body)
                 }
+                checkComplete()
                 log("204 offset=$offset")
                 respond(output, 204, mapOf("Upload-Offset" to offset.toString(), "Tus-Resumable" to "1.0.0"))
             }
@@ -208,6 +221,13 @@ class RealSocketTusServer : AutoCloseable {
             else -> { log("405"); respond(output, 405, emptyMap()) }
         }
         return true
+    }
+
+    private fun checkComplete() {
+        if (offset == uploadLength) {
+            completions.incrementAndGet()
+            if (removeWhenComplete) removed = true
+        }
     }
 
     private fun respond(output: OutputStream, status: Int, headers: Map<String, String>, isHead: Boolean = false) {
