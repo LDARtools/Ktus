@@ -20,8 +20,9 @@ Ktus uses your Ktor `HttpClient`. Two settings matter:
 
 ```kotlin
 val httpClient = HttpClient(engine) {
-    // tus requests must never be redirected. Ktus rejects any 3xx and any answer that came from another origin,
-    // but only after the engine has followed it (Ktor follows HEAD redirects by default), so turn it off here.
+    // tus requests must never be redirected. Ktus rejects any 3xx, and any answer that came from a different URL
+    // than the one it asked for (extra query parameters added by plugins such as defaultRequest are fine), but
+    // only after the client has followed it (Ktor follows HEAD redirects by default), so turn it off here.
     followRedirects = false
     // Ktus classifies responses by status itself, so expectSuccess can be either value.
     install(HttpTimeout) {
@@ -132,11 +133,13 @@ httpClient.createAndUploadTus(
   must then exceed the engine's socket/request timeout plus about 10 s. The in-flight ticker runs in a side job
   that is cancelled with the request.
 - Because the in-flight ticker keeps `onActivity` alive, a watchdog fed by it cannot catch a request that never
-  completes. Bound that with the engine's timeouts (Ktor `HttpTimeout`: socket/request timeout): once the
-  budget is spent Ktus sends no further request, so it gives up, at worst, about the duration of the first
-  failing request + `maxElapsedMillis` + one request timeout (a request already in flight when the budget runs
-  out is allowed to finish). Size
-  `maxElapsedMillis` to what you can really wait, or put a finite outer limit (`withTimeout`) around the call.
+  completes. Bound that with the engine's timeouts (Ktor `HttpTimeout`: socket/request timeout). One elapsed
+  budget covers the whole call (OPTIONS, POST and the upload; it restarts only on upload progress), and once it
+  is spent Ktus sends no further request except, when it is giving up on an unresolved final PATCH, one last
+  HEAD. So after the failures start it gives up, at worst, after about the first failing request +
+  `maxElapsedMillis` + one request timeout (the request in flight when the budget ran out, or that last HEAD).
+  Size `maxElapsedMillis` to what you can really wait, or put a finite outer limit (`withTimeout`) around the
+  call.
 - Callbacks can run on different threads: the in-flight ticker on the caller's dispatcher, and
   `onProgress`/`onActivity` during the body write on the engine's thread. Ktus never runs `onActivity`
   concurrently with itself (an overlapping call is skipped), but make callbacks thread-safe anyway (for
@@ -220,8 +223,10 @@ client has `expectSuccess` set:
 | A closed `HttpClient` | `IllegalStateException` at once, no retries |
 
 After any PATCH whose outcome is unknown (network error, timeout, a retryable status, 409, or any 2xx other than
-`204`) Ktus backs off, sends HEAD, and continues from the offset the server reports. It never re-sends a chunk
-at the old offset blindly. If that HEAD reports less than the server has already confirmed, the upload fails
+`204`) Ktus backs off, then sends HEAD, and continues from the offset the server reports. When it gives up on an
+unresolved final PATCH (out of attempts or budget, or the required wait would not fit the budget), it sends one
+last HEAD without waiting: if that shows the whole file, the upload succeeded. It never re-sends a chunk at the
+old offset blindly. If that HEAD reports less than the server has already confirmed, the upload fails
 with `TusOffsetMismatchException` rather than rewinding.
 
 ## When the outcome is unknown
@@ -246,8 +251,8 @@ original failure as its `cause`. The one exception is a **definitive refusal**: 
 bytes was answered with a 4xx that Ktus does not retry (408, 409, 423, 429 and, by default, 401 are retried and
 are never definitive), or a 3xx, or failed on a short local read, and no final PATCH earlier in the same call
 (or in an earlier call, for a marked entry) ended without a definitive answer. Any 5xx is never definitive (a
-server may answer 5xx after it stored the bytes), and neither is an answer from another origin (the client
-followed a redirect, so the body may have reached the original server first).
+server may answer 5xx after it stored the bytes), and neither is an answer from a different URL than the one
+requested (the client followed a redirect, so the body may have reached the original server first).
 
 Once any final PATCH has ended without a definitive answer, that stays true: a later PATCH answered `204` below
 the total lets the upload continue, but every failure for the rest of the call is still
@@ -424,7 +429,9 @@ permanently: a protocol error or a status that is not retried, such as 403.
 - **No raw fallback.** An unparseable `Location` is an error; it is never used as-is.
 - **No redirects.** Any 3xx answer to a tus request is an error. Configure the client with
   `followRedirects = false`; if the client follows a redirect anyway (Ktor does for HEAD by default), an answer
-  from another origin is rejected.
+  from any URL other than the one requested is rejected (extra query parameters that client plugins add are
+  allowed). On iOS, NSURLSession does not follow redirects on its own; Ktor's redirect handling does, and is
+  caught the same way.
 
 ## Installation
 

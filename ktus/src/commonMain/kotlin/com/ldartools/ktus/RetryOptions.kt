@@ -70,8 +70,8 @@ data class RetryOptions(
         require(factor >= 0.0) { "factor must not be negative or NaN" }
         require(maxElapsedMillis >= 0) { "maxElapsedMillis must not be negative" }
         require(minDelayMillis >= 0) { "minDelayMillis must not be negative" }
-        require(minDelayMillis <= maxElapsedMillis) {
-            "minDelayMillis ($minDelayMillis) must not exceed maxElapsedMillis ($maxElapsedMillis): no retry could ever be sent"
+        require(minDelayMillis == 0L || minDelayMillis < maxElapsedMillis) {
+            "minDelayMillis ($minDelayMillis) must be below maxElapsedMillis ($maxElapsedMillis): otherwise no retry could ever be sent"
         }
     }
 

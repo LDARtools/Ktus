@@ -114,10 +114,13 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
   the host is in `allowedUploadHosts`; https to http is always rejected, and so is a `Location` with user
   information (`user@host`).
 - **Any 3xx answer is an error** (`TusProtocolException`), and an answer the client got by following a
-  redirect (to any other URL, the same origin included) is rejected; on a final PATCH that is an unknown outcome.
-- **No request is sent once the retry budget is spent.** After the backoff wait, and after the recovery HEAD,
-  Ktus stops if `maxElapsedMillis` is used up, so a call gives up at most about one request timeout after the
-  budget ends.
+  redirect (to any other URL, the same origin included; extra query parameters added by client plugins are fine)
+  is rejected; on a final PATCH that is an unknown outcome.
+- **No request is sent once the retry budget is spent**, except one last HEAD (without waiting or retrying) when
+  giving up on an unresolved final PATCH; if it shows the whole file, the upload succeeds. One elapsed budget
+  covers the whole call (OPTIONS, POST and the upload), restarted only by upload progress, so a call gives up at
+  most about one request timeout after the budget ends.
+- **`minDelayMillis` must be below `maxElapsedMillis`** (when it is set), otherwise no retry could be sent.
 - **404/410 from POST or OPTIONS** is a `TusHttpException`, no longer a `TusUploadExpiredException`.
 - **Retry defaults are longer.** `maxRetries` 3 → 10, `maxDelayMillis` 10 s → 30 s, plus a new 10-minute
   `maxElapsedMillis` budget. Worst case for one operation that keeps failing: about 10 attempts with up to

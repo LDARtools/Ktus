@@ -113,11 +113,15 @@ internal fun sameOrigin(a: Url, b: Url): Boolean =
         a.port == b.port
 
 /**
- * True when [a] is the same request target as [b]: same origin, path and query. A different answer URL means
- * the client followed a redirect, even within the same origin.
+ * True when the answered URL [answered] is the request target [target]: same origin and path, and every query
+ * parameter of [target] present with the same values. Extra parameters are allowed, because client plugins
+ * (`defaultRequest`, for example an api-version) add them after Ktus built the request. Anything else means the
+ * client followed a redirect, even within the same origin.
  */
-internal fun sameTarget(a: Url, b: Url): Boolean =
-    sameOrigin(a, b) && a.encodedPath.ifEmpty { "/" } == b.encodedPath.ifEmpty { "/" } && a.encodedQuery == b.encodedQuery
+internal fun sameTarget(answered: Url, target: Url): Boolean =
+    sameOrigin(answered, target) &&
+        answered.encodedPath.ifEmpty { "/" } == target.encodedPath.ifEmpty { "/" } &&
+        target.parameters.entries().all { (name, values) -> answered.parameters.getAll(name) == values }
 
 private fun parseHttpUrl(value: String): Url? {
     val parts = parseUriReference(value) ?: return null

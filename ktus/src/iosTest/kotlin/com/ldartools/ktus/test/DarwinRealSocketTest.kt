@@ -225,6 +225,37 @@ class DarwinRealSocketTest {
         }
     }
 
+    /**
+     * 307/308 on HEAD and on PATCH, with followRedirects on (Ktor's default) and off. Observed: NSURLSession does
+     * not follow on its own; with followRedirects on, Ktor's redirect plugin follows the HEAD (and the answered-URL
+     * check rejects it) but not the PATCH (rejected as a 3xx); with it off every 3xx is rejected.
+     */
+    @Test
+    fun redirectsOnHeadAndPatch_areRejected_onDarwin() = runBlocking {
+        for (follow in listOf(true, false)) {
+            for (method in listOf("HEAD", "PATCH")) {
+                for (status in listOf(307, 308)) {
+                    PosixTusServer().use { server ->
+                        server.statuses = { m, n -> if (m == method && n == 1) status to mapOf("Location" to "/files/other") else null }
+                        val error = runCatching {
+                            withTimeout(30_000) {
+                                HttpClient(Darwin) { followRedirects = follow }.use {
+                                    it.createAndUploadTus("${server.baseUrl}/files", TrackingFile(payload(64 * 1024)),
+                                        options = TusUploadOptions(retryOptions = quickRetry(maxRetries = 2)))
+                                }
+                            }
+                        }.exceptionOrNull()
+                        val label = "follow=$follow $method $status"
+                        assertTrue(error != null, "$label: a redirected tus request must not succeed; log=${server.log}")
+                        val rejected = error is TusProtocolException ||
+                            (error is TusUploadOutcomeUnknownException && error.cause is TusProtocolException)
+                        assertTrue(rejected, "$label: rejected as a protocol error, was $error; log=${server.log}")
+                    }
+                }
+            }
+        }
+    }
+
     /** A block that adds a query parameter (an auth token, say) is not mistaken for a followed redirect. */
     @Test
     fun aQueryParameterAddedByTheBlock_isNotARedirect() = runBlocking {

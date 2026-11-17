@@ -81,8 +81,10 @@ suspend fun HttpClient.createTusUpload(
  *
  * Sends a HEAD first to learn the server's offset, then PATCHes the rest of the file in chunks. Every
  * failure whose outcome is unknown (network error, timeout, 500, 502, 503, 504, 408, 423, 429, 409, or any
- * 2xx other than 204) is followed by a backoff and a HEAD, and the upload continues from the offset the server
- * reports; a chunk is never blindly re-sent at the old offset. See [RetryOptions] for the limits.
+ * 2xx other than 204) is followed by a backoff and then a HEAD, and the upload continues from the offset the server
+ * reports; a chunk is never blindly re-sent at the old offset. When Ktus gives up on an unresolved final PATCH
+ * (out of attempts or budget), it sends one last HEAD without waiting, and succeeds if that shows the whole file.
+ * See [RetryOptions] for the limits; one elapsed budget covers the whole call.
  *
  * The file size is read once at the start. The upload fails if the size changes before it completes,
  * if the server's `Upload-Length` differs from it, or if the server reports an impossible offset.
@@ -193,10 +195,12 @@ suspend fun HttpClient.createAndUploadTus(
         withFileLock(file, options) {
             val activity = onActivity?.serializedActivity()
             val total = snapshotSize(file, options)
-            val upload = createUploadInternal(createUrl, total, metadata, options, activity, block)
+            // One elapsed budget for the whole call: OPTIONS, POST and the upload.
+            val backoff = callBackoff(options, activity)
+            val upload = createUploadInternal(createUrl, total, metadata, options, activity, block, backoff)
             onCreate?.invoke(upload.uploadUrl)
             uploadInternal(upload.uploadUrl, file, total, options, onProgress?.guarded(), onConfirmed?.guarded(),
-                activity, block, onFinalPatch = onFinalPatch?.guarded())
+                activity, block, onFinalPatch = onFinalPatch?.guarded(), sharedBackoff = backoff)
         }
     }
 }
@@ -289,6 +293,8 @@ private suspend fun HttpClient.resumeOrCreateInternal(
     block: suspend HttpRequestBuilder.() -> Unit,
 ) {
     val total = snapshotSize(file, options)
+    // One elapsed budget for the whole call: resuming, and creating a new upload if needed.
+    val backoff = callBackoff(options, onActivity)
 
     // Uploads [entry], keeping its finalSentAt flag in the store up to date, and returns normally on success.
     suspend fun upload(initial: TusUpload) {
@@ -306,7 +312,7 @@ private suspend fun HttpClient.resumeOrCreateInternal(
         )
         try {
             uploadInternal(entry.uploadUrl, file, total, options, onProgress, onConfirmed, onActivity, block, hooks,
-                onFinalPatch)
+                onFinalPatch, sharedBackoff = backoff)
         } catch (e: TusUploadOutcomeUnknownException) {
             // Keep (and flag) the entry: every later call must keep reporting the unknown outcome until the
             // caller has checked the server and removed the entry. Never re-create.
@@ -373,7 +379,7 @@ private suspend fun HttpClient.resumeOrCreateInternal(
         guardedStore { store.remove(fingerprint) }
     }
 
-    val created = createUploadInternal(createUrl, total, metadata, options, onActivity, block)
+    val created = createUploadInternal(createUrl, total, metadata, options, onActivity, block, backoff)
     guardedStore { store.set(fingerprint, created) }
     onCreate?.invoke(created.uploadUrl)
     upload(created)
@@ -428,6 +434,9 @@ private fun (() -> Unit).guarded(): () -> Unit = {
  * skipped (activity is being reported anyway). The mutex also gives the callback's own state a
  * happens-before edge between threads.
  */
+private fun callBackoff(options: TusUploadOptions, onActivity: (() -> Unit)?) =
+    Backoff(options.retryOptions, onActivity, options.activityHeartbeatMillis ?: HEARTBEAT_MILLIS)
+
 private fun (() -> Unit).serializedActivity(): () -> Unit {
     val inner = guarded()
     val mutex = Mutex()
@@ -526,6 +535,7 @@ private suspend fun HttpClient.createUploadInternal(
     options: TusUploadOptions,
     onActivity: (() -> Unit)?,
     block: suspend HttpRequestBuilder.() -> Unit,
+    sharedBackoff: Backoff? = null,
 ): TusUpload {
     // Validate the metadata before touching the network.
     val encodedMetadata = encodeMetadata(metadata, options.omitEmptyMetadataValues)
@@ -536,7 +546,7 @@ private suspend fun HttpClient.createUploadInternal(
             op = TusOp.OPTIONS,
             targetUrl = createUrl,
             options = retry,
-            backoff = Backoff(retry, onActivity, options.activityHeartbeatMillis ?: HEARTBEAT_MILLIS),
+            backoff = sharedBackoff ?: callBackoff(options, onActivity),
             client = this,
             onActivity = onActivity,
             heartbeatMillis = options.activityHeartbeatMillis,
@@ -563,7 +573,7 @@ private suspend fun HttpClient.createUploadInternal(
         op = TusOp.POST,
         targetUrl = createUrl,
         options = retry,
-        backoff = Backoff(retry, onActivity, options.activityHeartbeatMillis ?: HEARTBEAT_MILLIS),
+        backoff = sharedBackoff ?: callBackoff(options, onActivity),
         client = this,
         onActivity = onActivity,
         heartbeatMillis = options.activityHeartbeatMillis,
@@ -621,10 +631,11 @@ private suspend fun HttpClient.uploadInternal(
     block: suspend HttpRequestBuilder.() -> Unit,
     hooks: FinalPatchHooks? = null,
     onFinalPatch: (() -> Unit)? = null,
+    sharedBackoff: Backoff? = null,
 ) {
     val retry = options.retryOptions
     val heartbeat = options.activityHeartbeatMillis
-    val backoff = Backoff(retry, onActivity, heartbeat ?: HEARTBEAT_MILLIS)
+    val backoff = sharedBackoff ?: callBackoff(options, onActivity)
 
     // The outcome-unknown latch. Set while the PATCH carrying the last bytes may have landed and Ktus has
     // not found out; every terminal failure is then reported as TusUploadOutcomeUnknownException. A HEAD
@@ -645,6 +656,26 @@ private suspend fun HttpClient.uploadInternal(
     // refusal is treated as definitive.
     var finalEverUncertain = finalMayHaveLanded
 
+    // One HEAD with no wait and no retry, sent when giving up on an unresolved final PATCH. True when it shows
+    // the upload complete. Its own failure never replaces the failure being reported, except that a 404/410
+    // (the upload is gone) propagates and is reported as such.
+    suspend fun lastResolutionHead(): Boolean {
+        val singleShot = retry.copy(maxRetries = 1, maxElapsedMillis = 0, minDelayMillis = 0)
+        val serverOffset = try {
+            headOffset(uploadUrl, total, singleShot, Backoff(singleShot, onActivity, heartbeat ?: HEARTBEAT_MILLIS),
+                onActivity, heartbeat, block)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: CallbackFailure) {
+            throw e
+        } catch (e: TusUploadExpiredException) {
+            throw e
+        } catch (e: Throwable) {
+            return false
+        }
+        return serverOffset == total
+    }
+
     suspend fun provedIncomplete() {
         finalMayHaveLanded = false
         finalUnresolved = false
@@ -657,8 +688,8 @@ private suspend fun HttpClient.uploadInternal(
     }
 
     try {
+        // A successful first HEAD is not progress: the elapsed budget keeps running across the whole call.
         var offset = headOffset(uploadUrl, total, retry, backoff, onActivity, heartbeat, block)
-        backoff.reset()
         var confirmed = offset
         if (offset == total) {
             onConfirmed?.invoke(total, total)
@@ -790,12 +821,24 @@ private suspend fun HttpClient.uploadInternal(
                     // Upload progress is not used: some engines (Darwin) report it before connecting.
                     val originMayBeBusy = outcome.timedOut || locked || outcome.statusCode in GATEWAY_STATUSES ||
                         (outcome.statusCode == null && outcome.cause?.let { !isPreSendFailure(it) } != false)
-                    if (!backoff.awaitRetry(patchAttempts, outcome.retryAfterMillis,
-                            if (locked) LOCKED_MIN_DELAY_MILLIS else 0L, applyMinDelay = originMayBeBusy)) {
+                    val giveUp = !backoff.awaitRetry(patchAttempts, outcome.retryAfterMillis,
+                        if (locked) LOCKED_MIN_DELAY_MILLIS else 0L, applyMinDelay = originMayBeBusy) ||
+                        // The wait used up the rest of the budget: stop instead of a full retry cycle.
+                        backoff.budgetExhausted()
+                    if (giveUp) {
+                        // Giving up on an unresolved final PATCH: ask once, without waiting or retrying, whether it
+                        // landed. If it did, the upload is simply complete.
+                        if (finalUnresolved && lastResolutionHead()) {
+                            finalMayHaveLanded = false
+                            offset = total
+                            if (total > confirmed) {
+                                confirmed = total
+                                onConfirmed?.invoke(total, total)
+                            }
+                            continue
+                        }
                         throw patchRetriesExhausted(outcome, patchAttempts)
                     }
-                    // The wait used up the rest of the budget: stop instead of sending another full request.
-                    if (backoff.budgetExhausted()) throw patchRetriesExhausted(outcome, patchAttempts)
                     // The PATCH may or may not have been applied: ask the server where it is.
                     var serverOffset = headOffset(uploadUrl, total, retry, backoff, onActivity, heartbeat, block)
                     // Below what the server already confirmed: probably a stale instance. Ask again a few times

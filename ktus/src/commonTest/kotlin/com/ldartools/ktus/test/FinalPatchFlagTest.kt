@@ -548,7 +548,7 @@ class Adv6DefinitiveRefusalTest {
     fun aMinDelayLongerThanTheBudget_isRejected() {
         val e = assertFailsWith<IllegalArgumentException> { RetryOptions(minDelayMillis = 300_000, maxElapsedMillis = 240_000) }
         assertTrue(e.message!!.contains("minDelayMillis"), e.message)
-        RetryOptions(minDelayMillis = 240_000, maxElapsedMillis = 240_000)
+        RetryOptions(minDelayMillis = 239_999, maxElapsedMillis = 240_000)
         for (bad in listOf<() -> Unit>({ RetryOptions(initialDelayMillis = -1) }, { RetryOptions(maxDelayMillis = -1) },
                 { RetryOptions(maxElapsedMillis = -1) }, { RetryOptions(minDelayMillis = -1) }, { RetryOptions(factor = -1.0) },
                 { RetryOptions(factor = Double.NaN) })) {

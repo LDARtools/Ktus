@@ -157,22 +157,24 @@ class Adv11Test {
         assertTrue(gaveUpAfter <= 600_000 + 300_000 + 10_000, "budget + one request: gave up after $gaveUpAfter ms")
     }
 
-    private suspend fun kotlinx.coroutines.test.TestScope.gaveUpAfter(headSlowFrom: Long, patchSlowFrom: Long): Long {
+    private suspend fun kotlinx.coroutines.test.TestScope.gaveUpAfter(headSlowFrom: Long, patchSlowFrom: Long, finalChunk: Boolean = false): Long {
+        // By default the failing PATCH is not the final one, so no last resolution HEAD is involved.
+        val size = if (finalChunk) 10L else 20L
         val sched = testScheduler
         val server = ScriptedTusServer(clock = { sched.currentTime },
-            dispatcher = kotlinx.coroutines.test.StandardTestDispatcher(sched)).apply { uploadLength = 10 }
-        server.script(HttpMethod.Head, ok(0, 10))
+            dispatcher = kotlinx.coroutines.test.StandardTestDispatcher(sched)).apply { uploadLength = size }
+        server.script(HttpMethod.Head, ok(0, size))
         repeat(200) {
             server.script(HttpMethod.Patch, Reply.Custom { _, _ ->
                 if (sched.currentTime >= patchSlowFrom) delay(300_000)
                 throw kotlinx.io.IOException("fails") })
             server.script(HttpMethod.Head, Reply.Custom { _, _ ->
                 if (sched.currentTime >= headSlowFrom) delay(300_000)
-                respond("", HttpStatusCode.OK, headersOf("Upload-Offset" to listOf("0"), "Upload-Length" to listOf("10"))) })
+                respond("", HttpStatusCode.OK, headersOf("Upload-Offset" to listOf("0"), "Upload-Length" to listOf("$size"))) })
         }
         val start = sched.currentTime
         runCatching {
-            server.client().uploadTus(url, InMemoryTusFile("f", testBytes(10)), options = TusUploadOptions(
+            server.client().uploadTus(url, InMemoryTusFile("f", testBytes(size.toInt())), options = TusUploadOptions(chunkSize = 10,
                 activityHeartbeatMillis = null, retryOptions = RetryOptions(maxRetries = 100_000, initialDelayMillis = 10_000,
                     maxDelayMillis = 10_000, jitter = false, timeSource = sched.timeSource)))
         }
@@ -217,5 +219,12 @@ class Adv11Test {
         }
         assertEquals(10, server.offset)
         assertTrue(server.requests.all { "token=" in it.url }, "${server.requests.map { it.url }}")
+    }
+
+    /** M1 (round 12): giving up on an unresolved final PATCH sends exactly one last HEAD; bound budget + one request. */
+    @Test
+    fun anUnresolvedFinalPatch_getsOneLastHead_withinTheBudgetPlusOneRequest() = runTest {
+        val t = gaveUpAfter(headSlowFrom = 600_000, patchSlowFrom = 600_000, finalChunk = true)
+        assertEquals(600_000L + 300_000L, t, "one last (slow) HEAD after the budget, nothing more")
     }
 }
