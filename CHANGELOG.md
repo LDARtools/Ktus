@@ -24,9 +24,14 @@ Two new failure types are not `IOException`s, so a "network error, retry later" 
   dropped or re-created.
 - `TusLocalFileException` (a `TusProtocolException`) for problems with the local file (size changed, short read).
 - `RetryOptions.minDelayMillis` (default 0, at most `maxElapsedMillis`): the shortest wait before retrying a
-  PATCH the origin may still be processing (timeout, 502/503/504, 423, or a connection dropped after body bytes
-  were sent), applied after the jitter. If the remaining budget is shorter than that wait, the call gives up
-  instead of retrying early. It does not apply to fast failures where nothing was sent, or to HEAD/OPTIONS/POST.
+  PATCH the origin may still be processing (a request/socket timeout, 502/503/504, 423, or any network error
+  that does not prove the request never reached the origin), applied after the jitter. If the remaining budget
+  is shorter than that wait, the call gives up instead of retrying early. It does not apply to failures that
+  prove nothing reached the origin (connection refused or unreachable, DNS failure, no network, connect
+  timeout, TLS handshake failure, and the matching NSURLErrorDomain codes on iOS), or to HEAD/OPTIONS/POST.
+  The decision comes from the failure, not from upload progress, which some engines report before connecting.
+- `TusUploadOutcomeUnknownException.isUploadGone` and `.isNetworkFailure`, to decide between "check the server"
+  and "call again later" without hand-rolled cause checks.
 - `TusUploadOptions.activityHeartbeatMillis` (default 5 s; null turns it off): `onActivity` ticks while a
   request is in flight.
 - `onFinalPatch` callback on `uploadTus`, `createAndUploadTus` and `resumeOrCreateAndUploadTus`: called right
@@ -144,8 +149,14 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
 - **`TusUrlStore` writes must be durable when they return.**
 - **A HEAD below an offset the server already confirmed is asked again** (up to 3 times, with backoff, within the
   budget) before the upload fails with `TusOffsetMismatchException`; confirmed bytes are never re-sent.
-- **`RetryOptions` rejects contradictory values**: `minDelayMillis` above `maxElapsedMillis`, and
-  `initialDelayMillis` above `maxDelayMillis`.
+- **`RetryOptions` validation.** Compared with 1.0.3 (which validated nothing):
+  - negative `initialDelayMillis`, `maxDelayMillis`, `maxElapsedMillis` or `minDelayMillis`, a negative or NaN
+    `factor`, and `minDelayMillis` above `maxElapsedMillis` now throw `IllegalArgumentException`;
+  - `maxRetries` of 0 or less still means a single attempt, as in 1.0.3;
+  - `initialDelayMillis` above `maxDelayMillis` is accepted and capped at `maxDelayMillis`, as in 1.0.3;
+  - a `factor` between 0 and 1 is accepted (delays shrink), as in 1.0.3.
+- **Ktus installs its upload-progress listener after the request block.** Ktor keeps one `onUpload` listener per
+  request, so an `onUpload` set in the block is replaced; use `onProgress`.
 - **`TusOffsetMismatchException` no longer makes `resumeOrCreateAndUploadTus` drop a stored upload** (it can be
   caused by a stale HEAD); the entry is kept.
 - **A short read is reported as `TusLocalFileException`** and is not retried; verified with real sockets on the

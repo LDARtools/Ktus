@@ -692,8 +692,6 @@ private suspend fun HttpClient.uploadInternal(
             val body = TusPatchContent(file, start, length)
             // Written on the engine's thread, read here: a CompletableDeferred is safe across threads.
             val callbackError = CompletableDeferred<Throwable>()
-            // Completed once the engine has taken body bytes for this PATCH.
-            val bodyStarted = CompletableDeferred<Unit>()
             val attemptOutcome = try {
                 attemptTus(TusOp.PATCH, uploadUrl, retry, client = this, onActivity = onActivity, heartbeatMillis = heartbeat) {
                     patch(urlString = uploadUrl) {
@@ -702,9 +700,11 @@ private suspend fun HttpClient.uploadInternal(
                         // Content-Length comes from the body's contentLength.
                         setBody(body)
 
-                        // Progress listener hook (Ktor capability): bytes handed to the engine so far.
+                        block()
+                        // Progress listener hook (Ktor capability): bytes handed to the engine so far. Installed
+                        // after the caller's block: Ktor keeps one upload listener per request, and Ktus needs
+                        // this one (use onProgress rather than onUpload in the block).
                         onUpload { bytesSentTotal, _ ->
-                            if (bytesSentTotal > 0) bodyStarted.complete(Unit)
                             try {
                                 onActivity?.invoke()
                                 onProgress?.invoke(start + bytesSentTotal, total)
@@ -714,7 +714,6 @@ private suspend fun HttpClient.uploadInternal(
                                 throw e
                             }
                         }
-                        block()
                     }
                 }
             } finally {
@@ -779,10 +778,12 @@ private suspend fun HttpClient.uploadInternal(
                     val locked = outcome.statusCode == 423
                     if (locked) patchAttempts--
                     // The origin may still be processing this PATCH (it timed out, a gateway gave up on it, the
-                    // file is locked, or the connection dropped after body bytes left): wait at least
-                    // minDelayMillis before asking again. Not after fast failures where nothing was sent.
+                    // file is locked, or the connection failed in a way that does not prove nothing was sent):
+                    // wait at least minDelayMillis before asking again. Not after failures that prove the
+                    // request never reached the origin (connect refused, DNS, no network, TLS handshake).
+                    // Upload progress is not used: some engines (Darwin) report it before connecting.
                     val originMayBeBusy = outcome.timedOut || locked || outcome.statusCode in GATEWAY_STATUSES ||
-                        (outcome.statusCode == null && bodyStarted.isCompleted)
+                        (outcome.statusCode == null && outcome.cause?.let { !isPreSendFailure(it) } != false)
                     if (!backoff.awaitRetry(patchAttempts, outcome.retryAfterMillis,
                             if (locked) LOCKED_MIN_DELAY_MILLIS else 0L, applyMinDelay = originMayBeBusy)) {
                         throw patchRetriesExhausted(outcome, patchAttempts)

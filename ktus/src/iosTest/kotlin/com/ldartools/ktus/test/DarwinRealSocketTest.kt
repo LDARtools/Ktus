@@ -194,6 +194,45 @@ class DarwinRealSocketTest {
         }
     }
 
+    /** The Darwin engine reports upload progress before connecting; the floor must not depend on it. */
+    @Test
+    fun aRefusedConnection_doesNotGetTheMinDelayFloor() = runBlocking {
+        val server = PosixTusServer()
+        val started = TimeSource.Monotonic.markNow()
+        val progress = AtomicLong(0)
+        val error = runCatching {
+            withTimeout(30_000) {
+                client().use {
+                    it.createAndUploadTus("${server.baseUrl}/files", TrackingFile(payload(512 * 1024)),
+                        options = TusUploadOptions(retryOptions = RetryOptions(maxRetries = 3, initialDelayMillis = 20,
+                            maxDelayMillis = 50, minDelayMillis = 10_000, maxElapsedMillis = 60_000)),
+                        onProgress = { sent, _ -> if (sent > progress.value) progress.value = sent },
+                        onFinalPatch = { server.close() }) // every later connection is refused
+                }
+            }
+        }.exceptionOrNull()
+        val elapsed = started.elapsedNow().inWholeMilliseconds
+        assertTrue(error != null, "the call must fail")
+        assertTrue(elapsed < 5_000, "connection refused (-1004) proves nothing was sent; no 10 s floor ($elapsed ms, $error)")
+    }
+
+    @Test
+    fun aConnectionDroppedAfterTheBody_getsTheMinDelayFloor() = runBlocking {
+        PosixTusServer().use { server ->
+            server.faults = { m, n -> if (m == "PATCH" && n == 1) Fault.ApplyThenDrop else Fault.None }
+            val bytes = payload(512 * 1024)
+            withTimeout(30_000) {
+                client().use { it.createAndUploadTus("${server.baseUrl}/files", TrackingFile(bytes),
+                    options = TusUploadOptions(chunkSize = 256 * 1024, retryOptions = RetryOptions(
+                        initialDelayMillis = 20, maxDelayMillis = 50, minDelayMillis = 1_500, maxElapsedMillis = 60_000))) }
+            }
+            assertContentEquals(bytes, server.data)
+            val log = server.log
+            val i = log.indexOfFirst { it.result == "applied+dropped" }
+            assertTrue(log[i + 1].atMillis - log[i].atMillis >= 1_400, "$log")
+        }
+    }
+
     @Test
     fun cancellingMidPatch_leavesNoOpenFile() = runBlocking {
         PosixTusServer().use { server ->

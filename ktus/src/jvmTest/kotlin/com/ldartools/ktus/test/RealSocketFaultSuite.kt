@@ -326,6 +326,48 @@ abstract class RealSocketFaultSuite {
         }
     }
 
+    // (9) minDelayMillis is scoped by the failure, not by upload progress ---------------------------------
+
+    @Test
+    fun aRefusedConnection_doesNotGetTheMinDelayFloor() = runBlocking {
+        RealSocketTusServer().use { server ->
+            server.oneRequestPerConnection = true // no pooled connection: the PATCH must open a new one
+            val started = System.nanoTime()
+            val error = runCatching {
+                withTimeout(30_000) {
+                    client().use { client ->
+                        client.createAndUploadTus("${server.baseUrl}/files", TrackingFile(payload(64 * 1024)),
+                            options = TusUploadOptions(retryOptions = RetryOptions(maxRetries = 3, initialDelayMillis = 20,
+                                maxDelayMillis = 50, minDelayMillis = 10_000, maxElapsedMillis = 60_000)),
+                            onFinalPatch = { server.close() }) // every later connection is refused
+                    }
+                }
+            }.exceptionOrNull()
+            val elapsed = (System.nanoTime() - started) / 1_000_000
+            assertTrue(error != null, "the call must fail")
+            assertTrue(elapsed < 5_000, "a refused connection proves nothing was sent; no 10 s floor ($elapsed ms, $error)")
+        }
+    }
+
+    @Test
+    fun aConnectionDroppedAfterTheBody_getsTheMinDelayFloor() = runBlocking {
+        RealSocketTusServer().use { server ->
+            server.faults = { method, n -> if (method == "PATCH" && n == 1) Fault.ApplyThenDrop else Fault.None }
+            val bytes = payload(512 * 1024)
+            withTimeout(30_000) {
+                client().use { client ->
+                    client.createAndUploadTus("${server.baseUrl}/files", TrackingFile(bytes),
+                        options = TusUploadOptions(chunkSize = 256 * 1024, retryOptions = RetryOptions(
+                            initialDelayMillis = 20, maxDelayMillis = 50, minDelayMillis = 1_500, maxElapsedMillis = 60_000)))
+                }
+            }
+            assertContentEquals(bytes, server.data)
+            val i = server.log.indexOfFirst { it.result == "applied+dropped" }
+            val gap = server.log[i + 1].atMillis - server.log[i].atMillis
+            assertTrue(gap >= 1_400, "the origin may still be processing: wait minDelayMillis ($gap ms)")
+        }
+    }
+
     // (6) ------------------------------------------------------------------------------------------------
 
     @Test

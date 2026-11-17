@@ -20,23 +20,29 @@ import kotlin.time.TimeSource
  *   "retries after the first try": `maxRetries = 3` means at most 3 attempts. 423 Locked answers are not
  *   counted: tusdotnet's per-file lock is bounded by [maxElapsedMillis] alone.
  *
- * @param maxRetries maximum attempts per operation, including the first one (default 10).
- * @param initialDelayMillis upper bound of the first backoff delay in milliseconds (default 500).
+ * @param maxRetries maximum attempts per operation, including the first one (default 10). Values below 1 mean
+ *   one attempt, as in 1.0.x.
+ * @param initialDelayMillis upper bound of the first backoff delay in milliseconds (default 500). A value above
+ *   [maxDelayMillis] is capped at [maxDelayMillis].
  * @param maxDelayMillis upper bound of any single computed backoff delay in milliseconds (default 30000).
  *   A server `Retry-After` may ask for longer; one wait is capped at max([maxDelayMillis], 60 s). If the
  *   remaining [maxElapsedMillis] is shorter than the wait a retry requires (an honoured `Retry-After`,
  *   [minDelayMillis], the 423 floor), the call gives up with the last failure instead of retrying early.
- * @param factor multiplier applied to the delay bound after each failure (default 2.0).
+ * @param factor multiplier applied to the delay bound after each failure (default 2.0); must not be negative.
  * @param maxElapsedMillis total time budget for a run of consecutive failures (default 10 minutes).
  * @param retryableStatusCodes HTTP statuses that are retried (default 408, 423, 429, 500, 502, 503, 504).
  * @param retryOnUnauthorized retry 401 responses so the request block can supply a refreshed token (default true).
  * @param honorRetryAfter wait at least as long as a `Retry-After` header asks (default true).
  * @param jitter randomise each delay within its bound (default true). Turn off only for deterministic tests.
  * @param random random source for the jitter. Replace only in tests.
- * @param minDelayMillis the shortest wait before retrying a PATCH the origin may still be processing: one that
- *   timed out, was answered 502/503/504 or 423, or whose connection dropped after body bytes were sent
- *   (default 0). It is applied after the jitter. It does not apply to fast failures where nothing was sent
- *   (connection refused, DNS) or to HEAD, OPTIONS, POST and DELETE retries. If the remaining
+ * @param minDelayMillis the shortest wait before retrying a PATCH the origin may still be processing (default 0):
+ *   one that timed out (request or socket timeout), was answered 502/503/504 or 423, or failed with any other
+ *   network error that does not prove the request never reached the origin. It does not apply to failures
+ *   that prove that: connection refused or unreachable, DNS failure, no network, connect timeout, TLS
+ *   handshake failure (java.net `ConnectException`, `UnknownHostException`, `NoRouteToHostException`,
+ *   `SSLHandshakeException`, Ktor's `ConnectTimeoutException`, and NSURLErrorDomain -1003, -1004, -1006, -1009,
+ *   -1018 to -1022, -1200 to -1206 on Darwin). Nor does it apply to HEAD, OPTIONS, POST and DELETE retries.
+ *   It is applied after the jitter. If the remaining
  *   [maxElapsedMillis] is shorter, the call gives up rather than retrying early; it must not exceed
  *   [maxElapsedMillis]. Use it to make a retry after a gateway timeout wait longer than the origin's own
  *   request timeout; with full jitter, raising [initialDelayMillis] alone does not guarantee that.
@@ -58,17 +64,14 @@ data class RetryOptions(
     val minDelayMillis: Long = 0L,
 ) {
     init {
-        require(maxRetries >= 1) { "maxRetries must be at least 1 (it counts attempts, including the first)" }
+        // maxRetries below 1 means one attempt, as in 1.0.x.
         require(initialDelayMillis >= 0) { "initialDelayMillis must not be negative" }
         require(maxDelayMillis >= 0) { "maxDelayMillis must not be negative" }
-        require(factor >= 1.0) { "factor must be at least 1.0" }
+        require(factor >= 0.0) { "factor must not be negative or NaN" }
         require(maxElapsedMillis >= 0) { "maxElapsedMillis must not be negative" }
         require(minDelayMillis >= 0) { "minDelayMillis must not be negative" }
         require(minDelayMillis <= maxElapsedMillis) {
             "minDelayMillis ($minDelayMillis) must not exceed maxElapsedMillis ($maxElapsedMillis): no retry could ever be sent"
-        }
-        require(initialDelayMillis <= maxDelayMillis || maxDelayMillis == 0L) {
-            "initialDelayMillis ($initialDelayMillis) must not exceed maxDelayMillis ($maxDelayMillis)"
         }
     }
 

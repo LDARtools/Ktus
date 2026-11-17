@@ -121,8 +121,9 @@ httpClient.createAndUploadTus(
 )
 ```
 
-- `onProgress` reports bytes handed to the HTTP engine while a PATCH body is written. It can go backwards when a
-  chunk has to be sent again, and it is silent while Ktus waits to retry, which can legitimately last minutes
+- `onProgress` reports bytes handed to the HTTP engine while a PATCH body is written. Some engines take the body
+  before any connection exists (on iOS the Darwin engine can report the whole chunk and then fail to connect),
+  so it is not proof that bytes reached the server. It can go backwards when a chunk has to be sent again, and it is silent while Ktus waits to retry, which can legitimately last minutes
   (a server answering `503` with `Retry-After`, or tusdotnet's `423` lock). Do not use it for a stall watchdog.
 - `onActivity` fires whenever Ktus is doing something: a request starts or gets its response, the body makes
   progress, every `TusUploadOptions.activityHeartbeatMillis` (default 5 s) while a request is in flight, and at
@@ -138,6 +139,8 @@ httpClient.createAndUploadTus(
   `onProgress`/`onActivity` during the body write on the engine's thread. Ktus never runs `onActivity`
   concurrently with itself (an overlapping call is skipped), but make callbacks thread-safe anyway (for
   example, only write an atomic timestamp).
+- Do not call Ktor's `onUpload` in the request block: Ktor keeps one upload listener per request, and Ktus
+  installs its own after your block. Use `onProgress` instead.
 - Exceptions thrown by `onProgress`, `onActivity`, `onConfirmed` or the `TusUrlStore` end the upload and reach
   you exactly as thrown (including a `CancellationException`); they are never retried.
 - `onConfirmed` reports offsets the server has acknowledged: after each PATCH answered `204`, after a recovery
@@ -267,13 +270,15 @@ answered by a stale server instance). A malformed answer to the final PATCH (a `
 `Upload-Offset`) is an unknown outcome too.
 
 **What to do with `TusUploadOutcomeUnknownException`:**
-1. **By default, just call `resumeOrCreateAndUploadTus` again later.** It is always safe: it sends HEAD to the
-   same upload URL and either finds the upload complete, or sends what is missing (at most the last chunk). It
-   never re-creates a marked entry. If the cause was a network failure (`e.cause is IOException`), that is all
-   there is to do; do not call your server-check API while offline.
-2. **When the cause is a 404/410 or the entry expired** (the upload URL is gone, typically because the server
-   finished and removed it), ask your server whether the file arrived, for example by id or by a hash of the
-   content it stored. Do the same whenever the app wants to confirm.
+1. **If the upload URL is gone** (`e.isUploadGone`: the cause is a 404/410, a `TusUploadExpiredException`, or the
+   entry expired), typically because the server finished and removed the upload, ask your server whether the file
+   arrived, for example by id or by a hash of the content it stored. Check this first: `TusHttpException` and
+   `TusUploadExpiredException` are `IOException`s too, so do not test `e.cause is IOException` for it.
+2. **Otherwise, just call `resumeOrCreateAndUploadTus` again later.** It is safe: it sends HEAD to the same
+   upload URL, finds the upload complete or sends what the server is missing (a server that disagrees about
+   the offset answers 409, which protects the data), and never re-creates a marked entry. If the cause was a
+   network failure (`e.isNetworkFailure`: an `IOException` that is not a `TusProtocolException`), do not call your
+   server-check API while offline.
 3. **Remove the entry (`store.remove(fingerprint)`) only once the server has answered:** it has the file (report
    success), or it does not and the upload URL is gone (start a fresh upload).
 
@@ -304,9 +309,10 @@ but the next PATCH can reach a different server instance while the first one is 
 an upload per process, not across instances, so two instances can write to the same upload at once if they
 share its storage. Check that your server is safe for that (a storage-level lock, affinity, or a single
 writer), or set `RetryOptions.minDelayMillis` above the origin's own request timeout. It applies to retries of a
-PATCH the origin may still be processing (one that timed out, got 502/503/504 or 423, or whose connection dropped
-after body bytes were sent), not to fast failures where nothing was sent (connection refused, DNS) and not to
-HEAD/OPTIONS/POST retries. It is a floor applied after the jitter; raising `initialDelayMillis` alone does not
+PATCH the origin may still be processing: one that timed out, got 502/503/504 or 423, or failed with a network
+error that does not prove the request never reached the origin. It does not apply to failures that prove it
+never got there (connection refused or unreachable, DNS failure, no network, connect timeout, TLS handshake
+failure; on iOS the matching NSURLErrorDomain codes such as -1004 and -1009), or to HEAD/OPTIONS/POST retries. It is a floor applied after the jitter; raising `initialDelayMillis` alone does not
 guarantee it, because full jitter can draw any delay down to 0. When the remaining `maxElapsedMillis` budget is
 shorter than the wait a retry requires, Ktus gives up instead of retrying early; `minDelayMillis` may not exceed
 `maxElapsedMillis`.
@@ -338,10 +344,9 @@ try {
     httpClient.resumeOrCreateAndUploadTus(createUrl = url, file = file, fingerprint = fp, store = store) { auth() }
     markUploaded(file)
 } catch (e: TusUploadOutcomeUnknownException) {
-    val urlGone = e.cause is TusUploadExpiredException || e.cause == null // 404/410, or the entry expired
     when {
-        // Offline or a flaky network: resuming later is safe and costs at most one chunk.
-        !urlGone -> scheduleRetry(file)
+        // Offline, a flaky network or a server error: resuming the same upload later is safe.
+        !e.isUploadGone -> scheduleRetry(file)
         // The upload URL is gone: only the server can say whether the file arrived.
         api.serverHasFile(fileId) -> { store.remove(fp); markUploaded(file) }
         else -> { store.remove(fp); scheduleRetry(file) } // the next call creates a fresh upload

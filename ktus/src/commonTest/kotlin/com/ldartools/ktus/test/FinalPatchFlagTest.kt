@@ -5,6 +5,7 @@ import com.ldartools.ktus.test.ScriptedTusServer.Reply
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.respond
+import io.ktor.client.plugins.onUpload
 import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
@@ -522,7 +523,15 @@ class Adv6DefinitiveRefusalTest {
     @Test
     fun minDelayMillis_doesNotApplyToFastFailures_orToNonPatchRequests() = runTest {
         assertEquals(listOf(1_000L),
-            gapsBetweenPatches(4_000, jitter = false, failures = listOf(Reply.Throw(kotlinx.io.IOException("connection refused"), beforeBody = true))))
+            gapsBetweenPatches(4_000, jitter = false, failures = listOf(Reply.Throw(io.ktor.client.network.sockets.ConnectTimeoutException("connect timed out"), beforeBody = true))))
+        // Darwin: a refused connection (NSURLErrorDomain -1004) also proves nothing reached the origin.
+        assertEquals(listOf(1_000L), gapsBetweenPatches(4_000, jitter = false, failures = listOf(Reply.Throw(
+            kotlinx.io.IOException("Exception in http request: Error Domain=NSURLErrorDomain Code=-1004 \"Could not connect to the server.\""),
+            beforeBody = true))))
+        // Upload progress is no longer the signal: a plain network error after progress still gets the floor (see
+        // the floor test), and one before any progress does too unless it proves nothing was sent.
+        assertEquals(listOf(4_000L), gapsBetweenPatches(4_000, jitter = false, failures = listOf(Reply.Throw(
+            kotlinx.io.IOException("reset"), beforeBody = true))))
         assertEquals(listOf(1_000L), gapsBetweenPatches(4_000, jitter = false, failures = listOf(Reply.Status(500))))
 
         val server = ScriptedTusServer(clock = { currentTime })
@@ -539,8 +548,72 @@ class Adv6DefinitiveRefusalTest {
     fun aMinDelayLongerThanTheBudget_isRejected() {
         val e = assertFailsWith<IllegalArgumentException> { RetryOptions(minDelayMillis = 300_000, maxElapsedMillis = 240_000) }
         assertTrue(e.message!!.contains("minDelayMillis"), e.message)
-        assertFailsWith<IllegalArgumentException> { RetryOptions(initialDelayMillis = 5_000, maxDelayMillis = 1_000) }
         RetryOptions(minDelayMillis = 240_000, maxElapsedMillis = 240_000)
+        for (bad in listOf<() -> Unit>({ RetryOptions(initialDelayMillis = -1) }, { RetryOptions(maxDelayMillis = -1) },
+                { RetryOptions(maxElapsedMillis = -1) }, { RetryOptions(minDelayMillis = -1) }, { RetryOptions(factor = -1.0) },
+                { RetryOptions(factor = Double.NaN) })) {
+            assertFailsWith<IllegalArgumentException> { bad() }
+        }
+    }
+
+    /** L1: values 1.0.3 accepted keep working the same way. */
+    @Test
+    fun retryOptionsThat103Accepted_keepTheirMeaning() = runTest {
+        // initialDelayMillis above maxDelayMillis is capped.
+        val capped = RetryOptions(initialDelayMillis = 5_000, maxDelayMillis = 200)
+        assertEquals(200, delayBoundMillis(capped, 1))
+        // A factor below 1 shrinks the delays.
+        assertEquals(250, delayBoundMillis(RetryOptions(initialDelayMillis = 1_000, factor = 0.5), 3))
+        // maxRetries = 0 (or less) means one attempt.
+        for (maxRetries in listOf(0, -3)) {
+            val server = ScriptedTusServer()
+            repeat(5) { server.script(HttpMethod.Post, Reply.Status(503)) }
+            assertFailsWith<TusHttpException> {
+                server.client().createTusUpload(createUrl, InMemoryTusFile("f", testBytes(10)), options = TusUploadOptions(
+                    checkServerCapabilities = false, retryOptions = RetryOptions(maxRetries = maxRetries,
+                        timeSource = testScheduler.timeSource)))
+            }
+            assertEquals(1, server.count(HttpMethod.Post), "maxRetries = $maxRetries")
+        }
+    }
+
+    /** M1: Darwin NSURLErrorDomain codes that prove the request was never sent. */
+    @Test
+    fun darwinPreSendCodes_areRecognisedFromTheErrorText() {
+        fun darwin(code: Int) = kotlinx.io.IOException("Exception in http request: Error Domain=NSURLErrorDomain Code=$code \"x\"")
+        for (code in listOf(-1003, -1004, -1006, -1009, -1200, -1202)) assertTrue(isPreSendFailure(darwin(code)), "$code")
+        for (code in listOf(-1001, -1005, -1017)) assertFalse(isPreSendFailure(darwin(code)), "$code")
+        assertTrue(isPreSendFailure(RuntimeException("wrapped", darwin(-1004))))
+        assertFalse(isPreSendFailure(kotlinx.io.IOException("connection reset")))
+    }
+
+    /** M2: the helpers tell "check the server" from "call again later". */
+    @Test
+    fun outcomeUnknownHelpers_classifyTheCause() {
+        fun e(cause: Throwable?) = TusUploadOutcomeUnknownException("u", cause)
+        assertTrue(e(null).isUploadGone)
+        assertTrue(e(TusUploadExpiredException()).isUploadGone)
+        assertTrue(e(TusHttpException(404, "PATCH")).isUploadGone)
+        assertTrue(e(TusHttpException(410, "HEAD")).isUploadGone)
+        assertFalse(e(TusHttpException(503, "PATCH")).isUploadGone)
+        assertFalse(e(kotlinx.io.IOException("offline")).isUploadGone)
+
+        assertTrue(e(kotlinx.io.IOException("offline")).isNetworkFailure)
+        assertFalse(e(TusUploadExpiredException()).isNetworkFailure, "a TusProtocolException is an IOException, not a network failure")
+        assertFalse(e(TusHttpException(503, "PATCH")).isNetworkFailure)
+        assertFalse(e(null).isNetworkFailure)
+    }
+
+    /** L2: an onUpload set in the request block does not silence onProgress. */
+    @Test
+    fun anOnUploadInTheBlock_doesNotReplaceKtusProgress() = runTest {
+        val server = ScriptedTusServer().apply { uploadLength = 1000 }
+        val progress = SyncList<Long>()
+        server.client().uploadTus("https://example.com/files/abc", InMemoryTusFile("f", testBytes(1000)),
+            options = opts(), onProgress = { sent, _ -> progress += sent }) {
+            onUpload { _, _ -> }
+        }
+        assertTrue(progress.isNotEmpty() && progress.last() == 1000L, "$progress")
     }
 
     /** L3: an offset mismatch (for example a stale HEAD) keeps the stored entry. */

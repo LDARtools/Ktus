@@ -84,7 +84,28 @@ class TusUploadOutcomeUnknownException(
     "The outcome of the final PATCH to $uploadUrl is unknown; the server may already have the complete file. " +
         "Verify on the server before uploading again.",
     cause,
-)
+) {
+    /**
+     * The upload URL is gone: the server answered 404/410 (typically because it finished and removed the
+     * upload), or the stored entry expired. Only the server can say whether the file arrived; check it.
+     */
+    val isUploadGone: Boolean
+        get() = when (val c = cause) {
+            null -> true
+            is TusUploadExpiredException -> true
+            is TusHttpException -> c.statusCode == 404 || c.statusCode == 410
+            else -> false
+        }
+
+    /**
+     * The last failure was a network error (offline, timeout, connection lost), not an answer from the server.
+     * Calling [resumeOrCreateAndUploadTus] again later is the right response. Note that [TusProtocolException]
+     * (and so [TusHttpException] and [TusUploadExpiredException]) also extends `IOException`; those are not
+     * network failures and are excluded here.
+     */
+    val isNetworkFailure: Boolean
+        get() = cause.let { it is kotlinx.io.IOException && it !is TusProtocolException }
+}
 
 /**
  * The answer came from another origin because the client followed a redirect. The request (and its body) may

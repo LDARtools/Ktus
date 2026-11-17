@@ -57,6 +57,9 @@ class RealSocketTusServer : AutoCloseable {
 
     /** Like tusdotnet: once the upload is complete it is processed and removed, so HEAD/PATCH answer 404. */
     @Volatile var removeWhenComplete = false
+
+    /** Answer `Connection: close` and close after every response, so clients never reuse a connection. */
+    @Volatile var oneRequestPerConnection = false
     @Volatile var removed = false
     val completions = AtomicInteger()
 
@@ -88,7 +91,7 @@ class RealSocketTusServer : AutoCloseable {
             while (!socket.isClosed) {
                 val head = readHead(input) ?: break
                 val keepOpen = handle(head, input, output, socket)
-                if (!keepOpen) break
+                if (!keepOpen || oneRequestPerConnection) break
             }
         } catch (e: Exception) {
             // Client went away.
@@ -235,6 +238,7 @@ class RealSocketTusServer : AutoCloseable {
             append("HTTP/1.1 $status ${reason(status)}\r\n")
             headers.forEach { (k, v) -> append("$k: $v\r\n") }
             if (!isHead && status != 204) append("Content-Length: 0\r\n")
+            if (oneRequestPerConnection) append("Connection: close\r\n")
             append("\r\n")
         }
         output.write(text.toByteArray())
