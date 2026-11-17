@@ -47,6 +47,11 @@ kotlin {
             implementation(libs.kotlinx.coroutines.test)
             implementation(libs.ktor.client.mock)
         }
+        jvmTest.dependencies {
+            // Real-socket fault-injection tests: a raw ServerSocket fake tus server and the CIO engine.
+            implementation(libs.ktor.client.cio)
+        }
+
     }
 }
 
