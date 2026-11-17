@@ -143,14 +143,17 @@ class ProductionHardeningTest {
 
     @Test
     fun onActivity_keepsTicking_duringALongRecovery_whileOnProgressIsSilent() = runTest {
-        val server = ScriptedTusServer(clock = { currentTime }).apply { uploadLength = 1000 }
+        val server = ScriptedTusServer(clock = { currentTime },
+            dispatcher = kotlinx.coroutines.test.StandardTestDispatcher(testScheduler)).apply { uploadLength = 1000 }
         server.script(HttpMethod.Patch, Reply.Throw(IOException("reset")))
         server.script(HttpMethod.Head, Reply.Status(200, mapOf("Upload-Offset" to "0", "Upload-Length" to "1000")))
         repeat(6) { server.script(HttpMethod.Head, Reply.Status(503, mapOf("Retry-After" to "60"))) }
         val activity = mutableListOf<Long>()
         val progress = mutableListOf<Long>()
         server.client().uploadTus(url, InMemoryTusFile("f", testBytes(1000)),
-            options = TusUploadOptions(retryOptions = RetryOptions(jitter = false, timeSource = testScheduler.timeSource)),
+            // Backoff heartbeat only; the in-flight ticker has its own deterministic tests (OutcomeUnknownTest).
+            options = TusUploadOptions(activityHeartbeatMillis = null,
+                retryOptions = RetryOptions(jitter = false, timeSource = testScheduler.timeSource)),
             onProgress = { _, _ -> progress += currentTime },
             onActivity = { activity += currentTime })
         assertEquals(1000, server.offset)

@@ -26,6 +26,12 @@ import kotlinx.io.readByteArray
 class ScriptedTusServer(
     var location: String = "/files/abc",
     private val clock: () -> Long = { 0L },
+    /**
+     * The dispatcher MockEngine runs handlers on. Pass `StandardTestDispatcher(testScheduler)` when a test
+     * uses virtual time together with background work (the onActivity heartbeat): otherwise runTest advances
+     * virtual time while a handler runs on a real thread.
+     */
+    private val dispatcher: kotlinx.coroutines.CoroutineDispatcher? = null,
 ) {
     sealed class Reply(val apply: Boolean) {
         /** Answer with [status] and [headers]. */
@@ -84,7 +90,10 @@ class ScriptedTusServer(
     fun patchSizes(): List<Int> = requests.filter { it.method == "PATCH" }.map { it.bodySize }
     fun times(method: HttpMethod): List<Long> = requests.filter { it.method == method.value }.map { it.timeMillis }
 
-    val engine: MockEngine = MockEngine { request -> handle(request) }
+    val engine: MockEngine = MockEngine(io.ktor.client.engine.mock.MockEngineConfig().apply {
+        this@ScriptedTusServer.dispatcher?.let { dispatcher = it }
+        addHandler { request -> handle(request) }
+    })
 
     fun client(expectSuccess: Boolean = false, followRedirects: Boolean = true): HttpClient =
         HttpClient(engine) {

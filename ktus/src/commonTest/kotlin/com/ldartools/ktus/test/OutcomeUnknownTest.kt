@@ -187,7 +187,9 @@ class OutcomeUnknownTest {
         var calls = 0
         val e = assertFailsWith<CancellationException> {
             server.client().createAndUploadTus(createUrl, InMemoryTusFile("f", testBytes(1000)),
-                options = TusUploadOptions(chunkSize = 1000, retryOptions = retry()),
+                // No in-flight ticker: under virtual time it would race the MockEngine thread. The ticker has
+                // its own deterministic tests below.
+                options = TusUploadOptions(chunkSize = 1000, retryOptions = retry(), activityHeartbeatMillis = null),
                 onActivity = { calls++; if (calls == 2) throw CancellationException("watchdog says stop") })
         }
         assertEquals("watchdog says stop", e.message)
@@ -354,12 +356,12 @@ class OutcomeUnknownTest {
         val errors = listOf<() -> Throwable>({ CancellationException("stop") }, { WatchdogIo() }, { WatchdogBug() })
         for (make in errors) {
             for (throwOnCall in 1..4) {
-                val server = ScriptedTusServer().apply { uploadLength = 100 }
+                val server = ScriptedTusServer(dispatcher = StandardTestDispatcher(testScheduler)).apply { uploadLength = 100 }
                 var calls = 0
                 val expected = make()
                 val thrown = assertFails("${expected::class.simpleName} on call $throwOnCall") {
                     server.client().uploadTus(url, InMemoryTusFile("f", testBytes(100)),
-                        options = TusUploadOptions(retryOptions = retry()),
+                        options = TusUploadOptions(retryOptions = retry(), activityHeartbeatMillis = null),
                         onActivity = { if (++calls == throwOnCall) throw expected })
                 }
                 assertSame(expected, thrown, "call $throwOnCall")
@@ -409,6 +411,21 @@ class OutcomeUnknownTest {
         assertTrue(server.requests.size <= 10_000 / 250 + 2, "${server.requests.size} attempts in 10 s")
     }
 
+    @Test
+    fun uncounted423OnPatch_alsoHasTheMinimumBackoff() = runTest {
+        val server = ScriptedTusServer(clock = { currentTime }).apply { uploadLength = 1000 }
+        repeat(5_000) { server.script(HttpMethod.Patch, Reply.Status(423)) }
+        server.onRequest = { check(server.requests.size < 4_000) { "runaway: ${server.requests.size} requests" } }
+        assertFails {
+            server.client().uploadTus(url, InMemoryTusFile("f", testBytes(1000)), options = TusUploadOptions(
+                chunkSize = 500, // not the final chunk
+                retryOptions = RetryOptions(initialDelayMillis = 0, maxElapsedMillis = 10_000, jitter = false,
+                    timeSource = testScheduler.timeSource)))
+        }
+        val patches = server.count(HttpMethod.Patch)
+        assertTrue(patches <= 10_000 / 250 + 2, "$patches PATCH attempts in 10 s")
+    }
+
     // ---------------------------------------------------------------- F5 in-flight heartbeat
 
     private fun TestScope.slowHeadClient(silenceMillis: Long, server: ScriptedTusServer): HttpClient {
@@ -437,6 +454,21 @@ class OutcomeUnknownTest {
         val count = stamps.size
         advanceTimeBy(60_000)
         assertEquals(count, stamps.size, "the ticker outlived the call")
+    }
+
+    @Test
+    fun anExceptionFromTheInFlightTicker_cancelsTheRequest_andSurfacesAsIs() = runTest {
+        for (make in listOf<() -> Throwable>({ CancellationException("watchdog") }, { WatchdogIo() }, { WatchdogBug() })) {
+            val expected = make()
+            val client = slowHeadClient(30_000, ScriptedTusServer())
+            val start = currentTime
+            val thrown = assertFails {
+                client.uploadTus(url, InMemoryTusFile("f", testBytes(100)),
+                    onActivity = { if (currentTime - start >= 10_000) throw expected })
+            }
+            assertSame(expected, thrown)
+            assertEquals(10_000, currentTime - start, "the request was cancelled when the ticker threw")
+        }
     }
 
     @Test
