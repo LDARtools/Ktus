@@ -38,6 +38,9 @@ data class TusUploadOptions(
     init {
         require(chunkSize > 0) { "chunkSize must be positive" }
         require(minChunkSize > 0) { "minChunkSize must be positive" }
+        require(activityHeartbeatMillis == null || activityHeartbeatMillis > 0) {
+            "activityHeartbeatMillis must be positive, or null to turn the heartbeat off"
+        }
     }
 
     /** Binary-compatibility constructor for callers compiled against Ktus 1.0.x. */

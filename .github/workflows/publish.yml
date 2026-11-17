@@ -49,7 +49,10 @@ jobs:
           done
 
       - name: Run tests
-        run: ./gradlew :ktus:jvmTest :ktus-okio:jvmTest --no-daemon --stacktrace
+        run: >-
+          ./gradlew --no-daemon --stacktrace
+          :ktus:jvmTest :ktus-okio:jvmTest
+          :ktus:iosSimulatorArm64Test :ktus-okio:iosSimulatorArm64Test
 
       - name: Publish to MavenCentral
         run: ./gradlew publishAndReleaseToMavenCentral --no-configuration-cache

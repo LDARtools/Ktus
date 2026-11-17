@@ -55,7 +55,7 @@ class TusHttpException(
  * A problem with the local file rather than the server: it changed size during the upload, or it held fewer
  * bytes than its size while a chunk was read. Uploading the same file again will not help until it is fixed.
  */
-open class TusLocalFileException(message: String) : TusProtocolException(message)
+open class TusLocalFileException(message: String, cause: Throwable? = null) : TusProtocolException(message, cause)
 
 /**
  * Ktus sent the PATCH carrying the last bytes of the file, did not learn whether the server stored them, and

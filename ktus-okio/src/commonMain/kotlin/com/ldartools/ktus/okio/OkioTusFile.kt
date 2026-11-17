@@ -32,7 +32,8 @@ class OkioTusFile(private val path: Path, private val fileSystem: FileSystem) : 
     constructor(path: Path) : this(path, FileSystem.SYSTEM)
 
     override val size: Long
-        get() = fileSystem.metadata(path).size ?: 0L
+        get() = localFile { fileSystem.metadata(path).size }
+            ?: throw TusLocalFileException("Cannot read the size of \"${path.name}\"")
     override val name: String
         get() = path.name
 
@@ -40,7 +41,7 @@ class OkioTusFile(private val path: Path, private val fileSystem: FileSystem) : 
         // Okio file operations block, so read on the IO dispatcher. withContext keeps this in the
         // request's coroutine: cancelling the request cancels the read and closes the file.
         withContext(Dispatchers.IO) {
-            fileSystem.openReadOnly(path).use { handle ->
+            localFile { fileSystem.openReadOnly(path) }.use { handle ->
                 handle.source(offset).buffer().use { source ->
                     copySection(source, offset, length) { buffer, count -> channel.writeFully(buffer, 0, count) }
                 }
@@ -68,6 +69,13 @@ class OkioTusFile(private val path: Path, private val fileSystem: FileSystem) : 
                 }
             }
         }.channel
+    }
+
+    /** A missing, deleted or unreadable file is a [TusLocalFileException]: retrying cannot fix it. */
+    private inline fun <T> localFile(action: () -> T): T = try {
+        action()
+    } catch (e: okio.IOException) {
+        throw TusLocalFileException("Cannot read \"${path.name}\": ${e.message}", e)
     }
 
     override suspend fun fileReadLock(): AutoCloseable {

@@ -261,7 +261,7 @@ class OutcomeUnknownTest {
     // ---------------------------------------------------------------- D2
 
     @Test
-    fun theStoreIsFlaggedBeforeTheFinalPatch_clearedWhenHeadShowsItDidNotLand_andRemovedOnSuccess() = runTest {
+    fun theStoreIsFlaggedBeforeTheFinalPatch_notClearedByHead_andRemovedOnSuccess() = runTest {
         val server = ScriptedTusServer(location = "/files/new").apply { uploadLength = 1000 }
         val store = RecordingStore()
         val flagAtFinalPatch = mutableListOf<Long?>()
@@ -272,7 +272,8 @@ class OutcomeUnknownTest {
         server.client().resumeOrCreateAndUploadTus(createUrl, InMemoryTusFile("f", testBytes(1000)), "fp", store,
             options = TusUploadOptions(chunkSize = 500, retryOptions = retry()), nowMillis = { 42 })
         assertEquals(listOf<Long?>(42, 42), flagAtFinalPatch, "flag persisted before each final PATCH")
-        assertEquals(listOf("set", "set-final", "set", "set-final", "remove"), store.writes)
+        // A HEAD never clears the persisted flag (it may come from a stale instance); only a 204 below the total does.
+        assertEquals(listOf("set", "set-final", "remove"), store.writes)
     }
 
     @Test

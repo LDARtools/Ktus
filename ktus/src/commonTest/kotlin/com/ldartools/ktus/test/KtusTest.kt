@@ -410,7 +410,9 @@ class KtusTest {
         assertFailsWith<TusOffsetMismatchException> {
             client.uploadTus(
                 uploadUrl = "https://example.com/files/uploads/123",
-                file = testFile
+                file = testFile,
+                // Not the final chunk: a bad answer to the final PATCH is TusUploadOutcomeUnknownException.
+                options = TusUploadOptions(chunkSize = 50)
             )
         }
 
@@ -537,7 +539,9 @@ class KtusTest {
         assertFailsWith<TusProtocolException> {
             client.uploadTus(
                 uploadUrl = "https://example.com/files/uploads/123",
-                file = testFile
+                file = testFile,
+                // Not the final chunk: a bad answer to the final PATCH is TusUploadOutcomeUnknownException.
+                options = TusUploadOptions(chunkSize = 50)
             )
         }
 

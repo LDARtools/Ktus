@@ -127,6 +127,13 @@ httpClient.createAndUploadTus(
   `activityHeartbeatMillis = null` it is silent while a single request is in flight, so the watchdog window
   must then exceed the engine's socket/request timeout plus about 10 s. The in-flight ticker runs in a side job
   that is cancelled with the request.
+- Because the in-flight ticker keeps `onActivity` alive, a watchdog fed by it cannot catch a request that never
+  completes. Bound that with the engine's timeouts (Ktor `HttpTimeout`: socket/request timeout): Ktus then
+  gives up, at worst, about `maxElapsedMillis` + one request timeout after the failures start. Size
+  `maxElapsedMillis` to what you can really wait, or put a finite outer limit (`withTimeout`) around the call.
+- Callbacks can run on different threads, possibly at the same time: the in-flight ticker on the caller's
+  dispatcher, and `onProgress`/`onActivity` during the body write on the engine's thread. Make them
+  thread-safe (for example, only write an atomic timestamp).
 - Exceptions thrown by `onProgress`, `onActivity`, `onConfirmed` or the `TusUrlStore` end the upload and reach
   you exactly as thrown (including a `CancellationException`); they are never retried.
 - `onConfirmed` reports offsets the server has acknowledged: after each PATCH answered `204`, after a recovery
@@ -229,9 +236,20 @@ generic "network error, retry later" or "expired, re-create" handler does not sw
 
 With `resumeOrCreateAndUploadTus`, the store entry is marked before the final PATCH is sent (`finalSentAt`). A
 marked entry is never dropped or re-created: a later call that gets 404/410 for it (or finds it expired) throws
-`TusUploadOutcomeUnknownException` again. If the caller's coroutine is cancelled while the final PATCH is in
-flight, the `CancellationException` propagates as coroutines require; the marked entry is how the next call
-knows. Only a HEAD showing `offset < total` clears the mark.
+`TusUploadOutcomeUnknownException` again, and so does any other failure of a marked entry (including a 403):
+it is never dropped or re-created. If the caller's coroutine is cancelled while the final PATCH is in flight,
+the `CancellationException` propagates as coroutines require; the marked entry is how the next call knows.
+A HEAD never clears the mark (it may be answered by a stale server instance); only a PATCH answered `204` with
+an offset below the total does, because that proves the upload still exists and is incomplete. A malformed
+answer to the final PATCH (a `2xx` with a missing or impossible `Upload-Offset`) is an unknown outcome too.
+
+`createAndUploadTus` and `uploadTus` have no store. If you use them, pass `onFinalPatch`: it is called right
+before every attempt to send the PATCH carrying the last bytes, so you can persist "the final chunk may have
+been sent". Cancelling such a call during the final PATCH surfaces as a plain `CancellationException` with no
+other signal, so after any cancellation or failure of a call that may have reached the final chunk, check
+the server's state before uploading again.
+
+A catch-all `catch (e: Exception)` also catches `TusUploadOutcomeUnknownException`: catch it first.
 
 **When you get this exception, check on your server whether the file arrived before uploading it again**, then
 resolve the store entry yourself:

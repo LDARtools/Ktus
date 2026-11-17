@@ -92,7 +92,8 @@ class ResumeApiTest {
 
     @Test
     fun aFailedUpload_keepsTheEntry_forTheNextAttempt() = runTest {
-        val file = InMemoryTusFile("f", testBytes(400))
+        // 600 bytes so the refused PATCH is not the final one (a flagged entry would throw OutcomeUnknown).
+        val file = InMemoryTusFile("f", testBytes(600))
         val server = ScriptedTusServer(location = "/files/new")
         server.script(HttpMethod.Patch, Reply.Status(204, mapOf("Upload-Offset" to "200"), apply = true), Reply.Status(403))
         val store = InMemoryTusUrlStore()
@@ -106,7 +107,7 @@ class ResumeApiTest {
         server.requests.clear()
         server.client().resumeOrCreateAndUploadTus(createUrl, file, "fp", store,
             options = TusUploadOptions(chunkSize = 200), nowMillis = { now })
-        assertEquals(listOf("HEAD", "PATCH"), server.methods())
+        assertEquals(listOf("HEAD", "PATCH", "PATCH"), server.methods())
         assertContentEquals(file.readAll(), server.data)
         assertNull(store.get("fp"))
     }

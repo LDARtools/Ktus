@@ -20,6 +20,9 @@ against 1.1.0.
 - `TusLocalFileException` (a `TusProtocolException`) for problems with the local file (size changed, short read).
 - `TusUploadOptions.activityHeartbeatMillis` (default 5 s; null turns it off): `onActivity` ticks while a
   request is in flight.
+- `onFinalPatch` callback on `uploadTus`, `createAndUploadTus` and `resumeOrCreateAndUploadTus`: called right
+  before every attempt to send the PATCH carrying the last bytes, so callers without a store can persist that
+  the final chunk may have been sent.
 - `createTusUpload(...)`: creates an upload and returns a `TusUpload` (URL, length, `expiresAt` parsed from
   `Upload-Expires`).
 - `TusUrlStore`, `InMemoryTusUrlStore` and `resumeOrCreateAndUploadTus(...)`: resume a stored upload when it is
@@ -113,6 +116,14 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
   marked and never re-creates it. **Callers must check on the server whether the file arrived before uploading
   it again**, then remove the store entry. A 404/410 after an earlier chunk is still
   `TusUploadExpiredException`.
+- **The `finalSentAt` mark is only cleared by a PATCH answered 204 below the total**, never by a HEAD (which can
+  be stale). Any failure of a marked entry, including a permanent 4xx, is `TusUploadOutcomeUnknownException`;
+  a marked entry is never dropped or re-created. A 2xx answer to the final PATCH with a missing or impossible
+  `Upload-Offset` is an unknown outcome too, and so is a client closed while the final PATCH is in flight.
+- **`OkioTusFile` reports a missing or deleted file as `TusLocalFileException`** (not retried); it used to report
+  size 0 or a raw okio `IOException` that was retried.
+- **`activityHeartbeatMillis` must be positive or null**; it also sets the backoff heartbeat interval.
+- **Callbacks may run concurrently on different threads** and must be thread-safe.
 - **The size check stops once the server has every byte**, and an edit that keeps the file's size is never
   detected.
 - **Exceptions thrown by `onProgress`** are rethrown as they are and end the upload; they are never treated as
@@ -125,7 +136,8 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
   environment with required reviewers and move the Maven Central and signing secrets into it; secrets left at
   repository level would bypass the protection.
 - Gradle wrapper validation in every workflow, and `distributionSha256Sum` in `gradle-wrapper.properties`.
-- A macOS CI job compiles the iOS targets.
+- A macOS CI job compiles the iOS targets and runs the iOS simulator tests (including Darwin-engine
+  real-socket tests); the publish job runs the JVM and iOS simulator tests before publishing.
 - Build outputs are no longer committed.
 
 ## 1.0.3
