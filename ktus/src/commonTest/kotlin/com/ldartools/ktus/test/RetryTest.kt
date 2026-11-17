@@ -21,7 +21,7 @@ import kotlin.test.assertTrue
 @OptIn(ExperimentalCoroutinesApi::class)
 class RetryTest {
 
-    private val defaultOptions = RetryOptions(maxRetries = 3, initialDelayMillis = 100, maxDelayMillis = 1000, factor = 2.0)
+    private val defaultOptions = RetryOptions(maxRetries = 3, initialDelayMillis = 100, maxDelayMillis = 1000, factor = 2.0, jitter = false)
 
     @Test
     fun `returns value on first try`() = runTest {

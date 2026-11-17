@@ -720,7 +720,8 @@ class BugFixTest {
             createUrl = "https://example.com/files",
             file = testFile,
             metadata = mapOf("is-confidential" to ""),
-            options = TusUploadOptions(checkServerCapabilities = false)
+            // 1.1 omits empty values by default; this test covers the opt-out.
+            options = TusUploadOptions(checkServerCapabilities = false, omitEmptyMetadataValues = false)
         )
 
         assertNotNull(receivedMetadata, "Upload-Metadata header should be present")
@@ -762,7 +763,8 @@ class BugFixTest {
             createUrl = "https://example.com/files",
             file = testFile,
             metadata = mapOf("filename" to "test.bin", "is-confidential" to ""),
-            options = TusUploadOptions(checkServerCapabilities = false)
+            // 1.1 omits empty values by default; this test covers the opt-out.
+            options = TusUploadOptions(checkServerCapabilities = false, omitEmptyMetadataValues = false)
         )
 
         assertNotNull(receivedMetadata, "Upload-Metadata header should be present")
@@ -876,7 +878,8 @@ class BugFixTest {
         client.createAndUploadTus(
             createUrl = "https://example.com/api/v1/files",
             file = testFile,
-            options = TusUploadOptions(checkServerCapabilities = false),
+            // 1.1: a Location on another host is only accepted when the host is allow-listed.
+            options = TusUploadOptions(checkServerCapabilities = false, allowedUploadHosts = setOf("cdn.example.com")),
             onCreate = { resolvedUrl = it }
         )
 

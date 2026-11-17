@@ -240,7 +240,7 @@ class KtusTest {
         client.createAndUploadTus(
             createUrl = "https://example.com/files",
             file = testFile,
-            options = TusUploadOptions(checkServerCapabilities = true)
+            options = TusUploadOptions(checkServerCapabilities = true, allowEmptyUpload = true)
         )
 
         assertTrue(optionsReceived, "Expected OPTIONS request for capability check")
