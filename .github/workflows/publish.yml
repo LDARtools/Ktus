@@ -3,23 +3,53 @@
 name: Publish
 on:
   release:
-    types: [released, prereleased]
+    # Full releases only. A pre-release is not published to Maven Central.
+    types: [released]
+
+permissions:
+  contents: read
+
 jobs:
   publish:
     name: Release build and publish
-    runs-on: macOS-latest
+    # macOS so the iOS artifacts can be built.
+    runs-on: macos-latest
+    # The Maven Central and signing secrets live in this environment; protect it with required reviewers.
+    environment: maven-central
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: 'zulu'
           java-version: 21
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+
+      - name: Verify the release tag matches the Gradle version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          expected="${RELEASE_TAG#v}"
+          for module in ktus ktus-okio; do
+            actual=$(./gradlew -q --no-configuration-cache ":$module:properties" --property version | awk '/^version:/ {print $2}')
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::Release tag '$RELEASE_TAG' does not match $module version '$actual'"
+              exit 1
+            fi
+            echo "$module version $actual matches the release tag"
+          done
+
+      - name: Run tests
+        run: ./gradlew :ktus:jvmTest :ktus-okio:jvmTest --no-daemon --stacktrace
 
       - name: Publish to MavenCentral
         run: ./gradlew publishAndReleaseToMavenCentral --no-configuration-cache
