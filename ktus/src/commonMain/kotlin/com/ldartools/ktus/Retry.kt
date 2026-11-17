@@ -85,8 +85,15 @@ internal class Backoff(
      * @param attemptsForOperation attempts made so far for the operation that just failed.
      * @param retryAfterMillis the server's `Retry-After`, if any.
      * @param floorMillis the shortest wait allowed, whatever the jitter draws.
+     * @param applyMinDelay apply [RetryOptions.minDelayMillis]: only after a PATCH the origin may still be
+     *   processing.
      */
-    suspend fun awaitRetry(attemptsForOperation: Int, retryAfterMillis: Long?, floorMillis: Long = 0L): Boolean {
+    suspend fun awaitRetry(
+        attemptsForOperation: Int,
+        retryAfterMillis: Long?,
+        floorMillis: Long = 0L,
+        applyMinDelay: Boolean = false,
+    ): Boolean {
         val start = runStart ?: options.timeSource.markNow().also { runStart = it }
         failures++
         if (attemptsForOperation >= options.maxRetries) return false
@@ -95,7 +102,7 @@ internal class Backoff(
 
         // The shortest wait this retry needs: the configured floor, the 423 floor, and the server's Retry-After
         // (capped at max(maxDelayMillis, 60 s)). If the budget cannot cover it, give up rather than retry early.
-        var required = maxOf(floorMillis, options.minDelayMillis)
+        var required = maxOf(floorMillis, if (applyMinDelay) options.minDelayMillis else 0L)
         if (retryAfterMillis != null && options.honorRetryAfter) {
             required = maxOf(required, min(retryAfterMillis, maxOf(options.maxDelayMillis, MAX_RETRY_AFTER_MILLIS)))
         }

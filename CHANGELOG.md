@@ -23,8 +23,10 @@ Two new failure types are not `IOException`s, so a "network error, retry later" 
 - `TusUpload.finalSentAt`: set by `resumeOrCreateAndUploadTus` before the final PATCH; a marked entry is never
   dropped or re-created.
 - `TusLocalFileException` (a `TusProtocolException`) for problems with the local file (size changed, short read).
-- `RetryOptions.minDelayMillis` (default 0): a floor for every retry delay, applied after the jitter and still
-  limited by the remaining budget.
+- `RetryOptions.minDelayMillis` (default 0, at most `maxElapsedMillis`): the shortest wait before retrying a
+  PATCH the origin may still be processing (timeout, 502/503/504, 423, or a connection dropped after body bytes
+  were sent), applied after the jitter. If the remaining budget is shorter than that wait, the call gives up
+  instead of retrying early. It does not apply to fast failures where nothing was sent, or to HEAD/OPTIONS/POST.
 - `TusUploadOptions.activityHeartbeatMillis` (default 5 s; null turns it off): `onActivity` ticks while a
   request is in flight.
 - `onFinalPatch` callback on `uploadTus`, `createAndUploadTus` and `resumeOrCreateAndUploadTus`: called right
@@ -120,8 +122,8 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
   the call becomes `TusUploadOutcomeUnknownException`, including the 404/410 that tusdotnet answers after it
   has completed and removed an upload, exhausted retries and HTTP errors. A plain retry of such an upload
   raised `IOException` or `TusUploadExpiredException` before. `resumeOrCreateAndUploadTus` keeps the entry
-  marked and never re-creates it. **Callers must check on the server whether the file arrived before uploading
-  it again**, then remove the store entry. A 404/410 after an earlier chunk is still
+  marked and never re-creates it; calling it again is safe and resumes the same upload. **Never start a fresh
+  upload of the file without checking the server first**; see "When the outcome is unknown" in the README. A 404/410 after an earlier chunk is still
   `TusUploadExpiredException`.
 - **Once a final PATCH has been sent in a call, it stays unresolved** until the server shows `offset == total` or
   a later PATCH is answered 204 below the total; a HEAD never resolves it. While unresolved, every failure of
@@ -140,6 +142,10 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
   written, so a PATCH that was never sent leaves no mark. If removing the entry fails after the upload
   completed, the call still succeeds.
 - **`TusUrlStore` writes must be durable when they return.**
+- **A HEAD below an offset the server already confirmed is asked again** (up to 3 times, with backoff, within the
+  budget) before the upload fails with `TusOffsetMismatchException`; confirmed bytes are never re-sent.
+- **`RetryOptions` rejects contradictory values**: `minDelayMillis` above `maxElapsedMillis`, and
+  `initialDelayMillis` above `maxDelayMillis`.
 - **`TusOffsetMismatchException` no longer makes `resumeOrCreateAndUploadTus` drop a stored upload** (it can be
   caused by a stale HEAD); the entry is kept.
 - **A short read is reported as `TusLocalFileException`** and is not retried; verified with real sockets on the

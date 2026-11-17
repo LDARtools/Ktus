@@ -80,8 +80,8 @@ What it does:
 - A new upload is saved to the store right after creation, before any data is sent, and removed when the upload
   completes. Network failures, retryable statuses, 409 and problems with the local file leave it in place.
 - Just before the PATCH carrying the last bytes, the entry is marked (`TusUpload.finalSentAt`). A marked entry is
-  never dropped or re-created; see [When the outcome is unknown](#when-the-outcome-is-unknown). Persist the
-  whole `TusUpload`, including that field.
+  never dropped or re-created; calling again simply resumes it. See
+  [When the outcome is unknown](#when-the-outcome-is-unknown). Persist the whole `TusUpload`, including that field.
 
 `InMemoryTusUrlStore` is a ready-made store for tests and for resuming within one process.
 
@@ -260,17 +260,29 @@ marked entry is never dropped or re-created: a later call that gets 404/410 for 
 `TusUploadOutcomeUnknownException` again, and so does any other failure of a marked entry (including a 403):
 it is never dropped or re-created. If the caller's coroutine is cancelled while the final PATCH is in flight,
 the `CancellationException` propagates as coroutines require; the marked entry is how the next call knows.
-A HEAD never clears the mark (it may be answered by a stale server instance); only a PATCH answered `204` with
-an offset below the total does, because that proves the upload still exists and is incomplete, or a definitive
-refusal of the final PATCH (see above). A malformed answer to the final PATCH (a `2xx` with a missing or impossible
+The mark is cleared only when the upload completes, or when a PATCH is answered `204` below the total while no
+final PATCH has ever ended uncertain (an entry carried over from an earlier call keeps its mark until it
+completes), or by a definitive refusal of the final PATCH (see above). A HEAD never clears it (it may be
+answered by a stale server instance). A malformed answer to the final PATCH (a `2xx` with a missing or impossible
 `Upload-Offset`) is an unknown outcome too.
 
-**A marked entry stays in the store until you remove it**, even when a later call gets a definitive answer from
-the server (a 404, 403 or 423 that was not a direct answer to a first, fresh final PATCH): Ktus cannot tell a
-completed-and-removed upload from one that never completed. To resolve it, ask your server whether the file
-arrived (by id, name or checksum); then `store.remove(fingerprint)` and either mark the file uploaded or upload
-it again. If removing the entry fails after an upload completed, the call still succeeds and the entry stays
-marked: the next call reports `TusUploadOutcomeUnknownException`, and the same check resolves it.
+**What to do with `TusUploadOutcomeUnknownException`:**
+1. **By default, just call `resumeOrCreateAndUploadTus` again later.** It is always safe: it sends HEAD to the
+   same upload URL and either finds the upload complete, or sends what is missing (at most the last chunk). It
+   never re-creates a marked entry. If the cause was a network failure (`e.cause is IOException`), that is all
+   there is to do; do not call your server-check API while offline.
+2. **When the cause is a 404/410 or the entry expired** (the upload URL is gone, typically because the server
+   finished and removed it), ask your server whether the file arrived, for example by id or by a hash of the
+   content it stored. Do the same whenever the app wants to confirm.
+3. **Remove the entry (`store.remove(fingerprint)`) only once the server has answered:** it has the file (report
+   success), or it does not and the upload URL is gone (start a fresh upload).
+
+If removing the entry fails after an upload completed, the call still succeeds and the entry stays marked; the
+next call finds the upload complete or gone, and the same steps resolve it.
+
+**If your server can answer 5xx after it stored a body** (for example "stored, but processing failed"), a later
+success (a HEAD showing the full offset) can follow such a 5xx. Verify the stored content on the server after
+every success, not only after failures.
 
 The store must write durably: `set` and `remove` must have reached disk when they return (for example
 `SharedPreferences.commit()` or DataStore, not `apply()`). A mark lost in a crash is a duplicate upload waiting
@@ -291,10 +303,13 @@ Behind a gateway (for example Azure Front Door) with no session affinity, a PATC
 but the next PATCH can reach a different server instance while the first one is still appending. tusdotnet locks
 an upload per process, not across instances, so two instances can write to the same upload at once if they
 share its storage. Check that your server is safe for that (a storage-level lock, affinity, or a single
-writer), or set `RetryOptions.minDelayMillis` above the origin's own request timeout, so every retry waits at
-least that long (it is a floor applied after the jitter; raising `initialDelayMillis` alone does not guarantee
-it, because full jitter can draw any delay down to 0). When the remaining `maxElapsedMillis` budget is shorter
-than that floor (or than an honoured `Retry-After`), Ktus gives up instead of retrying early.
+writer), or set `RetryOptions.minDelayMillis` above the origin's own request timeout. It applies to retries of a
+PATCH the origin may still be processing (one that timed out, got 502/503/504 or 423, or whose connection dropped
+after body bytes were sent), not to fast failures where nothing was sent (connection refused, DNS) and not to
+HEAD/OPTIONS/POST retries. It is a floor applied after the jitter; raising `initialDelayMillis` alone does not
+guarantee it, because full jitter can draw any delay down to 0. When the remaining `maxElapsedMillis` budget is
+shorter than the wait a retry requires, Ktus gives up instead of retrying early; `minDelayMillis` may not exceed
+`maxElapsedMillis`.
 
 ### Things to avoid
 
@@ -316,27 +331,28 @@ than that floor (or than an honoured `Retry-After`), Ktus gives up instead of re
   entry may be treated as expired early, and a new upload created; set a far expiry or omit `Upload-Expires`
   if that matters.
 
-**When you get this exception, check on your server whether the file arrived before uploading it again**, then
-resolve the store entry yourself:
+An example of the steps above:
 
 ```kotlin
 try {
     httpClient.resumeOrCreateAndUploadTus(createUrl = url, file = file, fingerprint = fp, store = store) { auth() }
     markUploaded(file)
 } catch (e: TusUploadOutcomeUnknownException) {
-    // Ask the server whether it has this file (for example by its id or checksum).
-    if (api.serverHasFile(fileId)) {
-        store.remove(fp)
-        markUploaded(file)
-    } else {
-        // The server has nothing usable: start a fresh upload next time.
-        store.remove(fp)
-        scheduleRetry(file)
+    val urlGone = e.cause is TusUploadExpiredException || e.cause == null // 404/410, or the entry expired
+    when {
+        // Offline or a flaky network: resuming later is safe and costs at most one chunk.
+        !urlGone -> scheduleRetry(file)
+        // The upload URL is gone: only the server can say whether the file arrived.
+        api.serverHasFile(fileId) -> { store.remove(fp); markUploaded(file) }
+        else -> { store.remove(fp); scheduleRetry(file) } // the next call creates a fresh upload
     }
 } catch (e: IOException) {
     scheduleRetry(file) // offline, timeouts, retryable statuses: the store entry is kept for the next attempt
 }
 ```
+
+Catch `TusUploadOutcomeUnknownException` before any catch-all `catch (e: Exception)`, and make the
+`serverHasFile` call itself handle being offline (treat a failure there as "try again later").
 
 Backoff uses full jitter: each delay is random in `[0, min(maxDelayMillis, initialDelayMillis * factor^n)]`.
 Retrying stops at whichever comes first:

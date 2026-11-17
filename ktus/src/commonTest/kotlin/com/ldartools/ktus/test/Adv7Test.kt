@@ -30,6 +30,7 @@ class Adv7Test {
                     timeSource = testScheduler.timeSource)))
         }.exceptionOrNull()
         assertIs<TusUploadOutcomeUnknownException>(e)
+        assertEquals(2, server.count(HttpMethod.Patch), "the third PATCH would have been early, so it is not sent")
         val gaps = server.times(HttpMethod.Patch).zipWithNext { a, b -> b - a }
         assertTrue(gaps.all { it >= 1_000 }, "PATCH re-sent sooner than minDelayMillis after a 504: gaps=$gaps")
     }
@@ -50,12 +51,12 @@ class Adv7Test {
     }
 
     /**
-     * The in-call rule "a final PATCH that once ended unknown taints later answers, even after a 204" is not
-     * persisted: a 204 below the total clears the store mark, so the next call treats a 404 as plain expiry and
-     * re-creates, although the first final PATCH may still have completed on another instance.
+     * A final PATCH that once ended unknown stays uncertain across calls, even after a later 204 below the
+     * total: the store mark is kept, so the next call reports OutcomeUnknown on the 404 instead of re-creating
+     * (the first final PATCH may have completed on another instance).
      */
     @Test
-    fun adv7_uncertainFinalPatch_isForgottenAcrossCalls_afterA204BelowTotal() = runTest {
+    fun adv7_uncertainFinalPatch_staysUncertainAcrossCalls_evenAfterA204BelowTotal() = runTest {
         val ghostServer = GhostServer()
         val store = InMemoryTusUrlStore()
         val file = InMemoryTusFile("f", testBytes(1000))

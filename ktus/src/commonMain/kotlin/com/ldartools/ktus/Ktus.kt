@@ -80,8 +80,8 @@ suspend fun HttpClient.createTusUpload(
  * Upload the provided [file] to an existing tus upload at [uploadUrl], resuming wherever the server is.
  *
  * Sends a HEAD first to learn the server's offset, then PATCHes the rest of the file in chunks. Every
- * failure whose outcome is unknown (network error, timeout, 5xx, 408, 423, 429, 409, or any 2xx other
- * than 204) is followed by a backoff and a HEAD, and the upload continues from the offset the server
+ * failure whose outcome is unknown (network error, timeout, 500, 502, 503, 504, 408, 423, 429, 409, or any
+ * 2xx other than 204) is followed by a backoff and a HEAD, and the upload continues from the offset the server
  * reports; a chunk is never blindly re-sent at the old offset. See [RetryOptions] for the limits.
  *
  * The file size is read once at the start. The upload fails if the size changes before it completes,
@@ -228,10 +228,14 @@ suspend fun HttpClient.createAndUploadTus(
  *
  * Before the PATCH carrying the last bytes is sent, the entry is marked ([TusUpload.finalSentAt]). If that
  * PATCH's outcome cannot be established, [TusUploadOutcomeUnknownException] is thrown and the marked entry is
- * kept: later calls keep throwing it (a marked entry is never dropped or re-created) until you have checked
- * the server and removed the entry from [store]. A HEAD never clears the mark; only a later PATCH answered 204
- * below the total does, or a definitive refusal of the final PATCH (a 4xx, a redirect or a short local read, with
- * no earlier final PATCH in the call left without a definitive answer); a 5xx is never definitive.
+ * kept. A marked entry is never dropped or re-created. Calling this function again is safe: it resumes the same
+ * upload URL (HEAD, then the rest) and succeeds when the server is fine; while the URL keeps failing (for
+ * example 404/410 because the server finished and removed it) it keeps throwing
+ * [TusUploadOutcomeUnknownException], and you resolve it by checking the server and removing the entry.
+ * It is cleared only when the upload completes, or when a PATCH is answered 204 below the total while
+ * no final PATCH has ever ended uncertain (in this call or, for an entry carried over from an earlier call, before
+ * it: such an entry keeps its mark until completion), or by a definitive refusal of the final PATCH (a non-retried
+ * 4xx, a 3xx or a short local read; never a 5xx). A HEAD never clears it.
  * If the store cannot remove the entry after the upload completed, the call still succeeds; the entry stays
  * marked and the next call for it reports [TusUploadOutcomeUnknownException]. [store] writes must be durable
  * when they return; see [TusUrlStore].
@@ -688,6 +692,8 @@ private suspend fun HttpClient.uploadInternal(
             val body = TusPatchContent(file, start, length)
             // Written on the engine's thread, read here: a CompletableDeferred is safe across threads.
             val callbackError = CompletableDeferred<Throwable>()
+            // Completed once the engine has taken body bytes for this PATCH.
+            val bodyStarted = CompletableDeferred<Unit>()
             val attemptOutcome = try {
                 attemptTus(TusOp.PATCH, uploadUrl, retry, client = this, onActivity = onActivity, heartbeatMillis = heartbeat) {
                     patch(urlString = uploadUrl) {
@@ -698,6 +704,7 @@ private suspend fun HttpClient.uploadInternal(
 
                         // Progress listener hook (Ktor capability): bytes handed to the engine so far.
                         onUpload { bytesSentTotal, _ ->
+                            if (bytesSentTotal > 0) bodyStarted.complete(Unit)
                             try {
                                 onActivity?.invoke()
                                 onProgress?.invoke(start + bytesSentTotal, total)
@@ -771,15 +778,26 @@ private suspend fun HttpClient.uploadInternal(
                     // 423 Locked (tusdotnet's per-file lock) is bounded by the elapsed budget only.
                     val locked = outcome.statusCode == 423
                     if (locked) patchAttempts--
+                    // The origin may still be processing this PATCH (it timed out, a gateway gave up on it, the
+                    // file is locked, or the connection dropped after body bytes left): wait at least
+                    // minDelayMillis before asking again. Not after fast failures where nothing was sent.
+                    val originMayBeBusy = outcome.timedOut || locked || outcome.statusCode in GATEWAY_STATUSES ||
+                        (outcome.statusCode == null && bodyStarted.isCompleted)
                     if (!backoff.awaitRetry(patchAttempts, outcome.retryAfterMillis,
-                            if (locked) LOCKED_MIN_DELAY_MILLIS else 0L)) {
+                            if (locked) LOCKED_MIN_DELAY_MILLIS else 0L, applyMinDelay = originMayBeBusy)) {
                         throw patchRetriesExhausted(outcome, patchAttempts)
                     }
                     // The PATCH may or may not have been applied: ask the server where it is.
-                    val serverOffset = headOffset(uploadUrl, total, retry, backoff, onActivity, heartbeat, block)
+                    var serverOffset = headOffset(uploadUrl, total, retry, backoff, onActivity, heartbeat, block)
+                    // Below what the server already confirmed: probably a stale instance. Ask again a few times
+                    // (with backoff, within the budget), but never rewind and re-send confirmed bytes.
+                    var staleHeads = 0
+                    while (serverOffset < confirmed && staleHeads < MAX_STALE_HEADS) {
+                        staleHeads++
+                        if (!backoff.awaitRetry(staleHeads, null)) break
+                        serverOffset = headOffset(uploadUrl, total, retry, backoff, onActivity, heartbeat, block)
+                    }
                     if (serverOffset < confirmed) {
-                        // The server already confirmed more than this. Rewinding would re-send data it said it
-                        // stored (and a flapping offset would loop forever), so stop.
                         throw TusOffsetMismatchException(
                             "HEAD reported Upload-Offset $serverOffset, below the offset $confirmed the server already confirmed")
                     }
@@ -811,6 +829,12 @@ private suspend fun HttpClient.uploadInternal(
         throw e
     }
 }
+
+/** Statuses a gateway answers while the origin may still be working on the request. */
+private val GATEWAY_STATUSES = setOf(502, 503, 504)
+
+/** How many times a HEAD below the confirmed offset is asked again before the upload fails. */
+private const val MAX_STALE_HEADS = 3
 
 /** A refusal of a PATCH that proves its bytes did not (all) land: a 4xx, a redirect, or a short local read. */
 private fun isDefinitiveRefusal(error: Throwable): Boolean = when (error) {

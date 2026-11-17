@@ -23,8 +23,9 @@ import kotlin.time.TimeSource
  * @param maxRetries maximum attempts per operation, including the first one (default 10).
  * @param initialDelayMillis upper bound of the first backoff delay in milliseconds (default 500).
  * @param maxDelayMillis upper bound of any single computed backoff delay in milliseconds (default 30000).
- *   A server `Retry-After` may ask for longer; one wait is capped at max([maxDelayMillis], 60 s) and never
- *   goes beyond the remaining [maxElapsedMillis].
+ *   A server `Retry-After` may ask for longer; one wait is capped at max([maxDelayMillis], 60 s). If the
+ *   remaining [maxElapsedMillis] is shorter than the wait a retry requires (an honoured `Retry-After`,
+ *   [minDelayMillis], the 423 floor), the call gives up with the last failure instead of retrying early.
  * @param factor multiplier applied to the delay bound after each failure (default 2.0).
  * @param maxElapsedMillis total time budget for a run of consecutive failures (default 10 minutes).
  * @param retryableStatusCodes HTTP statuses that are retried (default 408, 423, 429, 500, 502, 503, 504).
@@ -32,9 +33,13 @@ import kotlin.time.TimeSource
  * @param honorRetryAfter wait at least as long as a `Retry-After` header asks (default true).
  * @param jitter randomise each delay within its bound (default true). Turn off only for deterministic tests.
  * @param random random source for the jitter. Replace only in tests.
- * @param minDelayMillis the shortest wait before any retry, applied after the jitter (default 0). Still limited
- *   by the remaining [maxElapsedMillis]. Use it to make retries after a gateway timeout wait longer than the
- *   origin's own request timeout; with full jitter, raising [initialDelayMillis] alone does not guarantee that.
+ * @param minDelayMillis the shortest wait before retrying a PATCH the origin may still be processing: one that
+ *   timed out, was answered 502/503/504 or 423, or whose connection dropped after body bytes were sent
+ *   (default 0). It is applied after the jitter. It does not apply to fast failures where nothing was sent
+ *   (connection refused, DNS) or to HEAD, OPTIONS, POST and DELETE retries. If the remaining
+ *   [maxElapsedMillis] is shorter, the call gives up rather than retrying early; it must not exceed
+ *   [maxElapsedMillis]. Use it to make a retry after a gateway timeout wait longer than the origin's own
+ *   request timeout; with full jitter, raising [initialDelayMillis] alone does not guarantee that.
  * @param timeSource monotonic clock for [maxElapsedMillis]. Replace only in tests (for example with
  *   `TestCoroutineScheduler.timeSource`).
  */
@@ -59,6 +64,12 @@ data class RetryOptions(
         require(factor >= 1.0) { "factor must be at least 1.0" }
         require(maxElapsedMillis >= 0) { "maxElapsedMillis must not be negative" }
         require(minDelayMillis >= 0) { "minDelayMillis must not be negative" }
+        require(minDelayMillis <= maxElapsedMillis) {
+            "minDelayMillis ($minDelayMillis) must not exceed maxElapsedMillis ($maxElapsedMillis): no retry could ever be sent"
+        }
+        require(initialDelayMillis <= maxDelayMillis || maxDelayMillis == 0L) {
+            "initialDelayMillis ($initialDelayMillis) must not exceed maxDelayMillis ($maxDelayMillis)"
+        }
     }
 
     /** Binary-compatibility constructor for callers compiled against Ktus 1.0.x. */

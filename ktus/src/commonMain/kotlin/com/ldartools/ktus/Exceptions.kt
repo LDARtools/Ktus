@@ -65,13 +65,15 @@ open class TusLocalFileException(message: String, cause: Throwable? = null) : Tu
  * Thrown instead of any other failure (including [TusUploadExpiredException], exhausted retries and HTTP
  * errors) once that is the case; the original failure is the [cause].
  *
- * **Check on your server whether the file arrived before uploading it again.** Uploading again blindly can
- * make the server receive and process the file twice.
+ * **Never start a fresh upload of the same file blindly after it**: that can make the server receive and
+ * process the file twice. With [resumeOrCreateAndUploadTus], calling it again later is always safe: it sends
+ * HEAD to the same upload URL, resumes or confirms completion, and succeeds if the server is fine; it never
+ * re-creates a marked entry. When the cause is a 404/410 or an expired entry (the upload URL is gone), check on
+ * your server whether the file arrived, then remove the store entry. See the README section "When the outcome
+ * is unknown".
  *
  * It deliberately does not extend [IOException][kotlinx.io.IOException] or [TusProtocolException], so a
  * generic "network error, retry later" or "expired, re-create" handler does not swallow it.
- * [resumeOrCreateAndUploadTus] never re-creates an upload after it, and keeps the stored entry (marked as
- * outcome-unknown) so later calls keep throwing it until you resolve the entry and remove it from the store.
  *
  * @property uploadUrl the upload whose outcome is unknown.
  */

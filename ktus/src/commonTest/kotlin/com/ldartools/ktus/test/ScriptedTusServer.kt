@@ -43,7 +43,7 @@ class ScriptedTusServer(
         ) : Reply(apply)
 
         /** Throw [error] from the engine, like a dropped connection. */
-        class Throw(val error: Throwable, apply: Boolean = false) : Reply(apply)
+        class Throw(val error: Throwable, apply: Boolean = false, val beforeBody: Boolean = false) : Reply(apply)
 
         /** Fully custom answer. */
         class Custom(
@@ -103,6 +103,13 @@ class ScriptedTusServer(
 
     private suspend fun MockRequestHandleScope.handle(request: HttpRequestData): HttpResponseData {
         onRequest(request)
+        val reply = scripts[request.method.value]?.removeFirstOrNull()
+        // A connection refused before anything was sent: fail without touching the body.
+        if (reply is Reply.Throw && reply.beforeBody) {
+            requests += Recorded(request.method.value, request.url.toString(), request.headers["Upload-Offset"]?.toLongOrNull(),
+                0, clock(), request.headers.entries().associate { it.key to it.value.joinToString(",") })
+            throw reply.error
+        }
         val body = if (request.method == HttpMethod.Patch) readBody(request) else ByteArray(0)
         requests += Recorded(
             method = request.method.value,
@@ -116,7 +123,6 @@ class ScriptedTusServer(
         if ((request.method == HttpMethod.Head || request.method == HttpMethod.Patch) && clock() < lockedUntil) {
             return respond("locked", HttpStatusCode.Locked)
         }
-        val reply = scripts[request.method.value]?.removeFirstOrNull()
         if (reply != null) {
             if (reply.apply && request.method == HttpMethod.Patch) applyPatch(request, body)
             return when (reply) {

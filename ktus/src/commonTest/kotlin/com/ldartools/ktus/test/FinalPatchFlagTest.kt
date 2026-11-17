@@ -493,39 +493,54 @@ class Adv6DefinitiveRefusalTest {
     }
 
     /** L2: minDelayMillis is a floor after jitter. */
-    @Test
-    fun minDelayMillis_isAFloorAfterJitter() = runTest {
-        val server = ScriptedTusServer(clock = { currentTime })
-        repeat(5) { server.script(HttpMethod.Post, Reply.Status(503)) }
-        server.client().createTusUpload(createUrl, InMemoryTusFile("f", testBytes(10)),
-            options = TusUploadOptions(checkServerCapabilities = false, retryOptions = RetryOptions(
-                initialDelayMillis = 1_000, maxDelayMillis = 10_000, minDelayMillis = 4_000,
+    private suspend fun TestScope.gapsBetweenPatches(minDelay: Long, jitter: Boolean, failures: List<Reply>): List<Long> {
+        val server = ScriptedTusServer(clock = { currentTime }).apply { uploadLength = 200 }
+        server.script(HttpMethod.Patch, *failures.toTypedArray())
+        server.client().uploadTus("https://example.com/files/abc", InMemoryTusFile("f", testBytes(200)),
+            options = TusUploadOptions(chunkSize = 100, activityHeartbeatMillis = null, retryOptions = RetryOptions(
+                initialDelayMillis = 1_000, maxDelayMillis = 10_000, minDelayMillis = minDelay, jitter = jitter,
                 random = kotlin.random.Random(3), timeSource = testScheduler.timeSource)))
-        val gaps = server.times(HttpMethod.Post).zipWithNext { a, b -> b - a }
-        assertEquals(5, gaps.size)
-        assertTrue(gaps.all { it >= 4_000 }, "$gaps")
+        return server.times(HttpMethod.Patch).zipWithNext { a, b -> b - a }.take(failures.size)
+    }
 
+    /** M3: after a PATCH the origin may still be processing (503 here), every retry waits at least minDelayMillis. */
+    @Test
+    fun minDelayMillis_isAFloorAfterJitter_forPatchesTheOriginMayStillBeProcessing() = runTest {
+        val jittered = gapsBetweenPatches(4_000, jitter = true, failures = List(5) { Reply.Status(503) })
+        assertTrue(jittered.size == 5 && jittered.all { it >= 4_000 }, "$jittered")
         // Without jitter the floor only lifts the short early delays.
-        val plain = ScriptedTusServer(clock = { currentTime })
-        repeat(5) { plain.script(HttpMethod.Post, Reply.Status(503)) }
-        plain.client().createTusUpload(createUrl, InMemoryTusFile("f", testBytes(10)),
+        assertEquals(listOf(4_000L, 4_000L, 4_000L, 8_000L, 10_000L),
+            gapsBetweenPatches(4_000, jitter = false, failures = List(5) { Reply.Status(503) }))
+        // Also after a timeout, 423, or a connection lost after body bytes were sent.
+        for (failure in listOf<Reply>(Reply.Status(504), Reply.Status(502), Reply.Status(423),
+                Reply.Throw(kotlinx.io.IOException("reset after the body")))) {
+            assertEquals(listOf(4_000L), gapsBetweenPatches(4_000, jitter = false, failures = listOf(failure)), "$failure")
+        }
+    }
+
+    /** M3: not after a fast failure where nothing was sent, nor for HEAD/OPTIONS/POST retries. */
+    @Test
+    fun minDelayMillis_doesNotApplyToFastFailures_orToNonPatchRequests() = runTest {
+        assertEquals(listOf(1_000L),
+            gapsBetweenPatches(4_000, jitter = false, failures = listOf(Reply.Throw(kotlinx.io.IOException("connection refused"), beforeBody = true))))
+        assertEquals(listOf(1_000L), gapsBetweenPatches(4_000, jitter = false, failures = listOf(Reply.Status(500))))
+
+        val server = ScriptedTusServer(clock = { currentTime })
+        repeat(2) { server.script(HttpMethod.Post, Reply.Status(503)) }
+        server.client().createTusUpload(createUrl, InMemoryTusFile("f", testBytes(10)),
             options = TusUploadOptions(checkServerCapabilities = false, retryOptions = RetryOptions(
                 initialDelayMillis = 1_000, maxDelayMillis = 10_000, minDelayMillis = 4_000, jitter = false,
                 timeSource = testScheduler.timeSource)))
-        assertEquals(listOf(4_000L, 4_000L, 4_000L, 8_000L, 10_000L), plain.times(HttpMethod.Post).zipWithNext { a, b -> b - a })
+        assertEquals(listOf(1_000L, 2_000L), server.times(HttpMethod.Post).zipWithNext { a, b -> b - a })
     }
 
+    /** L-c: contradictory retry options are rejected. */
     @Test
-    fun minDelayMillis_largerThanTheRemainingBudget_givesUpInsteadOfRetryingEarly() = runTest {
-        val server = ScriptedTusServer(clock = { currentTime })
-        repeat(5) { server.script(HttpMethod.Post, Reply.Status(503)) }
-        assertFailsWith<TusHttpException> {
-            server.client().createTusUpload(createUrl, InMemoryTusFile("f", testBytes(10)),
-                options = TusUploadOptions(checkServerCapabilities = false, retryOptions = RetryOptions(
-                    minDelayMillis = 60_000, maxElapsedMillis = 5_000, timeSource = testScheduler.timeSource)))
-        }
-        assertEquals(0, currentTime, "no early retry: gives up at once")
-        assertEquals(1, server.count(HttpMethod.Post))
+    fun aMinDelayLongerThanTheBudget_isRejected() {
+        val e = assertFailsWith<IllegalArgumentException> { RetryOptions(minDelayMillis = 300_000, maxElapsedMillis = 240_000) }
+        assertTrue(e.message!!.contains("minDelayMillis"), e.message)
+        assertFailsWith<IllegalArgumentException> { RetryOptions(initialDelayMillis = 5_000, maxDelayMillis = 1_000) }
+        RetryOptions(minDelayMillis = 240_000, maxElapsedMillis = 240_000)
     }
 
     /** L3: an offset mismatch (for example a stale HEAD) keeps the stored entry. */
@@ -533,8 +548,8 @@ class Adv6DefinitiveRefusalTest {
     fun anOffsetMismatchOnAStoredUpload_keepsTheEntry() = runTest {
         val server = ScriptedTusServer().apply { uploadLength = 1000 }
         server.script(HttpMethod.Patch, Reply.Status(204, mapOf("Upload-Offset" to "300"), apply = true), Reply.Status(503))
-        server.script(HttpMethod.Head, Reply.Status(200, mapOf("Upload-Offset" to "0", "Upload-Length" to "1000")),
-            Reply.Status(200, mapOf("Upload-Offset" to "100", "Upload-Length" to "1000")))
+        server.script(HttpMethod.Head, Reply.Status(200, mapOf("Upload-Offset" to "0", "Upload-Length" to "1000")))
+        repeat(4) { server.script(HttpMethod.Head, Reply.Status(200, mapOf("Upload-Offset" to "100", "Upload-Length" to "1000"))) }
         val store = InMemoryTusUrlStore().apply { set("fp", TusUpload("https://example.com/files/old", 1000, null)) }
         assertFailsWith<TusOffsetMismatchException> {
             server.client().resumeOrCreateAndUploadTus(createUrl, InMemoryTusFile("f", testBytes(1000)), "fp", store,

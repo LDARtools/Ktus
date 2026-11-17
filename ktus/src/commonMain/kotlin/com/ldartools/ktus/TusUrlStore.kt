@@ -11,11 +11,11 @@ import kotlinx.coroutines.sync.withLock
  * @property expiresAt when the server will discard an unfinished upload, in epoch milliseconds, from the
  *   `Upload-Expires` header of the creation response; null when the server did not say.
  * @property finalSentAt set (epoch milliseconds) by [resumeOrCreateAndUploadTus] just before it sends the PATCH
- *   carrying the last bytes. It is cleared only when a later PATCH is answered 204 with an offset below the
- *   total (which proves the upload still exists and is incomplete), or when the final PATCH gets a definitive
- *   refusal (a 4xx, a redirect or a short local read, with no earlier final PATCH left unknown; never a 5xx). A HEAD never clears it: it may be answered by a stale server instance. While it is
- *   set the upload's outcome may be unknown: Ktus never re-creates the upload, and any failure (a 404/410
- *   included) throws [TusUploadOutcomeUnknownException]. Persist it with the rest of the entry.
+ *   carrying the last bytes. It is cleared only when the upload completes, or when a PATCH is answered 204 below the total while
+ *   no final PATCH has ever ended uncertain (in this call or, for an entry carried over from an earlier call, before
+ *   it: such an entry keeps its mark until completion), or by a definitive refusal of the final PATCH (a non-retried
+ *   4xx, a 3xx or a short local read; never a 5xx). A HEAD never clears it. While it is set the upload's outcome may be unknown: Ktus never re-creates the upload, and any
+ *   failure (a 404/410 included) throws [TusUploadOutcomeUnknownException]. Persist it with the rest of the entry.
  */
 data class TusUpload(
     val uploadUrl: String,
