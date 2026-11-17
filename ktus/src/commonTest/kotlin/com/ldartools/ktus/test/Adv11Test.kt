@@ -156,4 +156,40 @@ class Adv11Test {
         val gaveUpAfter = sched.currentTime - firstFailure
         assertTrue(gaveUpAfter <= 600_000 + 300_000 + 10_000, "budget + one request: gave up after $gaveUpAfter ms")
     }
+
+    private suspend fun kotlinx.coroutines.test.TestScope.gaveUpAfter(headSlowFrom: Long, patchSlowFrom: Long): Long {
+        val sched = testScheduler
+        val server = ScriptedTusServer(clock = { sched.currentTime },
+            dispatcher = kotlinx.coroutines.test.StandardTestDispatcher(sched)).apply { uploadLength = 10 }
+        server.script(HttpMethod.Head, ok(0, 10))
+        repeat(20_000) {
+            server.script(HttpMethod.Patch, Reply.Custom { _, _ ->
+                if (sched.currentTime >= patchSlowFrom) delay(300_000)
+                throw kotlinx.io.IOException("fails") })
+            server.script(HttpMethod.Head, Reply.Custom { _, _ ->
+                if (sched.currentTime >= headSlowFrom) delay(300_000)
+                respond("", HttpStatusCode.OK, headersOf("Upload-Offset" to listOf("0"), "Upload-Length" to listOf("10"))) })
+        }
+        val start = sched.currentTime
+        runCatching {
+            server.client().uploadTus(url, InMemoryTusFile("f", testBytes(10)), options = TusUploadOptions(
+                activityHeartbeatMillis = null, retryOptions = RetryOptions(maxRetries = 100_000, initialDelayMillis = 100,
+                    maxDelayMillis = 100, jitter = false, timeSource = sched.timeSource)))
+        }
+        return sched.currentTime - start
+    }
+
+    /** L2: the backoff wait ends exactly at the end of the budget: the recovery HEAD is not sent. */
+    @Test
+    fun noHeadIsSentOnceTheWaitUsedUpTheBudget() = runTest {
+        val t = gaveUpAfter(headSlowFrom = 600_000, patchSlowFrom = 600_000)
+        assertTrue(t <= 601_000, "gave up after $t ms; a HEAD after the budget would add 300 s")
+    }
+
+    /** L2: a recovery HEAD that runs past the end of the budget is not followed by another PATCH. */
+    @Test
+    fun noPatchIsSentAfterAHeadThatOutlivedTheBudget() = runTest {
+        val t = gaveUpAfter(headSlowFrom = 599_900, patchSlowFrom = 600_000)
+        assertTrue(t <= 600_000 + 300_000 + 1_000, "gave up after $t ms; a PATCH after the budget would add 300 s")
+    }
 }
