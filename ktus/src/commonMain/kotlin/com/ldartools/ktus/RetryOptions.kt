@@ -40,8 +40,8 @@ import kotlin.time.TimeSource
  *   network error that does not prove the request never reached the origin. It does not apply to failures
  *   that prove that: connection refused or unreachable, DNS failure, no network, connect timeout, TLS
  *   handshake failure (java.net `ConnectException`, `UnknownHostException`, `NoRouteToHostException`,
- *   `SSLHandshakeException`, Ktor's `ConnectTimeoutException`, and NSURLErrorDomain -1003, -1004, -1006, -1009,
- *   -1018 to -1022, -1200 to -1206 on Darwin). Nor does it apply to HEAD, OPTIONS, POST and DELETE retries.
+ *   `SSLHandshakeException`, Ktor's `ConnectTimeoutException`, and on Darwin the NSURLErrorDomain codes -1003,
+ *   -1004, -1006, -1022 and -1201 to -1206). Nor does it apply to HEAD, OPTIONS, POST and DELETE retries.
  *   It is applied after the jitter. If the remaining
  *   [maxElapsedMillis] is shorter, the call gives up rather than retrying early; it must not exceed
  *   [maxElapsedMillis]. Use it to make a retry after a gateway timeout wait longer than the origin's own

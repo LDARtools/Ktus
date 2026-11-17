@@ -28,10 +28,10 @@ Two new failure types are not `IOException`s, so a "network error, retry later" 
   that does not prove the request never reached the origin), applied after the jitter. If the remaining budget
   is shorter than that wait, the call gives up instead of retrying early. It does not apply to failures that
   prove nothing reached the origin (connection refused or unreachable, DNS failure, no network, connect
-  timeout, TLS handshake failure, and the matching NSURLErrorDomain codes on iOS), or to HEAD/OPTIONS/POST.
+  timeout, TLS handshake failure, and NSURLErrorDomain -1003, -1004, -1006, -1022 and -1201 to -1206 on iOS), or to HEAD/OPTIONS/POST.
   The decision comes from the failure, not from upload progress, which some engines report before connecting.
-- `TusUploadOutcomeUnknownException.isUploadGone` and `.isNetworkFailure`, to decide between "check the server"
-  and "call again later" without hand-rolled cause checks.
+- `TusUploadOutcomeUnknownException.isUploadGone`, `.isServerRefusal` and `.isNetworkFailure`, to decide between
+  "check the server" and "call again later" without hand-rolled cause checks.
 - `TusUploadOptions.activityHeartbeatMillis` (default 5 s; null turns it off): `onActivity` ticks while a
   request is in flight.
 - `onFinalPatch` callback on `uploadTus`, `createAndUploadTus` and `resumeOrCreateAndUploadTus`: called right
@@ -153,7 +153,8 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
   - negative `initialDelayMillis`, `maxDelayMillis`, `maxElapsedMillis` or `minDelayMillis`, a negative or NaN
     `factor`, and `minDelayMillis` above `maxElapsedMillis` now throw `IllegalArgumentException`;
   - `maxRetries` of 0 or less still means a single attempt, as in 1.0.3;
-  - `initialDelayMillis` above `maxDelayMillis` is accepted and capped at `maxDelayMillis`, as in 1.0.3;
+  - `initialDelayMillis` above `maxDelayMillis` is accepted, and is now capped at `maxDelayMillis` (1.0.3 used it
+    uncapped for the first wait);
   - a `factor` between 0 and 1 is accepted (delays shrink), as in 1.0.3.
 - **Ktus installs its upload-progress listener after the request block.** Ktor keeps one `onUpload` listener per
   request, so an `onUpload` set in the block is replaced; use `onProgress`.

@@ -33,16 +33,16 @@ internal expect fun isPlatformPreSendFailure(error: Throwable): Boolean
  * `Error Domain=NSURLErrorDomain Code=-1004 "Could not connect to the server."`. Matching the text avoids a
  * dependency on the Darwin engine.
  */
+// Only codes that cannot happen after request bytes were sent. Deliberately left out (they then count as "the
+// origin may still be processing", the conservative side): -1009 NotConnectedToInternet (Apple: "probably"
+// did not leave the device, not reliably), -1018/-1019/-1020 (path conditions that can appear mid-request) and
+// -1200 SecureConnectionFailed (can come from a TLS abort mid-connection).
 private val DARWIN_PRE_SEND_CODES = setOf(
     -1003, // NSURLErrorCannotFindHost
     -1004, // NSURLErrorCannotConnectToHost
     -1006, // NSURLErrorDNSLookupFailed
-    -1009, // NSURLErrorNotConnectedToInternet
-    -1018, // NSURLErrorInternationalRoamingOff
-    -1019, // NSURLErrorCallIsActive
-    -1020, // NSURLErrorDataNotAllowed
     -1022, // NSURLErrorAppTransportSecurityRequiresSecureConnection
-    -1200, // NSURLErrorSecureConnectionFailed
+    // Certificate validation failures happen during the TLS handshake, before the request is sent.
     -1201, // NSURLErrorServerCertificateHasBadDate
     -1202, // NSURLErrorServerCertificateUntrusted
     -1203, // NSURLErrorServerCertificateHasUnknownRoot

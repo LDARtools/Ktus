@@ -270,10 +270,16 @@ answered by a stale server instance). A malformed answer to the final PATCH (a `
 `Upload-Offset`) is an unknown outcome too.
 
 **What to do with `TusUploadOutcomeUnknownException`:**
-1. **If the upload URL is gone** (`e.isUploadGone`: the cause is a 404/410, a `TusUploadExpiredException`, or the
-   entry expired), typically because the server finished and removed the upload, ask your server whether the file
-   arrived, for example by id or by a hash of the content it stored. Check this first: `TusHttpException` and
-   `TusUploadExpiredException` are `IOException`s too, so do not test `e.cause is IOException` for it.
+1. **If the upload URL is gone** (`e.isUploadGone`: the cause is a 404/410 or a `TusUploadExpiredException`, or
+   there is no cause because the marked entry could not be resumed at all: it expired, its length no longer
+   matches the file, or its host is no longer allowed), typically because the server finished and removed the
+   upload, ask your server whether the file arrived, for example by id or by a hash of the content it stored.
+   Check this first: `TusHttpException` and `TusUploadExpiredException` are `IOException`s too, so do not test
+   `e.cause is IOException` for it.
+   **The same applies when the server keeps refusing the upload** (`e.isServerRefusal`: a non-retried 4xx such as
+   403 or 400, a `TusUploadLengthMismatchException`, a persistent `TusOffsetMismatchException`): check the server,
+   then remove the entry. Retrying these will not help, and the entry would otherwise keep failing until it
+   expires.
 2. **Otherwise, just call `resumeOrCreateAndUploadTus` again later.** It is safe: it sends HEAD to the same
    upload URL, finds the upload complete or sends what the server is missing (a server that disagrees about
    the offset answers 409, which protects the data), and never re-creates a marked entry. If the cause was a
@@ -312,7 +318,9 @@ writer), or set `RetryOptions.minDelayMillis` above the origin's own request tim
 PATCH the origin may still be processing: one that timed out, got 502/503/504 or 423, or failed with a network
 error that does not prove the request never reached the origin. It does not apply to failures that prove it
 never got there (connection refused or unreachable, DNS failure, no network, connect timeout, TLS handshake
-failure; on iOS the matching NSURLErrorDomain codes such as -1004 and -1009), or to HEAD/OPTIONS/POST retries. It is a floor applied after the jitter; raising `initialDelayMillis` alone does not
+failure; on iOS NSURLErrorDomain -1003, -1004, -1006, -1022 and -1201 to -1206), or to HEAD/OPTIONS/POST
+retries. Other iOS errors, such as -1009 "not connected to the internet", get the floor, because they can occur
+after bytes were sent. It is a floor applied after the jitter; raising `initialDelayMillis` alone does not
 guarantee it, because full jitter can draw any delay down to 0. When the remaining `maxElapsedMillis` budget is
 shorter than the wait a retry requires, Ktus gives up instead of retrying early; `minDelayMillis` may not exceed
 `maxElapsedMillis`.
@@ -345,9 +353,10 @@ try {
     markUploaded(file)
 } catch (e: TusUploadOutcomeUnknownException) {
     when {
-        // Offline, a flaky network or a server error: resuming the same upload later is safe.
-        !e.isUploadGone -> scheduleRetry(file)
-        // The upload URL is gone: only the server can say whether the file arrived.
+        // Offline, a flaky network or a transient server error: resuming the same upload later is safe.
+        !e.isUploadGone && !e.isServerRefusal -> scheduleRetry(file)
+        // The upload URL is gone, or the server keeps refusing it: only the server can say whether the file
+        // arrived.
         api.serverHasFile(fileId) -> { store.remove(fp); markUploaded(file) }
         else -> { store.remove(fp); scheduleRetry(file) } // the next call creates a fresh upload
     }
@@ -358,6 +367,11 @@ try {
 
 Catch `TusUploadOutcomeUnknownException` before any catch-all `catch (e: Exception)`, and make the
 `serverHasFile` call itself handle being offline (treat a failure there as "try again later").
+
+**Your own callback exceptions are not wrapped.** If `onProgress`, `onActivity` or `onConfirmed` throws during or
+after the final PATCH (with `createAndUploadTus`, `uploadTus` or `resumeOrCreateAndUploadTus`), the call ends with
+that exception exactly as thrown, not `TusUploadOutcomeUnknownException`, even though the final PATCH may have
+landed. Treat it like a cancellation after `onFinalPatch`: check the server before uploading again.
 
 Backoff uses full jitter: each delay is random in `[0, min(maxDelayMillis, initialDelayMillis * factor^n)]`.
 Retrying stops at whichever comes first:

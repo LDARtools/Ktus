@@ -86,8 +86,10 @@ class TusUploadOutcomeUnknownException(
     cause,
 ) {
     /**
-     * The upload URL is gone: the server answered 404/410 (typically because it finished and removed the
-     * upload), or the stored entry expired. Only the server can say whether the file arrived; check it.
+     * The upload URL is gone or cannot be used: the server answered 404/410 (typically because it finished and
+     * removed the upload), or there is no cause because a marked stored entry could not be resumed at all (it
+     * expired, its length no longer matches the file, or its URL is on a host that is no longer allowed). Only
+     * the server can say whether the file arrived; check it.
      */
     val isUploadGone: Boolean
         get() = when (val c = cause) {
@@ -105,6 +107,23 @@ class TusUploadOutcomeUnknownException(
      */
     val isNetworkFailure: Boolean
         get() = cause.let { it is kotlinx.io.IOException && it !is TusProtocolException }
+
+    /**
+     * The server keeps refusing this upload in a way retrying will not fix: a 4xx that Ktus does not retry
+     * (other than 404/410, see [isUploadGone]), a different `Upload-Length`
+     * ([TusUploadLengthMismatchException]), or an impossible offset ([TusOffsetMismatchException]). Check the
+     * server, then remove the stored entry; do not keep retrying until it expires.
+     */
+    val isServerRefusal: Boolean
+        get() = when (val c = cause) {
+            is TusHttpException -> c.statusCode in 400..499 && c.statusCode !in RETRIED_OR_GONE_4XX
+            is TusUploadLengthMismatchException, is TusOffsetMismatchException -> true
+            else -> false
+        }
+
+    private companion object {
+        val RETRIED_OR_GONE_4XX = setOf(401, 404, 408, 409, 410, 423, 429)
+    }
 }
 
 /**

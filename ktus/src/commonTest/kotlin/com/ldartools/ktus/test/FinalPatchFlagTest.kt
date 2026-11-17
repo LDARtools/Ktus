@@ -581,8 +581,9 @@ class Adv6DefinitiveRefusalTest {
     @Test
     fun darwinPreSendCodes_areRecognisedFromTheErrorText() {
         fun darwin(code: Int) = kotlinx.io.IOException("Exception in http request: Error Domain=NSURLErrorDomain Code=$code \"x\"")
-        for (code in listOf(-1003, -1004, -1006, -1009, -1200, -1202)) assertTrue(isPreSendFailure(darwin(code)), "$code")
-        for (code in listOf(-1001, -1005, -1017)) assertFalse(isPreSendFailure(darwin(code)), "$code")
+        for (code in listOf(-1003, -1004, -1006, -1022, -1201, -1202, -1206)) assertTrue(isPreSendFailure(darwin(code)), "$code")
+        // Codes that can also occur after bytes were sent get the floor (conservative).
+        for (code in listOf(-1001, -1005, -1009, -1017, -1018, -1019, -1020, -1200)) assertFalse(isPreSendFailure(darwin(code)), "$code")
         assertTrue(isPreSendFailure(RuntimeException("wrapped", darwin(-1004))))
         assertFalse(isPreSendFailure(kotlinx.io.IOException("connection reset")))
     }
@@ -602,6 +603,13 @@ class Adv6DefinitiveRefusalTest {
         assertFalse(e(TusUploadExpiredException()).isNetworkFailure, "a TusProtocolException is an IOException, not a network failure")
         assertFalse(e(TusHttpException(503, "PATCH")).isNetworkFailure)
         assertFalse(e(null).isNetworkFailure)
+
+        for (status in listOf(400, 403, 413)) assertTrue(e(TusHttpException(status, "PATCH")).isServerRefusal, "$status")
+        for (status in listOf(401, 404, 409, 410, 423, 429, 500, 503)) assertFalse(e(TusHttpException(status, "PATCH")).isServerRefusal, "$status")
+        assertTrue(e(TusUploadLengthMismatchException(1, 2)).isServerRefusal)
+        assertTrue(e(TusOffsetMismatchException("x")).isServerRefusal)
+        assertFalse(e(kotlinx.io.IOException("offline")).isServerRefusal)
+        assertFalse(e(null).isServerRefusal)
     }
 
     /** L2: an onUpload set in the request block does not silence onProgress. */
