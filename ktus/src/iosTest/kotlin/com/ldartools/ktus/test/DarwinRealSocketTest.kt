@@ -133,7 +133,10 @@ class DarwinRealSocketTest {
                     }
                 }
             }
-            assertTrue(error is kotlinx.io.IOException, "a timeout must surface as a network error, was $error")
+            // The first PATCH carried the whole file and never got an answer, so the outcome is unknown; the
+            // cause is the timeout, a network error.
+            assertIs<TusUploadOutcomeUnknownException>(error, "was $error")
+            assertTrue(error.cause is kotlinx.io.IOException, "cause ${error.cause}")
             val patches = server.log.filter { it.method == "PATCH" }
             assertTrue(patches.size in 2..30, "bounded retries: ${patches.size}")
             assertTrue(started.elapsedNow().inWholeMilliseconds < 3_000 + 10_000)

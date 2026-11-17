@@ -4,9 +4,14 @@ All notable changes to Ktus are documented here. The project follows [Semantic V
 
 ## 1.1.0
 
-A reliability and security release. Existing calls keep compiling and keep their meaning; the 1.0.x function
-and constructor signatures remain in the binary as hidden overloads, so code compiled against 1.0.x links
-against 1.1.0.
+A reliability and security release. The 1.0.x function and constructor signatures remain in the binary as
+hidden overloads, so code compiled against 1.0.x links against 1.1.0, and calls that use named arguments or a
+trailing `block` lambda keep compiling. Two source breaks: a call to `uploadTus` with five positional arguments
+or to `createAndUploadTus` with seven (passing `block` positionally rather than as a trailing lambda) no longer
+compiles, because new callback parameters now sit before `block`. Use a trailing lambda or `block = …`.
+
+Two new failure types are not `IOException`s, so a "network error, retry later" handler does not catch them:
+`TusUploadOutcomeUnknownException` and the `IllegalStateException` thrown for a closed `HttpClient`.
 
 ### Added
 - `onActivity` callback on `uploadTus`, `createAndUploadTus` and `resumeOrCreateAndUploadTus`: fires on every
@@ -116,14 +121,21 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
   marked and never re-creates it. **Callers must check on the server whether the file arrived before uploading
   it again**, then remove the store entry. A 404/410 after an earlier chunk is still
   `TusUploadExpiredException`.
-- **The `finalSentAt` mark is only cleared by a PATCH answered 204 below the total**, never by a HEAD (which can
-  be stale). Any failure of a marked entry, including a permanent 4xx, is `TusUploadOutcomeUnknownException`;
+- **Once a final PATCH has been sent in a call, it stays unresolved** until the server shows `offset == total` or
+  a later PATCH is answered 204 below the total; a HEAD never resolves it. While unresolved, every failure of
+  the call is `TusUploadOutcomeUnknownException` (except a direct 4xx refusal of the first final PATCH).
+- **The `finalSentAt` mark is only cleared by a PATCH answered 204 below the total** (or a direct refusal of the
+  first final PATCH), never by a HEAD (which can be stale). The closed-client check runs before the mark is
+  written, so a PATCH that was never sent leaves no mark. If removing the entry fails after the upload
+  completed, the call still succeeds.
+- **`TusUrlStore` writes must be durable when they return.** Any failure of a marked entry, including a permanent 4xx, is `TusUploadOutcomeUnknownException`;
   a marked entry is never dropped or re-created. A 2xx answer to the final PATCH with a missing or impossible
   `Upload-Offset` is an unknown outcome too, and so is a client closed while the final PATCH is in flight.
 - **`OkioTusFile` reports a missing or deleted file as `TusLocalFileException`** (not retried); it used to report
   size 0 or a raw okio `IOException` that was retried.
 - **`activityHeartbeatMillis` must be positive or null**; it also sets the backoff heartbeat interval.
-- **Callbacks may run concurrently on different threads** and must be thread-safe.
+- **Callbacks may run on different threads** and must be thread-safe. `onActivity` is never run concurrently
+  with itself: an overlapping call (heartbeat vs. body-write progress) is skipped.
 - **The size check stops once the server has every byte**, and an edit that keeps the file's size is never
   detected.
 - **Exceptions thrown by `onProgress`** are rethrown as they are and end the upload; they are never treated as

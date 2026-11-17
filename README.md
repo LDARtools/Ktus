@@ -20,7 +20,8 @@ Ktus uses your Ktor `HttpClient`. Two settings matter:
 
 ```kotlin
 val httpClient = HttpClient(engine) {
-    // tus requests must never be redirected; Ktus rejects any 3xx and any answer that came from another origin.
+    // tus requests must never be redirected. Ktus rejects any 3xx and any answer that came from another origin,
+    // but only after the engine has followed it (Ktor follows HEAD redirects by default), so turn it off here.
     followRedirects = false
     // Ktus classifies responses by status itself, so expectSuccess can be either value.
     install(HttpTimeout) {
@@ -54,10 +55,12 @@ file. The next call with the same fingerprint resumes where the server is instea
 // import com.ldartools.ktus.resumeOrCreateAndUploadTus
 // import com.ldartools.ktus.TusUrlStore
 
+// Writes must be on disk when set/remove return (SharedPreferences.commit(), DataStore edit, a database
+// transaction), never fire-and-forget like SharedPreferences.apply(). See below.
 class PrefsTusUrlStore(private val prefs: MyKeyValueStore) : TusUrlStore {
     override suspend fun get(fingerprint: String): TusUpload? = prefs.read(fingerprint)
-    override suspend fun set(fingerprint: String, upload: TusUpload) = prefs.write(fingerprint, upload)
-    override suspend fun remove(fingerprint: String) = prefs.delete(fingerprint)
+    override suspend fun set(fingerprint: String, upload: TusUpload) = prefs.writeDurably(fingerprint, upload)
+    override suspend fun remove(fingerprint: String) = prefs.deleteDurably(fingerprint)
 }
 
 httpClient.resumeOrCreateAndUploadTus(
@@ -131,9 +134,10 @@ httpClient.createAndUploadTus(
   completes. Bound that with the engine's timeouts (Ktor `HttpTimeout`: socket/request timeout): Ktus then
   gives up, at worst, about `maxElapsedMillis` + one request timeout after the failures start. Size
   `maxElapsedMillis` to what you can really wait, or put a finite outer limit (`withTimeout`) around the call.
-- Callbacks can run on different threads, possibly at the same time: the in-flight ticker on the caller's
-  dispatcher, and `onProgress`/`onActivity` during the body write on the engine's thread. Make them
-  thread-safe (for example, only write an atomic timestamp).
+- Callbacks can run on different threads: the in-flight ticker on the caller's dispatcher, and
+  `onProgress`/`onActivity` during the body write on the engine's thread. Ktus never runs `onActivity`
+  concurrently with itself (an overlapping call is skipped), but make callbacks thread-safe anyway (for
+  example, only write an atomic timestamp).
 - Exceptions thrown by `onProgress`, `onActivity`, `onConfirmed` or the `TusUrlStore` end the upload and reach
   you exactly as thrown (including a `CancellationException`); they are never retried.
 - `onConfirmed` reports offsets the server has acknowledged: after each PATCH answered `204`, after a recovery
@@ -223,13 +227,19 @@ lost), and could not find out afterwards. The server may hold the complete file.
 upload once it is complete, so every later HEAD or PATCH answers 404, which looks exactly like an expired
 upload. Uploading again from scratch can make the server receive and process the file twice.
 
-Ktus follows one rule. Once the final PATCH's outcome is unknown, the next HEAD decides:
-- it shows `offset == total`: the upload succeeded;
-- it shows `offset < total`: the bytes did not land, and the upload continues normally;
-- anything else ends the call with **`TusUploadOutcomeUnknownException`**, whatever the underlying failure was
-  (404/410, retries or budget exhausted, an HTTP error, a protocol error). The original failure is its `cause`.
-  A 404/410 later in the same call is reported the same way even after a HEAD said the bytes were missing,
-  because a HEAD answered by another server instance can be stale.
+Ktus follows one rule. Once a PATCH carrying the last bytes has been sent in a call, that final chunk stays
+**unresolved** until either
+- a HEAD or the PATCH itself shows `offset == total`: the upload succeeded; or
+- a later PATCH is answered `204` with an offset below the total, which proves the upload still exists and is
+  incomplete.
+
+A HEAD showing `offset < total` lets the upload continue, but does **not** resolve it: behind a load balancer
+without affinity, the HEAD may be answered by a stale server instance. While the final chunk is unresolved,
+**every** failure that ends the call (404/410, retries or budget exhausted, a network error, an HTTP error, a
+protocol or validation error, a closed client) is reported as **`TusUploadOutcomeUnknownException`**, with the
+original failure as its `cause`. The one exception is a direct refusal of the very first final PATCH (a 4xx
+answered to it, with nothing unresolved before): the server answered, so the bytes did not land, and the
+original error is thrown. Cancelling the caller still throws `CancellationException`.
 
 `TusUploadOutcomeUnknownException` deliberately does **not** extend `IOException` or `TusProtocolException`, so a
 generic "network error, retry later" or "expired, re-create" handler does not swallow it.
@@ -240,8 +250,20 @@ marked entry is never dropped or re-created: a later call that gets 404/410 for 
 it is never dropped or re-created. If the caller's coroutine is cancelled while the final PATCH is in flight,
 the `CancellationException` propagates as coroutines require; the marked entry is how the next call knows.
 A HEAD never clears the mark (it may be answered by a stale server instance); only a PATCH answered `204` with
-an offset below the total does, because that proves the upload still exists and is incomplete. A malformed
-answer to the final PATCH (a `2xx` with a missing or impossible `Upload-Offset`) is an unknown outcome too.
+an offset below the total does, because that proves the upload still exists and is incomplete, or a direct
+refusal of the first final PATCH. A malformed answer to the final PATCH (a `2xx` with a missing or impossible
+`Upload-Offset`) is an unknown outcome too.
+
+**A marked entry stays in the store until you remove it**, even when a later call gets a definitive answer from
+the server (a 404, 403 or 423 that was not a direct answer to a first, fresh final PATCH): Ktus cannot tell a
+completed-and-removed upload from one that never completed. To resolve it, ask your server whether the file
+arrived (by id, name or checksum); then `store.remove(fingerprint)` and either mark the file uploaded or upload
+it again. If removing the entry fails after an upload completed, the call still succeeds and the entry stays
+marked: the next call reports `TusUploadOutcomeUnknownException`, and the same check resolves it.
+
+The store must write durably: `set` and `remove` must have reached disk when they return (for example
+`SharedPreferences.commit()` or DataStore, not `apply()`). A mark lost in a crash is a duplicate upload waiting
+to happen.
 
 `createAndUploadTus` and `uploadTus` have no store. If you use them, pass `onFinalPatch`: it is called right
 before every attempt to send the PATCH carrying the last bytes, so you can persist "the final chunk may have
@@ -250,6 +272,16 @@ other signal, so after any cancellation or failure of a call that may have reach
 the server's state before uploading again.
 
 A catch-all `catch (e: Exception)` also catches `TusUploadOutcomeUnknownException`: catch it first.
+
+### Gateways, timeouts and overlapping writes
+
+Behind a gateway (for example Azure Front Door) with no session affinity, a PATCH that timed out at the gateway
+(504) or on the client may still be running on the origin. Ktus backs off and asks with HEAD before sending more,
+but the next PATCH can reach a different server instance while the first one is still appending. tusdotnet locks
+an upload per process, not across instances, so two instances can write to the same upload at once if they
+share its storage. Check that your server is safe for that (a storage-level lock, affinity, or a single
+writer), or raise `RetryOptions.initialDelayMillis` so retries after a timeout wait longer than the origin's own
+request timeout.
 
 **When you get this exception, check on your server whether the file arrived before uploading it again**, then
 resolve the store entry yourself:

@@ -30,7 +30,7 @@ class BugFixTest {
         val testFile = InMemoryTusFile("test.bin", fileData)
         var serverOffset = 0L
         var patchAttempts = 0
-        val receivedBytes = mutableListOf<ByteArray>()
+        val receivedBytes = SyncList<ByteArray>()
 
         val engine = MockEngine { request ->
             when (request.method) {
@@ -99,7 +99,7 @@ class BugFixTest {
         val testFile = InMemoryTusFile("test.bin", fileData)
         var serverOffset = 0L
         var patchAttempts = 0
-        val byteSizesPerAttempt = mutableListOf<Int>()
+        val byteSizesPerAttempt = SyncList<Int>()
 
         val engine = MockEngine { request ->
             when (request.method) {
@@ -422,7 +422,7 @@ class BugFixTest {
         var patchCount = 0
         var headCount = 0
         var serverOffset = 0L
-        val patchOffsets = mutableListOf<Long>()
+        val patchOffsets = SyncList<Long>()
 
         val engine = MockEngine { request ->
             when (request.method) {

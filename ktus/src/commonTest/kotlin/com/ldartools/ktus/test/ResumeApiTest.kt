@@ -75,7 +75,7 @@ class ResumeApiTest {
         val file = InMemoryTusFile("f", testBytes(400))
         val server = ScriptedTusServer(location = "/files/new")
         val store = InMemoryTusUrlStore()
-        val seenAtFirstPatch = mutableListOf<TusUpload?>()
+        val seenAtFirstPatch = SyncList<TusUpload?>()
         server.onRequest = { request ->
             if (request.method == HttpMethod.Patch && seenAtFirstPatch.isEmpty()) seenAtFirstPatch += store.get("fp")
         }

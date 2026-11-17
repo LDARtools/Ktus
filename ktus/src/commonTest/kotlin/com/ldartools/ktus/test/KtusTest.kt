@@ -14,7 +14,7 @@ class KtusTest {
 
     @Test
     fun testCoreProtocol_allRequestsHaveTusResumableHeader() = runTest {
-        val requestHeaders = mutableListOf<Pair<HttpMethod, String?>>()
+        val requestHeaders = SyncList<Pair<HttpMethod, String?>>()
 
         val engine = MockEngine { request ->
             requestHeaders.add(request.method to request.headers["Tus-Resumable"])
@@ -137,7 +137,7 @@ class KtusTest {
         val fileData = ByteArray(1024) { (it and 0xFF).toByte() }
         val testFile = InMemoryTusFile("test.bin", fileData)
         var serverOffset = 0L
-        val receivedChunks = mutableListOf<Int>()
+        val receivedChunks = SyncList<Int>()
 
         val engine = MockEngine { request ->
             when (request.method) {
@@ -258,7 +258,7 @@ class KtusTest {
         val fileData = ByteArray(1000) { it.toByte() }
         val testFile = InMemoryTusFile("test.bin", fileData)
         var serverOffset = 300L // Already uploaded 300 bytes
-        val patchCount = mutableListOf<Int>()
+        val patchCount = SyncList<Int>()
 
         val engine = MockEngine { request ->
             when (request.method) {
@@ -338,7 +338,7 @@ class KtusTest {
         val fileData = ByteArray(600) { it.toByte() }
         val testFile = InMemoryTusFile("test.bin", fileData)
         var serverOffset = 0L
-        val patchOffsets = mutableListOf<Long>()
+        val patchOffsets = SyncList<Long>()
 
         val engine = MockEngine { request ->
             when (request.method) {
@@ -746,7 +746,7 @@ class KtusTest {
         val fileData = ByteArray(1000) { it.toByte() }
         val testFile = InMemoryTusFile("test.bin", fileData)
         var serverOffset = 0L
-        val progressUpdates = mutableListOf<Pair<Long, Long>>()
+        val progressUpdates = SyncList<Pair<Long, Long>>()
 
         val engine = MockEngine { request ->
             when (request.method) {

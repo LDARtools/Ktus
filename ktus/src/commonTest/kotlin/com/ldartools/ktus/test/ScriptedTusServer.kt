@@ -74,14 +74,14 @@ class ScriptedTusServer(
     /** Answer 423 Locked to HEAD and PATCH while `clock()` is below this (tusdotnet's per-file lock). */
     var lockedUntil: Long = Long.MIN_VALUE
 
-    val requests = mutableListOf<Recorded>()
-    private val scripts = mutableMapOf<String, ArrayDeque<Reply>>()
+    val requests = SyncList<Recorded>()
+    private val scripts = SyncMap<String, SyncList<Reply>>()
 
     /** Hook run at the start of every request, before scripted replies (for assertions mid-upload). */
     var onRequest: suspend (HttpRequestData) -> Unit = {}
 
     fun script(method: HttpMethod, vararg replies: Reply) {
-        scripts.getOrPut(method.value) { ArrayDeque() }.addAll(replies)
+        scripts.getOrPut(method.value) { SyncList() }.addAll(replies.toList())
     }
 
     fun count(method: HttpMethod): Int = requests.count { it.method == method.value }
@@ -190,7 +190,7 @@ class ScriptedTusServer(
 class MutableTusFile(private val nameValue: String, var data: ByteArray) : ITusFile {
     /** When set, [size] reports this instead of `data.size`. */
     var sizeOverride: Long? = null
-    val reads = mutableListOf<Pair<Long, Long>>()
+    val reads = SyncList<Pair<Long, Long>>()
 
     override val size: Long get() = sizeOverride ?: data.size.toLong()
     override val name: String get() = nameValue

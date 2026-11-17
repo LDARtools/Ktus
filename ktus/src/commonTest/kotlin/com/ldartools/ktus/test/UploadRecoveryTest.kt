@@ -229,7 +229,7 @@ class UploadRecoveryTest {
     @Test
     fun anEmptyFile_isUploaded_whenAllowed() = runTest {
         val server = ScriptedTusServer()
-        val confirmed = mutableListOf<Pair<Long, Long>>()
+        val confirmed = SyncList<Pair<Long, Long>>()
         server.client().createAndUploadTus("https://example.com/files", InMemoryTusFile("e", ByteArray(0)),
             options = TusUploadOptions(allowEmptyUpload = true), onConfirmed = { o, t -> confirmed += o to t })
         assertEquals(listOf("OPTIONS", "POST", "HEAD"), server.methods())
@@ -306,7 +306,7 @@ class UploadRecoveryTest {
     @Test
     fun onConfirmed_reportsEachAcceptedPatch_andCompletionOnce() = runTest {
         val server = server(1000)
-        val confirmed = mutableListOf<Pair<Long, Long>>()
+        val confirmed = SyncList<Pair<Long, Long>>()
         server.client().uploadTus(url, InMemoryTusFile("f", testBytes(1000)),
             options = TusUploadOptions(chunkSize = 300, retryOptions = retry()),
             onConfirmed = { o, t -> confirmed += o to t })
@@ -316,7 +316,7 @@ class UploadRecoveryTest {
     @Test
     fun onConfirmed_firesOnce_whenHeadShowsTheUploadIsAlreadyComplete() = runTest {
         val server = server(1000).apply { data = testBytes(1000) }
-        val confirmed = mutableListOf<Pair<Long, Long>>()
+        val confirmed = SyncList<Pair<Long, Long>>()
         server.client().uploadTus(url, InMemoryTusFile("f", testBytes(1000)),
             onConfirmed = { o, t -> confirmed += o to t })
         assertEquals(listOf(1000L to 1000L), confirmed)
@@ -327,7 +327,7 @@ class UploadRecoveryTest {
     fun onConfirmed_reportsProgressRevealedByARecoveryHead_andNeverRepeats() = runTest {
         val server = server(600)
         server.script(HttpMethod.Patch, Reply.Status(500, apply = true), Reply.Status(409))
-        val confirmed = mutableListOf<Long>()
+        val confirmed = SyncList<Long>()
         server.client().uploadTus(url, InMemoryTusFile("f", testBytes(600)),
             options = TusUploadOptions(chunkSize = 200, retryOptions = retry()),
             onConfirmed = { o, _ -> confirmed += o })
@@ -337,7 +337,7 @@ class UploadRecoveryTest {
     @Test
     fun onConfirmed_isNotCalledForTheStartingOffsetOfAResume() = runTest {
         val server = server(600).apply { data = testBytes(600).copyOfRange(0, 200) }
-        val confirmed = mutableListOf<Long>()
+        val confirmed = SyncList<Long>()
         server.client().uploadTus(url, InMemoryTusFile("f", testBytes(600)),
             options = TusUploadOptions(chunkSize = 200, retryOptions = retry()),
             onConfirmed = { o, _ -> confirmed += o })
@@ -347,7 +347,7 @@ class UploadRecoveryTest {
     @Test
     fun onProgress_stillReportsBytesHandedToTheEngine() = runTest {
         val server = server(1000)
-        val progress = mutableListOf<Long>()
+        val progress = SyncList<Long>()
         server.client().uploadTus(url, InMemoryTusFile("f", testBytes(1000)),
             options = TusUploadOptions(chunkSize = 400, retryOptions = retry()),
             onProgress = { sent, total -> assertEquals(1000, total); progress += sent })

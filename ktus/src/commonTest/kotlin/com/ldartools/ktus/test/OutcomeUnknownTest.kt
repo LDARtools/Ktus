@@ -28,15 +28,15 @@ import kotlin.test.*
 
 internal class TusdotnetLike(val size: Long) {
     var nextId = 0
-    val uploads = mutableMapOf<String, ByteArray>()
-    val processed = mutableListOf<ByteArray>()
+    val uploads = SyncMap<String, ByteArray>()
+    val processed = SyncList<ByteArray>()
     var loseFinal = 0
     var headFailures = 0
     var staleHeads = 0
     var patchConflicts = 0
     /** Runs after the final chunk is stored (and the upload removed), before the response. */
     var afterFinalStored: suspend () -> Unit = {}
-    val methods = mutableListOf<String>()
+    val methods = SyncList<String>()
 
     val engine = MockEngine { request ->
         methods += request.method.value
@@ -87,7 +87,7 @@ internal class TusdotnetLike(val size: Long) {
 /** A store that records every write, to observe the finalSentAt flag over time. */
 private class RecordingStore : TusUrlStore {
     val inner = InMemoryTusUrlStore()
-    val writes = mutableListOf<String>()
+    val writes = SyncList<String>()
     override suspend fun get(fingerprint: String) = inner.get(fingerprint)
     override suspend fun set(fingerprint: String, upload: TusUpload) {
         writes += if (upload.finalSentAt == null) "set" else "set-final"
@@ -202,7 +202,7 @@ class OutcomeUnknownTest {
     fun aLostFinalResponse_whereHeadProvesCompletion_succeeds() = runTest {
         val server = ScriptedTusServer().apply { uploadLength = 500 }
         server.script(HttpMethod.Patch, Reply.Throw(IOException("response lost"), apply = true))
-        val confirmed = mutableListOf<Long>()
+        val confirmed = SyncList<Long>()
         server.client().uploadTus(url, InMemoryTusFile("f", testBytes(500)),
             options = TusUploadOptions(retryOptions = retry()), onConfirmed = { o, _ -> confirmed += o })
         assertEquals(listOf("HEAD", "PATCH", "HEAD"), server.methods())
@@ -210,15 +210,42 @@ class OutcomeUnknownTest {
     }
 
     @Test
-    fun aFinalPatchThatDidNotLand_isUnlatchedByHead_andFailuresAfterThatAreNormal() = runTest {
+    fun aHeadBelowTheTotal_doesNotResolveTheFinalPatch_soALaterRefusalIsStillUnknown() = runTest {
         val server = ScriptedTusServer().apply { uploadLength = 500 }
-        // Final PATCH fails without storing; HEAD shows 0 (< total), so the latch is released; the re-sent
-        // PATCH is then refused with 403, an ordinary error.
+        // Final PATCH fails without storing; HEAD shows 0 (< total): the upload continues but the final PATCH is
+        // still unresolved (the HEAD may be stale), so the re-sent PATCH's 403 is an unknown outcome.
         server.script(HttpMethod.Patch, Reply.Status(503), Reply.Status(403))
-        val e = assertFailsWith<TusHttpException> {
+        val e = assertFailsWith<TusUploadOutcomeUnknownException> {
             server.client().uploadTus(url, InMemoryTusFile("f", testBytes(500)), options = TusUploadOptions(retryOptions = retry()))
         }
+        assertEquals(403, (e.cause as TusHttpException).statusCode)
+    }
+
+    @Test
+    fun a204BelowTheTotal_resolvesTheFinalPatch_andAFreshRefusalAfterThatIsDefinitive() = runTest {
+        val server = ScriptedTusServer().apply { uploadLength = 1000 }
+        // 0..500 ok; final 500..1000 answered 504 (not stored) -> chunk halves; HEAD 500; 500..750 answered 204
+        // (resolves); final 750..1000 refused 403 directly: a definitive answer.
+        server.script(HttpMethod.Patch, Reply.Status(204, mapOf("Upload-Offset" to "500"), apply = true),
+            Reply.Status(504), Reply.Status(204, mapOf("Upload-Offset" to "750"), apply = true), Reply.Status(403))
+        val e = assertFailsWith<TusHttpException> {
+            server.client().uploadTus(url, InMemoryTusFile("f", testBytes(1000)),
+                options = TusUploadOptions(chunkSize = 500, minChunkSize = 100, retryOptions = retry()))
+        }
         assertEquals(403, e.statusCode)
+        assertEquals(listOf(0L, 500L, 500L, 750L), server.patchOffsets())
+    }
+
+    @Test
+    fun aDirectRefusalOfTheFirstFinalPatch_isDefinitive() = runTest {
+        for (status in listOf(403, 400, 413)) {
+            val server = ScriptedTusServer().apply { uploadLength = 500 }
+            server.script(HttpMethod.Patch, Reply.Status(status))
+            val e = assertFailsWith<TusHttpException>("$status") {
+                server.client().uploadTus(url, InMemoryTusFile("f", testBytes(500)), options = TusUploadOptions(retryOptions = retry()))
+            }
+            assertEquals(status, e.statusCode)
+        }
     }
 
     @Test
@@ -264,7 +291,7 @@ class OutcomeUnknownTest {
     fun theStoreIsFlaggedBeforeTheFinalPatch_notClearedByHead_andRemovedOnSuccess() = runTest {
         val server = ScriptedTusServer(location = "/files/new").apply { uploadLength = 1000 }
         val store = RecordingStore()
-        val flagAtFinalPatch = mutableListOf<Long?>()
+        val flagAtFinalPatch = SyncList<Long?>()
         server.onRequest = { r ->
             if (r.method == HttpMethod.Patch && r.headers["Upload-Offset"] == "500") flagAtFinalPatch += store.get("fp")?.finalSentAt
         }
@@ -446,7 +473,7 @@ class OutcomeUnknownTest {
 
     @Test
     fun aLongSilentRequest_stillProducesActivityTicks_andTheTickerStopsWithTheCall() = runTest {
-        val stamps = mutableListOf<Long>()
+        val stamps = SyncList<Long>()
         val client = slowHeadClient(30_000, ScriptedTusServer())
         client.uploadTus(url, InMemoryTusFile("f", testBytes(100)), onActivity = { stamps += currentTime })
         assertEquals(30_000, currentTime)
@@ -474,7 +501,7 @@ class OutcomeUnknownTest {
 
     @Test
     fun theInFlightHeartbeat_canBeTurnedOff() = runTest {
-        val stamps = mutableListOf<Long>()
+        val stamps = SyncList<Long>()
         val client = slowHeadClient(30_000, ScriptedTusServer())
         client.uploadTus(url, InMemoryTusFile("f", testBytes(100)),
             options = TusUploadOptions(activityHeartbeatMillis = null), onActivity = { stamps += currentTime })

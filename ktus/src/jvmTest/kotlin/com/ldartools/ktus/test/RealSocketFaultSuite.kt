@@ -260,8 +260,10 @@ abstract class RealSocketFaultSuite {
                 }
             }
             val elapsed = (System.nanoTime() - started) / 1_000_000
-            assertTrue(error is kotlinx.io.IOException, "a timeout must surface as a network error, was $error")
-            assertFalse(error is TusProtocolException)
+            // The first PATCH carried the whole file and never got an answer, so the outcome is unknown; the
+            // cause is the timeout, a network error.
+            assertIs<TusUploadOutcomeUnknownException>(error, "was $error")
+            assertTrue(error.cause is kotlinx.io.IOException, "cause ${error.cause}")
             val patches = server.log.filter { it.method == "PATCH" }
             assertTrue(patches.size in 2..20, "bounded retries: ${patches.size}")
             // Wall-clock bound kept generous for loaded CI machines; the attempt count above is the tight check.
@@ -291,6 +293,36 @@ abstract class RealSocketFaultSuite {
             assertContentEquals(bytes, server.data)
             assertEquals(1, server.completions.get())
             assertEquals(2, server.log.count { it.method == "PATCH" }, "the final chunk is never re-sent: ${server.log}")
+        }
+    }
+
+    // (8) ------------------------------------------------------------------------------------------------
+
+    @Test
+    fun onActivity_isNeverInvokedConcurrently() = runBlocking {
+        RealSocketTusServer().use { server ->
+            val inside = AtomicInteger()
+            val overlaps = AtomicInteger()
+            val calls = AtomicInteger()
+            val bytes = payload(8 * 1024 * 1024)
+            withTimeout(60_000) {
+                client().use { client ->
+                    client.createAndUploadTus("${server.baseUrl}/files", TrackingFile(bytes),
+                        // A 1 ms heartbeat on the caller's dispatcher races the body-write progress on the
+                        // engine's thread.
+                        options = TusUploadOptions(chunkSize = 8L * 1024 * 1024, activityHeartbeatMillis = 1,
+                            retryOptions = quickRetry()),
+                        onActivity = {
+                            if (inside.incrementAndGet() > 1) overlaps.incrementAndGet()
+                            calls.incrementAndGet()
+                            Thread.sleep(1)
+                            inside.decrementAndGet()
+                        })
+                }
+            }
+            assertContentEquals(bytes, server.data)
+            assertTrue(calls.get() > 10, "precondition: many activity calls (${calls.get()})")
+            assertEquals(0, overlaps.get(), "onActivity ran concurrently ${overlaps.get()} times")
         }
     }
 

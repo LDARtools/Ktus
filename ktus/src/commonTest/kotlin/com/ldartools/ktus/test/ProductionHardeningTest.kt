@@ -22,10 +22,10 @@ import kotlin.test.*
  */
 private class CompletingServer(val size: Long) {
     var nextId = 0
-    val uploads = mutableMapOf<String, ByteArray>()
-    val processed = mutableListOf<ByteArray>()
+    val uploads = SyncMap<String, ByteArray>()
+    val processed = SyncList<ByteArray>()
     var loseFinalResponses = 1
-    val methods = mutableListOf<String>()
+    val methods = SyncList<String>()
 
     val engine = MockEngine { request ->
         methods += request.method.value
@@ -148,8 +148,8 @@ class ProductionHardeningTest {
         server.script(HttpMethod.Patch, Reply.Throw(IOException("reset")))
         server.script(HttpMethod.Head, Reply.Status(200, mapOf("Upload-Offset" to "0", "Upload-Length" to "1000")))
         repeat(6) { server.script(HttpMethod.Head, Reply.Status(503, mapOf("Retry-After" to "60"))) }
-        val activity = mutableListOf<Long>()
-        val progress = mutableListOf<Long>()
+        val activity = SyncList<Long>()
+        val progress = SyncList<Long>()
         server.client().uploadTus(url, InMemoryTusFile("f", testBytes(1000)),
             // Backoff heartbeat only; the in-flight ticker has its own deterministic tests (OutcomeUnknownTest).
             options = TusUploadOptions(activityHeartbeatMillis = null,
@@ -309,7 +309,7 @@ class ProductionHardeningTest {
 
     @Test
     fun aCrossOriginRedirect_neverReceivesTheAuthorizationHeader() = runTest {
-        val seenAtEvil = mutableListOf<String?>()
+        val seenAtEvil = SyncList<String?>()
         val engine = MockEngine { request ->
             if (request.url.host == "evil.example") {
                 seenAtEvil += request.headers["Authorization"]

@@ -11,9 +11,11 @@ import kotlinx.coroutines.sync.withLock
  * @property expiresAt when the server will discard an unfinished upload, in epoch milliseconds, from the
  *   `Upload-Expires` header of the creation response; null when the server did not say.
  * @property finalSentAt set (epoch milliseconds) by [resumeOrCreateAndUploadTus] just before it sends the PATCH
- *   carrying the last bytes, and cleared only when a HEAD shows the server does not have them. While it is
- *   set the upload's outcome may be unknown: Ktus never re-creates the upload, and a 404/410 throws
- *   [TusUploadOutcomeUnknownException]. Persist it with the rest of the entry.
+ *   carrying the last bytes. It is cleared only when a later PATCH is answered 204 with an offset below the
+ *   total (which proves the upload still exists and is incomplete), or when the server refuses that first
+ *   final PATCH directly. A HEAD never clears it: it may be answered by a stale server instance. While it is
+ *   set the upload's outcome may be unknown: Ktus never re-creates the upload, and any failure (a 404/410
+ *   included) throws [TusUploadOutcomeUnknownException]. Persist it with the rest of the entry.
  */
 data class TusUpload(
     val uploadUrl: String,
@@ -28,6 +30,11 @@ data class TusUpload(
  *
  * Persist the entries (database, preferences, a file) to resume uploads across app restarts.
  * Implementations must be safe to call from the coroutine that runs the upload.
+ *
+ * **Writes must be durable when [set] and [remove] return** (for example `SharedPreferences.commit()` or
+ * DataStore's `edit`, not `apply()`). Ktus writes the [TusUpload.finalSentAt] mark right before sending the
+ * last bytes; if that write is lost (the process dies before an asynchronous write reaches disk), the next
+ * call cannot know the final PATCH may have landed and may upload the file a second time.
  */
 interface TusUrlStore {
     /** The stored upload for [fingerprint], or null. */

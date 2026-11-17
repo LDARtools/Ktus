@@ -78,7 +78,7 @@ class StatusPolicyTest {
             for (method in methods) {
                 val server = server()
                 server.script(method, Reply.Status(401))
-                val tokens = mutableListOf<String>()
+                val tokens = SyncList<String>()
                 var token = 0
                 server.onRequest = { request ->
                     if (request.method == method) tokens += request.headers["Authorization"] ?: "none"

@@ -21,9 +21,9 @@ import kotlin.test.*
 /** tusdotnet-like server with hooks. */
 private class Srv(val size: Long) {
     var nextId = 0
-    val uploads = mutableMapOf<String, ByteArray>()
-    val processed = mutableListOf<String>()
-    val log = mutableListOf<String>()
+    val uploads = SyncMap<String, ByteArray>()
+    val processed = SyncList<String>()
+    val log = SyncList<String>()
     /** Called for each PATCH with (index, offset, len); return null to behave normally. */
     var patchHook: suspend (Int, Long, Int) -> String? = { _, _, _ -> null }
     var headHook: suspend (Int, String) -> Long? = { _, _ -> null }
@@ -147,7 +147,7 @@ class FinalPatchFlagTest {
 
     @Test
     fun aHeadBelowTheTotal_doesNotClearThePersistedFlag_butA204BelowTheTotalDoes() = runTest {
-        val writes = mutableListOf<String>()
+        val writes = SyncList<String>()
         val store = object : TusUrlStore {
             val inner = InMemoryTusUrlStore()
             override suspend fun get(fingerprint: String) = inner.get(fingerprint)
@@ -200,7 +200,7 @@ class FinalPatchFlagTest {
 
     @Test
     fun onFinalPatch_firesBeforeEveryFinalPatchAttempt() = runTest {
-        val events = mutableListOf<String>()
+        val events = SyncList<String>()
         val server = ScriptedTusServer().apply { uploadLength = 1000 }
         server.onRequest = { r -> if (r.method == HttpMethod.Patch) events += "PATCH@${r.headers["Upload-Offset"]}" }
         server.script(HttpMethod.Patch, Reply.Status(204, mapOf("Upload-Offset" to "500"), apply = true), Reply.Status(503))
@@ -234,12 +234,16 @@ class FinalPatchFlagTest {
         val server = ScriptedTusServer(clock = { currentTime }, dispatcher = StandardTestDispatcher(testScheduler))
             .apply { uploadLength = 100 }
         server.script(HttpMethod.Head, Reply.Status(503, mapOf("Retry-After" to "10")))
-        val stamps = mutableListOf<Long>()
+        val stamps = SyncList<Long>()
         server.client().uploadTus(url, InMemoryTusFile("f", testBytes(100)),
             options = TusUploadOptions(activityHeartbeatMillis = 2_000, retryOptions = retry()),
             onActivity = { stamps += currentTime })
-        assertEquals(10_000, server.times(HttpMethod.Head)[1] - server.times(HttpMethod.Head)[0])
-        assertTrue(stamps.zipWithNext { a, b -> b - a }.max() <= 2_000, "$stamps")
+        val (t0, t1) = server.times(HttpMethod.Head).let { it[0] to it[1] }
+        assertEquals(10_000, t1 - t0)
+        // Only the backoff window is asserted: after it, the in-flight ticker runs while the PATCH is handled on
+        // an engine thread, and runTest's virtual clock can jump ahead there (most visibly on Kotlin/Native).
+        val window = stamps.filter { it in t0..t1 }
+        assertTrue(window.zipWithNext { a, b -> b - a }.max() <= 2_000, "$window")
     }
 
     // ---------------------------------------------------------------- L6
@@ -269,5 +273,117 @@ class FinalPatchFlagTest {
         }
         assertTrue(e.message!!.contains("closed"))
         assertEquals(listOf(0L), server.patchOffsets(), "the final PATCH was never sent")
+    }
+
+    // ---------------------------------------------------------------- round 5
+
+    private fun TestScope.adv5Options() = TusUploadOptions(chunkSize = 500, minChunkSize = 100, activityHeartbeatMillis = null,
+        retryOptions = RetryOptions(maxRetries = 3, initialDelayMillis = 10, maxDelayMillis = 10, jitter = false,
+            timeSource = testScheduler.timeSource))
+
+    private fun Srv.staleHeadThenOffline() {
+        var offline = false
+        patchHook = { idx, _, _ ->
+            when (idx) {
+                1 -> "lostFinal504"
+                2 -> { offline = true; throw kotlinx.io.IOException("connection reset") }
+                else -> if (offline) throw kotlinx.io.IOException("offline") else null
+            }
+        }
+        headHook = { idx, _ ->
+            when {
+                idx == 1 -> 500L // stale instance
+                offline -> throw kotlinx.io.IOException("offline")
+                else -> null
+            }
+        }
+    }
+
+    /**
+     * H1, no store (Chateau's call shape): the final PATCH lands but the gateway answers 504, a stale HEAD says
+     * 500, the next (smaller, non-final) PATCH and every HEAD then fail. That used to be a plain IOException,
+     * which a "retry later" handler answered by uploading the file again.
+     */
+    @Test
+    fun H1_noStore_staleHeadThenNetworkLoss_isOutcomeUnknown_soTheAppDoesNotReupload() = runTest {
+        val srv = Srv(1000).apply { staleHeadThenOffline() }
+        val file = InMemoryTusFile("f", testBytes(1000))
+        val first = runCatching { srv.client().createAndUploadTus(createUrl, file, options = adv5Options()) }.exceptionOrNull()
+        assertIs<TusUploadOutcomeUnknownException>(first)
+        assertIs<kotlinx.io.IOException>(first.cause)
+        // The app's handler: retry only on a network error.
+        srv.patchHook = { _, _, _ -> null }; srv.headHook = { _, _ -> null }
+        if (first is kotlinx.io.IOException) runCatching { srv.client().createAndUploadTus(createUrl, file, options = adv5Options()) }
+        assertEquals(1, srv.processed.size, "file processed ${srv.processed.size} times: ${srv.processed}")
+    }
+
+    @Test
+    fun H1_store_staleHeadThenNetworkLoss_isOutcomeUnknown() = runTest {
+        val srv = Srv(1000).apply { staleHeadThenOffline() }
+        val store = InMemoryTusUrlStore()
+        val first = runCatching {
+            srv.client().resumeOrCreateAndUploadTus(createUrl, InMemoryTusFile("f", testBytes(1000)), "fp", store, options = adv5Options())
+        }.exceptionOrNull()
+        assertIs<TusUploadOutcomeUnknownException>(first)
+        assertNotNull(store.get("fp")?.finalSentAt)
+    }
+
+    /** A 404 answered directly to the first-ever final PATCH is definitive: no permanent mark is left behind. */
+    @Test
+    fun a404AnsweredToTheFirstFinalPatch_isExpired_andLeavesNoMark() = runTest {
+        val srv = Srv(500)
+        val store = InMemoryTusUrlStore()
+        val file = InMemoryTusFile("f", testBytes(500))
+        val opts = TusUploadOptions(chunkSize = 500, activityHeartbeatMillis = null, retryOptions = retry())
+        srv.patchHook = { _, _, _ -> srv.uploads.clear(); null } // the server lost the upload before the PATCH
+        val e1 = runCatching { srv.client().resumeOrCreateAndUploadTus(createUrl, file, "fp", store, options = opts) }.exceptionOrNull()
+        assertIs<TusUploadExpiredException>(e1, "a 404 to a never-before-sent final PATCH: the server never had it")
+        assertNull(store.get("fp"), "no stuck mark")
+        srv.patchHook = { _, _, _ -> null }
+        srv.client().resumeOrCreateAndUploadTus(createUrl, file, "fp", store, options = opts)
+        assertEquals(1, srv.processed.size)
+    }
+
+    /** A direct 403 to the first final PATCH clears the mark it just set (the bytes did not land). */
+    @Test
+    fun aDirectRefusalOfTheFirstFinalPatch_clearsTheMarkItSet() = runTest {
+        val server = ScriptedTusServer(location = "/files/new")
+        server.script(HttpMethod.Patch, Reply.Status(403))
+        val store = InMemoryTusUrlStore()
+        assertFailsWith<TusHttpException> {
+            server.client().resumeOrCreateAndUploadTus(createUrl, InMemoryTusFile("f", testBytes(100)), "fp", store,
+                options = TusUploadOptions(retryOptions = retry()))
+        }
+        assertNull(store.get("fp")?.finalSentAt)
+    }
+
+    /** L1: a client closed before the final PATCH leaves no mark and does not call onFinalPatch. */
+    @Test
+    fun aClientClosedBeforeTheFinalPatch_leavesNoMark() = runTest {
+        val server = ScriptedTusServer(location = "/files/new")
+        val client = server.client()
+        val store = InMemoryTusUrlStore()
+        var finalCalls = 0
+        assertFailsWith<IllegalStateException> {
+            client.resumeOrCreateAndUploadTus(createUrl, InMemoryTusFile("f", testBytes(1000)), "fp", store,
+                options = TusUploadOptions(chunkSize = 500, retryOptions = retry()),
+                onConfirmed = { _, _ -> client.close() }, onFinalPatch = { finalCalls++ })
+        }
+        assertEquals(0, finalCalls)
+        assertNull(store.get("fp")?.finalSentAt, "a PATCH that never left must not leave a mark")
+    }
+
+    /** L3: if the store cannot forget a completed upload, the call still succeeds. */
+    @Test
+    fun aStoreThatFailsToRemoveAfterCompletion_stillReportsSuccess() = runTest {
+        val inner = InMemoryTusUrlStore()
+        val store = object : TusUrlStore by inner {
+            override suspend fun remove(fingerprint: String) = throw kotlinx.io.IOException("disk full")
+        }
+        val server = ScriptedTusServer(location = "/files/new")
+        server.client().resumeOrCreateAndUploadTus(createUrl, InMemoryTusFile("f", testBytes(100)), "fp", store,
+            options = TusUploadOptions(retryOptions = retry()))
+        assertEquals(100, server.offset)
+        assertNotNull(inner.get("fp")?.finalSentAt, "the entry stays marked")
     }
 }
