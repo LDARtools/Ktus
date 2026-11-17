@@ -192,4 +192,30 @@ class Adv11Test {
         val t = gaveUpAfter(headSlowFrom = 590_000, patchSlowFrom = 600_000)
         assertTrue(t <= 600_000 + 300_000 + 1_000, "gave up after $t ms; a PATCH after the budget would add 300 s")
     }
+
+    /** The answered-URL check must not mis-fire on URL spellings or on a block that edits the URL. */
+    @Test
+    fun theAnsweredUrlCheck_ignoresHarmlessSpellings_andBlockEdits() = runTest {
+        val targets = listOf(
+            "https://EXAMPLE.com:443/files/abc",
+            "https://example.com/files/abc/",
+            "https://example.com/files/a%20b",
+            "https://example.com/files/ab%2Fc?sig=x%2By&z=",
+            "http://example.com:80/files/abc",
+        )
+        for (target in targets) {
+            val server = ScriptedTusServer().apply { uploadLength = 10 }
+            server.client().uploadTus(target, InMemoryTusFile("f", testBytes(10)),
+                options = TusUploadOptions(activityHeartbeatMillis = null, retryOptions = fast()))
+            assertEquals(10, server.offset, target)
+        }
+        // A block that adds a query parameter (an auth token) to every request.
+        val server = ScriptedTusServer().apply { uploadLength = 10 }
+        server.client().uploadTus(url, InMemoryTusFile("f", testBytes(10)),
+            options = TusUploadOptions(activityHeartbeatMillis = null, retryOptions = fast())) {
+            url { parameters.append("token", "a b/c") }
+        }
+        assertEquals(10, server.offset)
+        assertTrue(server.requests.all { "token=" in it.url }, "${server.requests.map { it.url }}")
+    }
 }

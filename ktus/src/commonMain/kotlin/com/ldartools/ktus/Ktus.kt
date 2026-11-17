@@ -405,6 +405,7 @@ suspend fun HttpClient.terminateTus(
             delete(uploadUrl) {
                 tusVersionHeader()
                 block()
+                markRequestTarget()
             }
         },
         onSuccess = { },
@@ -543,6 +544,7 @@ private suspend fun HttpClient.createUploadInternal(
                 optionsRequest(urlString = createUrl) {
                     // Per TUS spec, Tus-Resumable MUST NOT be included in OPTIONS requests.
                     block()
+                    markRequestTarget()
                 }
             },
             onSuccess = { response ->
@@ -573,6 +575,7 @@ private suspend fun HttpClient.createUploadInternal(
                     header("Upload-Metadata", encodedMetadata)
                 }
                 block()
+                markRequestTarget()
             }
         },
         onSuccess = { response ->
@@ -703,6 +706,7 @@ private suspend fun HttpClient.uploadInternal(
                         setBody(body)
 
                         block()
+                        markRequestTarget()
                         // Progress listener hook (Ktor capability): bytes handed to the engine so far. Installed
                         // after the caller's block: Ktor keeps one upload listener per request, and Ktus needs
                         // this one (use onProgress rather than onUpload in the block).
@@ -887,6 +891,7 @@ private suspend fun HttpClient.headOffset(
         head(uploadUrl) {
             tusVersionHeader()
             block()
+            markRequestTarget()
         }
     },
     onSuccess = { response ->

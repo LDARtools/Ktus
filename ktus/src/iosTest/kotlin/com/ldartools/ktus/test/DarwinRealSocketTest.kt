@@ -11,6 +11,7 @@ import io.ktor.utils.io.writeFully
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
+import com.ldartools.ktus.copyExactly
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -169,9 +170,27 @@ class DarwinRealSocketTest {
     }
 
     /** A file that is shorter than its size mid-PATCH: TusLocalFileException, not retried, nothing truncated stored. */
-    class ShortFile(private val bytes: ByteArray, private val claimed: Long) : ITusFile {
+    /**
+     * Claims [claimed] bytes but holds fewer. With [pauseBeforeFailingMillis] > 0 it first sends what it has and
+     * waits, so the partial body certainly reaches the server before the short read is detected.
+     */
+    class ShortFile(
+        private val bytes: ByteArray,
+        private val claimed: Long,
+        private val pauseBeforeFailingMillis: Long = 0,
+    ) : ITusFile {
         override val size: Long get() = claimed
         override val name: String get() = "short.bin"
+        override suspend fun writeSection(offset: Long, length: Long, channel: ByteWriteChannel) {
+            if (pauseBeforeFailingMillis == 0L) return copyExactly(readSection(offset, length), channel, offset, length)
+            val available = (bytes.size - offset).coerceIn(0, length).toInt()
+            channel.writeFully(bytes, offset.toInt(), offset.toInt() + available)
+            channel.flush()
+            if (available < length) {
+                delay(pauseBeforeFailingMillis)
+                throw TusLocalFileException("short read at ${offset + available}")
+            }
+        }
         override suspend fun readSection(offset: Long, length: Long): ByteReadChannel =
             ByteReadChannel(bytes.copyOfRange(offset.toInt(), minOf(bytes.size.toLong(), offset + length).toInt()))
         override suspend fun fileReadLock(): AutoCloseable = AutoCloseable { }
@@ -179,8 +198,12 @@ class DarwinRealSocketTest {
 
     @Test
     fun aShortRead_isALocalFileError_andIsNotRetried() = runBlocking {
+        for (pause in listOf(0L, 500L)) shortRead(pause)
+    }
+
+    private suspend fun shortRead(pauseBeforeFailingMillis: Long) {
         PosixTusServer().use { server ->
-            val file = ShortFile(payload(300 * 1024), claimed = 512 * 1024)
+            val file = ShortFile(payload(300 * 1024), claimed = 512 * 1024, pauseBeforeFailingMillis)
             val error = assertFails {
                 withTimeout(30_000) {
                     client().use { it.createAndUploadTus("${server.baseUrl}/files", file,
@@ -188,9 +211,28 @@ class DarwinRealSocketTest {
                 }
             }
             assertIs<TusLocalFileException>(error, "was $error")
-            // NSURLSession may abort the second request before the server logs it; it must never be retried.
-            assertTrue(server.log.count { it.method == "PATCH" } in 1..2, "${server.log}")
-            assertEquals(256 * 1024, server.data.size, "the truncated second chunk is not stored")
+            val patches = server.log.filter { it.method == "PATCH" }
+            // NSURLSession may abort the second request before the server even logs it; it is never retried.
+            assertTrue(patches.size in 1..2, "${server.log}")
+            // The second request never completes: the client aborts it, so the server sees at most a body shorter
+            // than its Content-Length (logged "aborted"), never a finished request with fewer bytes.
+            assertTrue(patches.drop(1).all { it.result == "aborted" }, "${server.log}")
+            assertEquals(256 * 1024, server.data.size, "only the first chunk is stored: ${server.log}")
+        }
+    }
+
+    /** A block that adds a query parameter (an auth token, say) is not mistaken for a followed redirect. */
+    @Test
+    fun aQueryParameterAddedByTheBlock_isNotARedirect() = runBlocking {
+        PosixTusServer().use { server ->
+            val bytes = payload(300 * 1024)
+            withTimeout(30_000) {
+                client().use { it.createAndUploadTus("${server.baseUrl}/files", TrackingFile(bytes),
+                    options = TusUploadOptions(chunkSize = 256 * 1024, retryOptions = quickRetry())) {
+                    url { parameters.append("token", "a b/c") }
+                } }
+            }
+            assertContentEquals(bytes, server.data)
         }
     }
 

@@ -253,7 +253,10 @@ private suspend fun classifyResponse(
     // The client followed a redirect on its own (HttpClient followRedirects = true): the answer came
     // from somewhere else than the upload URL.
     val answeredUrl = response.call.request.url
-    val target = try { Url(targetUrl) } catch (e: Exception) { null }
+    // The URL Ktus actually requested, after the caller's block (which may, for example, add a query parameter).
+    // A followed redirect copies the attributes, so a different answered URL means a redirect.
+    val target = response.call.request.attributes.getOrNull(RequestTargetKey)
+        ?: try { Url(targetUrl) } catch (e: Exception) { null }
     if (target != null && !sameTarget(answeredUrl, target)) {
         return Outcome.Fail(RedirectedAnswerException(
             "tus ${op.method} to $targetUrl was answered by $answeredUrl; the client followed a redirect. " +
@@ -457,4 +460,12 @@ internal suspend fun <T> retryWithBackoff(
             if (!backoff.awaitRetry(attempts, null)) throw e
         }
     }
+}
+
+/** The URL of a tus request as Ktus built it, after the caller's request block. */
+internal val RequestTargetKey = io.ktor.util.AttributeKey<Url>("KtusRequestTarget")
+
+/** Records the request's URL once the caller's block has run; see [RequestTargetKey]. */
+internal fun io.ktor.client.request.HttpRequestBuilder.markRequestTarget() {
+    attributes.put(RequestTargetKey, url.build())
 }

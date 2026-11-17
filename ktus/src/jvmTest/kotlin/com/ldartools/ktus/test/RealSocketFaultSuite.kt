@@ -368,6 +368,24 @@ abstract class RealSocketFaultSuite {
         }
     }
 
+    // (10) a block that adds a query parameter is not a redirect -----------------------------------------
+
+    @Test
+    fun aQueryParameterAddedByTheBlock_isNotARedirect() = runBlocking {
+        RealSocketTusServer().use { server ->
+            val bytes = payload(300 * 1024)
+            withTimeout(30_000) {
+                client().use { client ->
+                    client.createAndUploadTus("${server.baseUrl}/files", TrackingFile(bytes),
+                        options = TusUploadOptions(chunkSize = 256 * 1024, retryOptions = quickRetry())) {
+                        url { parameters.append("token", "a b/c") }
+                    }
+                }
+            }
+            assertContentEquals(bytes, server.data)
+        }
+    }
+
     // (6) ------------------------------------------------------------------------------------------------
 
     @Test

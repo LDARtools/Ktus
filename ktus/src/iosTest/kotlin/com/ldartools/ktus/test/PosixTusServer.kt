@@ -198,6 +198,9 @@ class PosixTusServer : AutoCloseable {
             }
             "PATCH" -> {
                 val bytes = body()
+                // A body shorter than its Content-Length means the client aborted the request: like a server that
+                // only applies complete requests, store nothing (and answer nothing).
+                if (contentLength != null && bytes.size.toLong() != contentLength) { log("aborted"); return }
                 val accepted = locked {
                     if (requestOffset == stored.size.toLong()) { stored += bytes; true } else false
                 }
