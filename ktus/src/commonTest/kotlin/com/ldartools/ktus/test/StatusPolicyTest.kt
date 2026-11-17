@@ -182,7 +182,7 @@ class StatusPolicyTest {
                 server.script(method, Reply.Status(status, body = "nope"))
                 val error = assertFailsWith<TusHttpException>("$method $status") {
                     runOperation(server.client(expectSuccess = false), method,
-                        TusUploadOptions(retryOptions = fastRetry()), InMemoryTusFile("f", testBytes(fileSize)))
+                        TusUploadOptions(chunkSize = 100, retryOptions = fastRetry()), InMemoryTusFile("f", testBytes(fileSize)))
                 }
                 assertEquals(status, error.statusCode, "$method $status")
                 assertEquals(method.value, error.method)

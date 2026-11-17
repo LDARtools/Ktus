@@ -237,9 +237,11 @@ A HEAD showing `offset < total` lets the upload continue, but does **not** resol
 without affinity, the HEAD may be answered by a stale server instance. While the final chunk is unresolved,
 **every** failure that ends the call (404/410, retries or budget exhausted, a network error, an HTTP error, a
 protocol or validation error, a closed client) is reported as **`TusUploadOutcomeUnknownException`**, with the
-original failure as its `cause`. The one exception is a direct refusal of the very first final PATCH (a 4xx
-answered to it, with nothing unresolved before): the server answered, so the bytes did not land, and the
-original error is thrown. Cancelling the caller still throws `CancellationException`.
+original failure as its `cause`. The one exception is a **definitive refusal**: the PATCH carrying the last bytes was answered with a 4xx, a redirect, or failed on a
+short local read, and no final PATCH earlier in the same call (or in an earlier call, for a marked entry) ended
+without a definitive answer. Any 5xx is never definitive: a server may answer 5xx after it stored the bytes.
+On a definitive refusal the original error is thrown. Cancelling the caller still throws
+`CancellationException`.
 
 `TusUploadOutcomeUnknownException` deliberately does **not** extend `IOException` or `TusProtocolException`, so a
 generic "network error, retry later" or "expired, re-create" handler does not swallow it.
@@ -250,8 +252,8 @@ marked entry is never dropped or re-created: a later call that gets 404/410 for 
 it is never dropped or re-created. If the caller's coroutine is cancelled while the final PATCH is in flight,
 the `CancellationException` propagates as coroutines require; the marked entry is how the next call knows.
 A HEAD never clears the mark (it may be answered by a stale server instance); only a PATCH answered `204` with
-an offset below the total does, because that proves the upload still exists and is incomplete, or a direct
-refusal of the first final PATCH. A malformed answer to the final PATCH (a `2xx` with a missing or impossible
+an offset below the total does, because that proves the upload still exists and is incomplete, or a definitive
+refusal of the final PATCH (see above). A malformed answer to the final PATCH (a `2xx` with a missing or impossible
 `Upload-Offset`) is an unknown outcome too.
 
 **A marked entry stays in the store until you remove it**, even when a later call gets a definitive answer from
@@ -280,8 +282,9 @@ Behind a gateway (for example Azure Front Door) with no session affinity, a PATC
 but the next PATCH can reach a different server instance while the first one is still appending. tusdotnet locks
 an upload per process, not across instances, so two instances can write to the same upload at once if they
 share its storage. Check that your server is safe for that (a storage-level lock, affinity, or a single
-writer), or raise `RetryOptions.initialDelayMillis` so retries after a timeout wait longer than the origin's own
-request timeout.
+writer), or set `RetryOptions.minDelayMillis` above the origin's own request timeout, so every retry waits at
+least that long (it is a floor applied after the jitter; raising `initialDelayMillis` alone does not guarantee
+it, because full jitter can draw any delay down to 0).
 
 **When you get this exception, check on your server whether the file arrived before uploading it again**, then
 resolve the store entry yourself:

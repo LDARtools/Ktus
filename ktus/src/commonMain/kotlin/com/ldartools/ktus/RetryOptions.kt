@@ -32,6 +32,9 @@ import kotlin.time.TimeSource
  * @param honorRetryAfter wait at least as long as a `Retry-After` header asks (default true).
  * @param jitter randomise each delay within its bound (default true). Turn off only for deterministic tests.
  * @param random random source for the jitter. Replace only in tests.
+ * @param minDelayMillis the shortest wait before any retry, applied after the jitter (default 0). Still limited
+ *   by the remaining [maxElapsedMillis]. Use it to make retries after a gateway timeout wait longer than the
+ *   origin's own request timeout; with full jitter, raising [initialDelayMillis] alone does not guarantee that.
  * @param timeSource monotonic clock for [maxElapsedMillis]. Replace only in tests (for example with
  *   `TestCoroutineScheduler.timeSource`).
  */
@@ -47,6 +50,7 @@ data class RetryOptions(
     val jitter: Boolean = true,
     val random: Random = Random.Default,
     val timeSource: TimeSource = TimeSource.Monotonic,
+    val minDelayMillis: Long = 0L,
 ) {
     init {
         require(maxRetries >= 1) { "maxRetries must be at least 1 (it counts attempts, including the first)" }
@@ -54,6 +58,7 @@ data class RetryOptions(
         require(maxDelayMillis >= 0) { "maxDelayMillis must not be negative" }
         require(factor >= 1.0) { "factor must be at least 1.0" }
         require(maxElapsedMillis >= 0) { "maxElapsedMillis must not be negative" }
+        require(minDelayMillis >= 0) { "minDelayMillis must not be negative" }
     }
 
     /** Binary-compatibility constructor for callers compiled against Ktus 1.0.x. */

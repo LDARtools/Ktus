@@ -3,6 +3,8 @@ package com.ldartools.ktus
 import io.ktor.http.ContentType
 import io.ktor.http.content.OutgoingContent
 import io.ktor.utils.io.ByteWriteChannel
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -29,10 +31,22 @@ internal class TusPatchContent(
     override val contentType: ContentType = OFFSET_OCTET_STREAM
 
     private val abandoned = Job()
+    private val localError = CompletableDeferred<TusLocalFileException>()
+
+    /** A [TusLocalFileException] the file raised while this body was written, whatever the engine reported. */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun localFailure(): TusLocalFileException? = if (localError.isCompleted) localError.getCompleted() else null
 
     override suspend fun writeTo(channel: ByteWriteChannel) {
         coroutineScope {
-            val write = async { file.writeSection(offset, length, channel) }
+            val write = async {
+                try {
+                    file.writeSection(offset, length, channel)
+                } catch (e: TusLocalFileException) {
+                    localError.complete(e)
+                    throw e
+                }
+            }
             val watcher = launch {
                 abandoned.join()
                 write.cancel()

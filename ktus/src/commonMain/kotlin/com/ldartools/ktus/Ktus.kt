@@ -230,7 +230,8 @@ suspend fun HttpClient.createAndUploadTus(
  * PATCH's outcome cannot be established, [TusUploadOutcomeUnknownException] is thrown and the marked entry is
  * kept: later calls keep throwing it (a marked entry is never dropped or re-created) until you have checked
  * the server and removed the entry from [store]. A HEAD never clears the mark; only a later PATCH answered 204
- * below the total does (or a direct refusal of the first final PATCH, which proves the bytes did not land).
+ * below the total does, or a definitive refusal of the final PATCH (a 4xx, a redirect or a short local read, with
+ * no earlier final PATCH in the call left without a definitive answer); a 5xx is never definitive.
  * If the store cannot remove the entry after the upload completed, the call still succeeds; the entry stays
  * marked and the next call for it reports [TusUploadOutcomeUnknownException]. [store] writes must be durable
  * when they return; see [TusUrlStore].
@@ -313,13 +314,13 @@ private suspend fun HttpClient.resumeOrCreateInternal(
         } catch (e: TusLocalFileException) {
             throw e // a problem with the file itself; the entry stays as it is
         } catch (e: TusUploadExpiredException) {
-            // Only reaches here when it is definitive: a 404/410 answered directly to the first final PATCH,
-            // with nothing unresolved before it (anything else is TusUploadOutcomeUnknownException). The
-            // server never had the upload, so forget it.
+            // Only reaches here when it is definitive: a 404/410 answered to the final PATCH with no earlier final
+            // PATCH left unknown (anything else is TusUploadOutcomeUnknownException). The server never had
+            // the upload, so forget it.
             guardedStore { store.remove(fingerprint) }
             throw e
         } catch (e: Throwable) {
-            // Also definitive (for example a 403 answered directly to the first final PATCH): the bytes did not
+            // Also definitive (for example a 403 answered to the final PATCH, never a 5xx): the bytes did not
             // land, so the mark set for that PATCH no longer applies.
             if (entry.finalSentAt != null) {
                 entry = entry.copy(finalSentAt = null)
@@ -490,6 +491,7 @@ private fun isPermanentStatus(status: Int, retry: RetryOptions): Boolean =
 /** A server-side failure that justifies dropping a stored upload and creating a new one. */
 private fun isPermanentFailure(e: TusProtocolException, retry: RetryOptions): Boolean = when (e) {
     is TusLocalFileException -> false // the file is the problem, not the upload
+    is TusOffsetMismatchException -> false // may be a stale HEAD; keep the entry and try again later
     is TusHttpException -> isPermanentStatus(e.statusCode, retry)
     else -> true
 }
@@ -631,6 +633,10 @@ private suspend fun HttpClient.uploadInternal(
     // An HTTP refusal answered directly to a final PATCH when nothing earlier was unresolved: the server
     // never had the bytes, so this failure is definitive rather than unknown.
     var freshDefinitiveRefusal = false
+    // Some final PATCH in this call (or a previous call, for a flagged entry) ended without a definitive answer.
+    // Even if a later 204 resolved it, it may still be running on another server instance, so no later
+    // refusal is treated as definitive.
+    var finalEverUncertain = finalMayHaveLanded
 
     suspend fun provedIncomplete() {
         finalMayHaveLanded = false
@@ -682,7 +688,7 @@ private suspend fun HttpClient.uploadInternal(
             val body = TusPatchContent(file, start, length)
             // Written on the engine's thread, read here: a CompletableDeferred is safe across threads.
             val callbackError = CompletableDeferred<Throwable>()
-            val outcome = try {
+            val attemptOutcome = try {
                 attemptTus(TusOp.PATCH, uploadUrl, retry, client = this, onActivity = onActivity, heartbeatMillis = heartbeat) {
                     patch(urlString = uploadUrl) {
                         tusVersionHeader()
@@ -709,6 +715,8 @@ private suspend fun HttpClient.uploadInternal(
                 body.abandon()
             }
             if (callbackError.isCompleted) throw CallbackFailure(callbackError.getCompleted())
+            // A problem reading the file, however the engine reported it (some wrap or replace the exception).
+            val outcome = body.localFailure()?.let { Outcome.Fail(it) } ?: attemptOutcome
 
             when (outcome) {
                 is Outcome.Ok -> {
@@ -739,15 +747,23 @@ private suspend fun HttpClient.uploadInternal(
                     if (isFinal) {
                         // No HTTP answer (for example the client was closed mid-request): unknown outcome.
                         if (error !is TusProtocolException && error !is ResponseException) finalMayHaveLanded = true
-                        if (!unresolvedBefore && (error is TusProtocolException || error is ResponseException)) {
+                        // Definitive only when the server (or the local file) answered, with a 4xx, a redirect or a
+                        // short read, and no final PATCH in this call ever ended unknown. Any 5xx may come after
+                        // the bytes were stored, so it is never definitive.
+                        if (!unresolvedBefore && !finalEverUncertain && isDefinitiveRefusal(error)) {
                             freshDefinitiveRefusal = true
+                        } else {
+                            finalEverUncertain = true
                         }
                     }
                     throw error
                 }
 
                 is Outcome.Retry -> {
-                    if (isFinal) finalMayHaveLanded = true
+                    if (isFinal) {
+                        finalMayHaveLanded = true
+                        finalEverUncertain = true
+                    }
                     if (outcome.timedOut && options.adaptiveChunkSize) {
                         chunkSize = max(minChunkSize, chunkSize / 2)
                     }
@@ -786,12 +802,22 @@ private suspend fun HttpClient.uploadInternal(
         throw e
     } catch (e: Throwable) {
         // Once a final PATCH has been sent and not proved incomplete by a later 204, any failure leaves the
-        // outcome unknown; only a direct refusal of the first final PATCH is definitive.
+        // outcome unknown; only a definitive refusal (4xx, redirect, short read) with no earlier unknown final
+        // PATCH in the call is not.
         if (finalMayHaveLanded || (finalUnresolved && !freshDefinitiveRefusal)) {
             throw TusUploadOutcomeUnknownException(uploadUrl, e)
         }
         throw e
     }
+}
+
+/** A refusal of a PATCH that proves its bytes did not (all) land: a 4xx, a redirect, or a short local read. */
+private fun isDefinitiveRefusal(error: Throwable): Boolean = when (error) {
+    is TusHttpException -> error.statusCode in 400..499
+    is ResponseException -> error.response.status.value in 400..499
+    is TusUploadExpiredException, is TusLocalFileException -> true
+    is TusProtocolException -> true // a redirect or another protocol error raised for a 3xx/4xx answer
+    else -> false
 }
 
 private fun patchRetriesExhausted(outcome: Outcome.Retry, attempts: Int): Throwable {

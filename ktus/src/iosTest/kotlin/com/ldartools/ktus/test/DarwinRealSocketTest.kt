@@ -168,6 +168,31 @@ class DarwinRealSocketTest {
         }
     }
 
+    /** A file that is shorter than its size mid-PATCH: TusLocalFileException, not retried, nothing truncated stored. */
+    class ShortFile(private val bytes: ByteArray, private val claimed: Long) : ITusFile {
+        override val size: Long get() = claimed
+        override val name: String get() = "short.bin"
+        override suspend fun readSection(offset: Long, length: Long): ByteReadChannel =
+            ByteReadChannel(bytes.copyOfRange(offset.toInt(), minOf(bytes.size.toLong(), offset + length).toInt()))
+        override suspend fun fileReadLock(): AutoCloseable = AutoCloseable { }
+    }
+
+    @Test
+    fun aShortRead_isALocalFileError_andIsNotRetried() = runBlocking {
+        PosixTusServer().use { server ->
+            val file = ShortFile(payload(300 * 1024), claimed = 512 * 1024)
+            val error = assertFails {
+                withTimeout(30_000) {
+                    client().use { it.createAndUploadTus("${server.baseUrl}/files", file,
+                        options = TusUploadOptions(chunkSize = 256 * 1024, retryOptions = quickRetry())) }
+                }
+            }
+            assertIs<TusLocalFileException>(error, "was $error")
+            assertEquals(2, server.log.count { it.method == "PATCH" }, "${server.log}")
+            assertEquals(256 * 1024, server.data.size, "the truncated second chunk is not stored")
+        }
+    }
+
     @Test
     fun cancellingMidPatch_leavesNoOpenFile() = runBlocking {
         PosixTusServer().use { server ->

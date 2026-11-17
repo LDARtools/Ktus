@@ -23,6 +23,8 @@ Two new failure types are not `IOException`s, so a "network error, retry later" 
 - `TusUpload.finalSentAt`: set by `resumeOrCreateAndUploadTus` before the final PATCH; a marked entry is never
   dropped or re-created.
 - `TusLocalFileException` (a `TusProtocolException`) for problems with the local file (size changed, short read).
+- `RetryOptions.minDelayMillis` (default 0): a floor for every retry delay, applied after the jitter and still
+  limited by the remaining budget.
 - `TusUploadOptions.activityHeartbeatMillis` (default 5 s; null turns it off): `onActivity` ticks while a
   request is in flight.
 - `onFinalPatch` callback on `uploadTus`, `createAndUploadTus` and `resumeOrCreateAndUploadTus`: called right
@@ -123,12 +125,18 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
   `TusUploadExpiredException`.
 - **Once a final PATCH has been sent in a call, it stays unresolved** until the server shows `offset == total` or
   a later PATCH is answered 204 below the total; a HEAD never resolves it. While unresolved, every failure of
-  the call is `TusUploadOutcomeUnknownException` (except a direct 4xx refusal of the first final PATCH).
-- **The `finalSentAt` mark is only cleared by a PATCH answered 204 below the total** (or a direct refusal of the
-  first final PATCH), never by a HEAD (which can be stale). The closed-client check runs before the mark is
+  the call is `TusUploadOutcomeUnknownException`. The only exception is a definitive refusal of a final PATCH:
+  a 4xx, a redirect or a short local read, when no final PATCH earlier in the call (or in an earlier call, for a
+  marked entry) ended without a definitive answer. A 5xx answered to a final PATCH is never definitive.
+- **The `finalSentAt` mark is only cleared by a PATCH answered 204 below the total** (or a definitive refusal of
+  the final PATCH), never by a HEAD (which can be stale). The closed-client check runs before the mark is
   written, so a PATCH that was never sent leaves no mark. If removing the entry fails after the upload
   completed, the call still succeeds.
-- **`TusUrlStore` writes must be durable when they return.** Any failure of a marked entry, including a permanent 4xx, is `TusUploadOutcomeUnknownException`;
+- **`TusUrlStore` writes must be durable when they return.**
+- **`TusOffsetMismatchException` no longer makes `resumeOrCreateAndUploadTus` drop a stored upload** (it can be
+  caused by a stale HEAD); the entry is kept.
+- **A short read is reported as `TusLocalFileException` on every engine**, including Darwin, whatever exception
+  the engine raised for the aborted body. Any failure of a marked entry, including a permanent 4xx, is `TusUploadOutcomeUnknownException`;
   a marked entry is never dropped or re-created. A 2xx answer to the final PATCH with a missing or impossible
   `Upload-Offset` is an unknown outcome too, and so is a client closed while the final PATCH is in flight.
 - **`OkioTusFile` reports a missing or deleted file as `TusLocalFileException`** (not retried); it used to report

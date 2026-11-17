@@ -12,8 +12,8 @@ import kotlinx.coroutines.sync.withLock
  *   `Upload-Expires` header of the creation response; null when the server did not say.
  * @property finalSentAt set (epoch milliseconds) by [resumeOrCreateAndUploadTus] just before it sends the PATCH
  *   carrying the last bytes. It is cleared only when a later PATCH is answered 204 with an offset below the
- *   total (which proves the upload still exists and is incomplete), or when the server refuses that first
- *   final PATCH directly. A HEAD never clears it: it may be answered by a stale server instance. While it is
+ *   total (which proves the upload still exists and is incomplete), or when the final PATCH gets a definitive
+ *   refusal (a 4xx, a redirect or a short local read, with no earlier final PATCH left unknown; never a 5xx). A HEAD never clears it: it may be answered by a stale server instance. While it is
  *   set the upload's outcome may be unknown: Ktus never re-creates the upload, and any failure (a 404/410
  *   included) throws [TusUploadOutcomeUnknownException]. Persist it with the rest of the entry.
  */

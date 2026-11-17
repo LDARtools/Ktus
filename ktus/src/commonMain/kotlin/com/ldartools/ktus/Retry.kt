@@ -93,7 +93,7 @@ internal class Backoff(
         val remaining = options.maxElapsedMillis - start.elapsedNow().inWholeMilliseconds
         if (remaining <= 0) return false
 
-        var wait = maxOf(nextDelayMillis(failures), floorMillis)
+        var wait = maxOf(nextDelayMillis(failures), floorMillis, options.minDelayMillis)
         if (retryAfterMillis != null && options.honorRetryAfter) {
             // Honour the server, but never wait longer than max(maxDelayMillis, 60 s) for one retry.
             wait = maxOf(wait, min(retryAfterMillis, maxOf(options.maxDelayMillis, MAX_RETRY_AFTER_MILLIS)))

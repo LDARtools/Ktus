@@ -387,3 +387,140 @@ class FinalPatchFlagTest {
         assertNotNull(inner.get("fp")?.finalSentAt, "the entry stays marked")
     }
 }
+
+/** Sixth review: a 5xx answered to the final PATCH is never definitive. */
+class Adv6DefinitiveRefusalTest {
+    private val createUrl = "https://example.com/files"
+
+    private fun TestScope.opts(retryable: Set<Int> = RetryOptions.DEFAULT_RETRYABLE_STATUS_CODES) =
+        TusUploadOptions(chunkSize = 500, activityHeartbeatMillis = null,
+            retryOptions = RetryOptions(maxRetries = 3, initialDelayMillis = 10, maxDelayMillis = 10, jitter = false,
+                retryableStatusCodes = retryable, timeSource = testScheduler.timeSource))
+
+    /** Server stores + processes the file, then answers 507 (a non-retried 5xx). */
+    @Test
+    fun adv6_non_retried_5xx_after_final_landed_is_outcome_unknown() = runTest {
+        val srv = Srv(1000)
+        srv.finalReply = { _ -> HttpStatusCode.InsufficientStorage to emptyList() }
+        val e = runCatching {
+            srv.client().createAndUploadTus(createUrl, InMemoryTusFile("f", testBytes(1000)), options = opts())
+        }.exceptionOrNull()
+        assertEquals(1, srv.processed.size)
+        assertIs<TusUploadOutcomeUnknownException>(e, "got $e although the server processed the file")
+    }
+
+    /** Chateau's server answers 500 when the body was stored but the import could not start. */
+    @Test
+    fun adv6_500_with_narrowed_retryable_codes_after_final_landed_is_outcome_unknown() = runTest {
+        val srv = Srv(1000)
+        srv.finalReply = { _ -> HttpStatusCode.InternalServerError to emptyList() }
+        val e = runCatching {
+            srv.client().createAndUploadTus(createUrl, InMemoryTusFile("f", testBytes(1000)),
+                options = opts(retryable = setOf(503)))
+        }.exceptionOrNull()
+        assertEquals(1, srv.processed.size)
+        assertIs<TusUploadOutcomeUnknownException>(e, "got $e although the server processed the file")
+    }
+
+    /** With a store: the 5xx clears the mark, and the next call re-creates and uploads the file again. */
+    @Test
+    fun adv6_store_non_retried_5xx_after_final_landed_then_next_call_reuploads() = runTest {
+        val srv = Srv(1000)
+        val store = InMemoryTusUrlStore()
+        val file = InMemoryTusFile("f", testBytes(1000))
+        var first = true
+        srv.finalReply = { off ->
+            if (first) { first = false; HttpStatusCode.InsufficientStorage to emptyList() }
+            else HttpStatusCode.NoContent to listOf("Upload-Offset" to listOf(off.toString()))
+        }
+        val e1 = runCatching { srv.client().resumeOrCreateAndUploadTus(createUrl, file, "fp", store, options = opts()) }
+            .exceptionOrNull()
+        val markAfterFirst = store.get("fp")?.finalSentAt
+        runCatching { srv.client().resumeOrCreateAndUploadTus(createUrl, file, "fp", store, options = opts()) }
+        assertEquals(1, srv.processed.size,
+            "processed ${srv.processed.size} times; first error=$e1, mark after first call=$markAfterFirst")
+    }
+
+    /** Every non-retried 5xx answered to the final PATCH is an unknown outcome. */
+    @Test
+    fun everyNonRetried5xx_onTheFinalPatch_isOutcomeUnknown() = runTest {
+        for (status in listOf(500, 501, 505, 507, 508, 511)) {
+            val server = ScriptedTusServer().apply { uploadLength = 500 }
+            server.script(HttpMethod.Patch, Reply.Status(status))
+            val e = assertFailsWith<TusUploadOutcomeUnknownException>("$status") {
+                server.client().uploadTus("https://example.com/files/abc", InMemoryTusFile("f", testBytes(500)),
+                    options = opts(retryable = setOf(503)))
+            }
+            assertEquals(status, (e.cause as TusHttpException).statusCode)
+        }
+    }
+
+    /** L1: a final PATCH that once ended unknown taints every later refusal in the call, even after a 204. */
+    @Test
+    fun aRefusalAfterAnEarlierUnknownFinalPatch_isOutcomeUnknown_evenAfterA204() = runTest {
+        val server = ScriptedTusServer().apply { uploadLength = 1000 }
+        // 0..500 ok; final 500..1000 times out (504, halves); HEAD 500; 500..750 -> 204 750 (resolves);
+        // final 750..1000 -> 404.
+        server.script(HttpMethod.Patch, Reply.Status(204, mapOf("Upload-Offset" to "500"), apply = true),
+            Reply.Status(504), Reply.Status(204, mapOf("Upload-Offset" to "750"), apply = true), Reply.Status(404))
+        val e = assertFailsWith<TusUploadOutcomeUnknownException> {
+            server.client().uploadTus("https://example.com/files/abc", InMemoryTusFile("f", testBytes(1000)),
+                options = TusUploadOptions(chunkSize = 500, minChunkSize = 100, activityHeartbeatMillis = null,
+                    retryOptions = RetryOptions(maxRetries = 3, initialDelayMillis = 10, maxDelayMillis = 10,
+                        jitter = false, timeSource = testScheduler.timeSource)))
+        }
+        assertIs<TusUploadExpiredException>(e.cause)
+        assertEquals(listOf(0L, 500L, 500L, 750L), server.patchOffsets())
+    }
+
+    /** L2: minDelayMillis is a floor after jitter. */
+    @Test
+    fun minDelayMillis_isAFloorAfterJitter() = runTest {
+        val server = ScriptedTusServer(clock = { currentTime })
+        repeat(5) { server.script(HttpMethod.Post, Reply.Status(503)) }
+        server.client().createTusUpload(createUrl, InMemoryTusFile("f", testBytes(10)),
+            options = TusUploadOptions(checkServerCapabilities = false, retryOptions = RetryOptions(
+                initialDelayMillis = 1_000, maxDelayMillis = 10_000, minDelayMillis = 4_000,
+                random = kotlin.random.Random(3), timeSource = testScheduler.timeSource)))
+        val gaps = server.times(HttpMethod.Post).zipWithNext { a, b -> b - a }
+        assertEquals(5, gaps.size)
+        assertTrue(gaps.all { it >= 4_000 }, "$gaps")
+
+        // Without jitter the floor only lifts the short early delays.
+        val plain = ScriptedTusServer(clock = { currentTime })
+        repeat(5) { plain.script(HttpMethod.Post, Reply.Status(503)) }
+        plain.client().createTusUpload(createUrl, InMemoryTusFile("f", testBytes(10)),
+            options = TusUploadOptions(checkServerCapabilities = false, retryOptions = RetryOptions(
+                initialDelayMillis = 1_000, maxDelayMillis = 10_000, minDelayMillis = 4_000, jitter = false,
+                timeSource = testScheduler.timeSource)))
+        assertEquals(listOf(4_000L, 4_000L, 4_000L, 8_000L, 10_000L), plain.times(HttpMethod.Post).zipWithNext { a, b -> b - a })
+    }
+
+    @Test
+    fun minDelayMillis_isStillCappedByTheBudget() = runTest {
+        val server = ScriptedTusServer(clock = { currentTime })
+        repeat(5) { server.script(HttpMethod.Post, Reply.Status(503)) }
+        assertFailsWith<TusHttpException> {
+            server.client().createTusUpload(createUrl, InMemoryTusFile("f", testBytes(10)),
+                options = TusUploadOptions(checkServerCapabilities = false, retryOptions = RetryOptions(
+                    minDelayMillis = 60_000, maxElapsedMillis = 5_000, timeSource = testScheduler.timeSource)))
+        }
+        assertEquals(5_000, currentTime)
+    }
+
+    /** L3: an offset mismatch (for example a stale HEAD) keeps the stored entry. */
+    @Test
+    fun anOffsetMismatchOnAStoredUpload_keepsTheEntry() = runTest {
+        val server = ScriptedTusServer().apply { uploadLength = 1000 }
+        server.script(HttpMethod.Patch, Reply.Status(204, mapOf("Upload-Offset" to "300"), apply = true), Reply.Status(503))
+        server.script(HttpMethod.Head, Reply.Status(200, mapOf("Upload-Offset" to "0", "Upload-Length" to "1000")),
+            Reply.Status(200, mapOf("Upload-Offset" to "100", "Upload-Length" to "1000")))
+        val store = InMemoryTusUrlStore().apply { set("fp", TusUpload("https://example.com/files/old", 1000, null)) }
+        assertFailsWith<TusOffsetMismatchException> {
+            server.client().resumeOrCreateAndUploadTus(createUrl, InMemoryTusFile("f", testBytes(1000)), "fp", store,
+                options = opts())
+        }
+        assertEquals(0, server.count(HttpMethod.Post))
+        assertNotNull(store.get("fp"))
+    }
+}

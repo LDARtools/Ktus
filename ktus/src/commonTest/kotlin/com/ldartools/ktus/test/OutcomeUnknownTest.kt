@@ -222,17 +222,18 @@ class OutcomeUnknownTest {
     }
 
     @Test
-    fun a204BelowTheTotal_resolvesTheFinalPatch_andAFreshRefusalAfterThatIsDefinitive() = runTest {
+    fun a204BelowTheTotal_resolvesTheFinalPatch_butAnEarlierUnknownFinalPatchTaintsLaterRefusals() = runTest {
         val server = ScriptedTusServer().apply { uploadLength = 1000 }
-        // 0..500 ok; final 500..1000 answered 504 (not stored) -> chunk halves; HEAD 500; 500..750 answered 204
-        // (resolves); final 750..1000 refused 403 directly: a definitive answer.
+        // 0..500 ok; final 500..1000 answered 504 -> chunk halves; HEAD 500; 500..750 answered 204 (resolves, the
+        // upload continues); final 750..1000 refused 403. The 504'd PATCH may still be running on another
+        // instance, so even that refusal is not definitive.
         server.script(HttpMethod.Patch, Reply.Status(204, mapOf("Upload-Offset" to "500"), apply = true),
             Reply.Status(504), Reply.Status(204, mapOf("Upload-Offset" to "750"), apply = true), Reply.Status(403))
-        val e = assertFailsWith<TusHttpException> {
+        val e = assertFailsWith<TusUploadOutcomeUnknownException> {
             server.client().uploadTus(url, InMemoryTusFile("f", testBytes(1000)),
                 options = TusUploadOptions(chunkSize = 500, minChunkSize = 100, retryOptions = retry()))
         }
-        assertEquals(403, e.statusCode)
+        assertEquals(403, (e.cause as TusHttpException).statusCode)
         assertEquals(listOf(0L, 500L, 500L, 750L), server.patchOffsets())
     }
 
