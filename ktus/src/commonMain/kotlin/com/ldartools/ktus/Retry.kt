@@ -11,7 +11,9 @@ import io.ktor.http.Url
 import io.ktor.http.fromHttpToGmtDate
 import io.ktor.util.date.GMTDate
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.io.IOException
 import kotlin.math.min
 import kotlin.math.pow
@@ -83,7 +85,10 @@ internal class Backoff(private val options: RetryOptions) {
         if (remaining <= 0) return false
 
         var wait = nextDelayMillis(failures)
-        if (retryAfterMillis != null && options.honorRetryAfter) wait = maxOf(wait, retryAfterMillis)
+        if (retryAfterMillis != null && options.honorRetryAfter) {
+            // Honour the server, but never wait longer than max(maxDelayMillis, 60 s) for one retry.
+            wait = maxOf(wait, min(retryAfterMillis, maxOf(options.maxDelayMillis, MAX_RETRY_AFTER_MILLIS)))
+        }
         delay(min(wait, remaining))
         return true
     }
@@ -94,6 +99,9 @@ internal class Backoff(private val options: RetryOptions) {
         return if (options.jitter && bound > 0) options.random.nextLong(0, bound + 1) else bound
     }
 }
+
+/** The longest single wait a `Retry-After` can impose, unless [RetryOptions.maxDelayMillis] is larger. */
+internal const val MAX_RETRY_AFTER_MILLIS = 60_000L
 
 internal fun delayBoundMillis(options: RetryOptions, failure: Int): Long {
     val raw = options.initialDelayMillis * options.factor.pow((failure - 1).coerceAtLeast(0).toDouble())
@@ -114,7 +122,13 @@ internal suspend fun attemptTus(
         val response = send()
         classifyResponse(op, targetUrl, response, options, cause = null)
     } catch (e: CancellationException) {
-        throw e
+        // Only a cancelled caller is a cancellation. An engine can also throw CancellationException when
+        // its own call or connection is torn down; for an active caller that is a network failure.
+        currentCoroutineContext().ensureActive()
+        Outcome.Retry(
+            cause = IOException("The HTTP engine cancelled the ${op.method} request", e),
+            statusCode = null, body = null, retryAfterMillis = null, timedOut = false,
+        )
     } catch (e: ResponseException) {
         // expectSuccess = true: Ktor threw instead of returning the response. Classify the same way.
         classifyResponse(op, targetUrl, e.response, options, cause = e)
@@ -231,7 +245,11 @@ private suspend fun readBodySnippet(op: TusOp, response: HttpResponse): String? 
  */
 internal fun parseRetryAfterMillis(response: HttpResponse): Long? {
     val value = response.headers[HttpHeaders.RetryAfter]?.trim()?.takeIf { it.isNotEmpty() } ?: return null
-    value.toLongOrNull()?.let { seconds -> return if (seconds < 0) null else seconds * 1000 }
+    if (value.all { it.isDigit() }) {
+        // Delta-seconds, saturating instead of overflowing.
+        val seconds = value.toLongOrNull() ?: return Long.MAX_VALUE
+        return if (seconds > Long.MAX_VALUE / 1000) Long.MAX_VALUE else seconds * 1000
+    }
     val until = parseHttpDate(value) ?: return null
     val now = response.headers[HttpHeaders.Date]?.let { parseHttpDate(it) } ?: GMTDate().timestamp
     return (until - now).coerceAtLeast(0)
@@ -250,8 +268,9 @@ private fun Throwable.isTimeout(): Boolean {
         // A connect timeout says nothing about the chunk size.
         if (current is ConnectTimeoutException) return false
         if (current is HttpRequestTimeoutException || current is SocketTimeoutException) return true
-        // Engines differ in which timeout type they surface (for example java.net.SocketTimeoutException).
-        if (current::class.simpleName?.contains("Timeout") == true) return true
+        // Fallback for platform timeouts Ktor does not wrap (for example java.net.SocketTimeoutException
+        // or a Darwin timeout): an IOException whose class name ends in "TimeoutException".
+        if (current is IOException && current::class.simpleName?.endsWith("TimeoutException") == true) return true
         current = current.cause.takeIf { it !== current }
     }
     return false

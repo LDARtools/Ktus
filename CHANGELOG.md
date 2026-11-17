@@ -30,7 +30,10 @@ against 1.1.0.
   `expectSuccess` set. In 1.0.x, with the default `expectSuccess = false`, a 5xx on OPTIONS, POST or HEAD
   failed at once, and a 5xx on PATCH was retried with no delay.
 - Retryable statuses are 408, 423, 429, 500, 502, 503 and 504, plus 401 (so the request block can refresh a
-  token). `Retry-After` (seconds or HTTP-date) is honoured.
+  token). `Retry-After` (seconds or HTTP-date) is honoured, up to max(`maxDelayMillis`, 60 s) per wait and
+  never beyond the remaining budget.
+- A `CancellationException` thrown by the HTTP engine while the caller is still active is treated as a network
+  failure and retried; cancelling the caller still stops the upload at once.
 - 404/410 from POST or OPTIONS is now a `TusHttpException`, not a `TusUploadExpiredException`; 404/410 from
   HEAD or PATCH is still `TusUploadExpiredException`.
 - Any other 4xx/5xx is a `TusHttpException` carrying the status. With `expectSuccess = true` Ktor's own
@@ -63,11 +66,34 @@ against 1.1.0.
 - Any 3xx answer to a tus request is an error, and an answer that came from another origin (because the client
   followed a redirect) is rejected. Configure clients with `followRedirects = false`.
 
-### Breaking behaviour (source compatible, but observable)
-- Uploading an empty file throws `IllegalArgumentException` unless `allowEmptyUpload = true`.
-- A `Location` on another host is rejected unless that host is in `allowedUploadHosts`.
-- Metadata keys with an empty value are omitted unless `omitEmptyMetadataValues = false`.
-- Metadata keys containing non-ASCII or control characters now throw `IllegalArgumentException`.
+### Behaviour changes (source compatible, but observable)
+Code that compiled against 1.0.x compiles against 1.1.0, but these differences can be seen at run time:
+- **Empty files are rejected.** Uploading a zero-byte file throws `IllegalArgumentException` before any request,
+  unless `allowEmptyUpload = true`.
+- **Metadata keys are validated.** A key that is empty or contains anything but printable ASCII without spaces
+  or commas throws `IllegalArgumentException` (1.0.x rejected only spaces, commas and empty keys).
+- **Empty metadata values are dropped** from `Upload-Metadata` unless `omitEmptyMetadataValues = false`.
+- **A `Location` on another origin needs the allow-list.** A different host, port or scheme is rejected unless
+  the host is in `allowedUploadHosts`; https to http is always rejected, and so is a `Location` with user
+  information (`user@host`).
+- **Any 3xx answer is an error** (`TusProtocolException`), and an answer the client got by following a
+  redirect to another origin is rejected.
+- **404/410 from POST or OPTIONS** is a `TusHttpException`, no longer a `TusUploadExpiredException`.
+- **Retry defaults are longer.** `maxRetries` 3 → 10, `maxDelayMillis` 10 s → 30 s, plus a new 10-minute
+  `maxElapsedMillis` budget. Worst case for one operation that keeps failing: about 10 attempts with up to
+  30 s (random, full jitter) between them, so typically 1–2 minutes and never more than the 10-minute budget
+  plus one request. A `Retry-After` can stretch a single wait up to max(`maxDelayMillis`, 60 s). Any upload
+  progress restarts the budget. Pass `RetryOptions(maxRetries = 3, maxDelayMillis = 10_000)` for the old limits.
+- **HEAD before every re-PATCH.** After any PATCH whose outcome is unknown, Ktus waits, sends HEAD and
+  continues from the server's offset, so a retry costs one extra request. If that HEAD reports an offset below
+  one the server already confirmed, the upload fails with `TusOffsetMismatchException` instead of rewinding.
+- **A lost final response can look like an expired upload.** If the server stores the last chunk but its `204`
+  never reaches the client, the follow-up HEAD can answer 404/410 because the server has already finished
+  (and, on some servers, removed or moved) the upload. That surfaces as `TusUploadExpiredException`.
+  When it is thrown while the last chunk was in flight, check on your server whether the file arrived before
+  uploading it again.
+- **Exceptions thrown by `onProgress`** are rethrown as they are and end the upload; they are never treated as
+  network errors and retried.
 
 ### Build and CI
 - Every GitHub Action is pinned to a full commit SHA; workflows default to `permissions: contents: read`.

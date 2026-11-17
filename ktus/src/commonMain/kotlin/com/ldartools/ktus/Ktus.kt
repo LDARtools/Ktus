@@ -413,6 +413,7 @@ private suspend fun HttpClient.uploadInternal(
         patchAttempts++
 
         val body = TusPatchContent(file, start, length)
+        var callbackError: Throwable? = null
         val outcome = try {
             attemptTus(TusOp.PATCH, uploadUrl, retry) {
                 patch(urlString = uploadUrl) {
@@ -423,7 +424,13 @@ private suspend fun HttpClient.uploadInternal(
 
                     // Progress listener hook (Ktor capability): bytes handed to the engine so far.
                     onUpload { bytesSentTotal, _ ->
-                        onProgress?.invoke(start + bytesSentTotal, total)
+                        try {
+                            onProgress?.invoke(start + bytesSentTotal, total)
+                        } catch (e: Throwable) {
+                            // The caller's own failure; remembered so it is not mistaken for a network error.
+                            callbackError = e
+                            throw e
+                        }
                     }
                     block()
                 }
@@ -432,6 +439,7 @@ private suspend fun HttpClient.uploadInternal(
             // If the server answered before reading the whole body, stop writing it.
             body.abandon()
         }
+        callbackError?.let { throw it }
 
         when (outcome) {
             is Outcome.Ok -> {
@@ -463,6 +471,12 @@ private suspend fun HttpClient.uploadInternal(
                 }
                 // The PATCH may or may not have been applied: ask the server where it is.
                 val serverOffset = headOffset(uploadUrl, total, retry, backoff, block)
+                if (serverOffset < confirmed) {
+                    // The server already confirmed more than this. Rewinding would re-send data it said it
+                    // stored (and a flapping offset would loop forever), so stop.
+                    throw TusOffsetMismatchException(
+                        "HEAD reported Upload-Offset $serverOffset, below the offset $confirmed the server already confirmed")
+                }
                 if (serverOffset > start) {
                     // The server kept (some of) the data: that is progress, start a fresh failure run.
                     patchAttempts = 0

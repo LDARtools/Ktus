@@ -178,7 +178,7 @@ client has `expectSuccess` set:
 | Response | What Ktus does |
 |---|---|
 | Network error or timeout | Retry |
-| 408, 423, 429, 500, 502, 503, 504 (`RetryOptions.retryableStatusCodes`) | Retry, waiting at least as long as a `Retry-After` header asks (delta-seconds or HTTP-date) |
+| 408, 423, 429, 500, 502, 503, 504 (`RetryOptions.retryableStatusCodes`) | Retry, waiting at least as long as a `Retry-After` header asks (delta-seconds or HTTP-date), up to max(`maxDelayMillis`, 60 s) per wait |
 | 401 | Retry, so your request block can supply a fresh token (`retryOnUnauthorized`) |
 | 409 on PATCH | HEAD, then continue from the server's offset |
 | 404 / 410 on HEAD or PATCH | `TusUploadExpiredException` |
@@ -189,7 +189,12 @@ client has `expectSuccess` set:
 
 After any PATCH whose outcome is unknown (network error, timeout, a retryable status, 409, or any 2xx other than
 `204`) Ktus backs off, sends HEAD, and continues from the offset the server reports. It never re-sends a chunk
-at the old offset blindly.
+at the old offset blindly. If that HEAD reports less than the server has already confirmed, the upload fails
+with `TusOffsetMismatchException` rather than rewinding.
+
+If the last chunk's `204` is lost, the server may already have finished the upload, and the follow-up HEAD can
+answer 404/410 (`TusUploadExpiredException`). If that happens while the last chunk was in flight, check on your
+server whether the file arrived before uploading it again.
 
 Backoff uses full jitter: each delay is random in `[0, min(maxDelayMillis, initialDelayMillis * factor^n)]`.
 Retrying stops at whichever comes first:
@@ -219,7 +224,7 @@ When retries run out, a network failure is rethrown as the original `IOException
 
 - **Upload URL origin.** The `Location` of a creation response is resolved per RFC 3986. The result must be on the
   creation URL's scheme, host and port, unless its host is in `TusUploadOptions.allowedUploadHosts`. Anything else
-  is rejected, so a compromised or misconfigured server cannot send your file and your request headers (for
+  is rejected, as is any URL with user information (`user@host`), so a compromised or misconfigured server cannot send your file and your request headers (for
   example an `Authorization` header) to another host. The same check applies to URLs loaded from a `TusUrlStore`.
 - **No downgrade.** An `https` creation URL never accepts an `http` upload URL, whatever the host.
 - **No raw fallback.** An unparseable `Location` is an error; it is never used as-is.

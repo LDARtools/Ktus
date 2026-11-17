@@ -69,7 +69,7 @@ internal fun String.resolveUrl(location: String): String {
  * Checks that [uploadUrl] (an upload URL resolved from a creation response's `Location` header, or one
  * loaded from a [TusUrlStore]) is safe to send the file and the caller's request headers to.
  *
- * It must be an `http`/`https` URL with a host; it must be on the same scheme, host and port as
+ * It must be an `http`/`https` URL with a host and no user information; it must be on the same scheme, host and port as
  * [createUrl] unless its host is listed in [allowedHosts]; and an `https` creation URL never accepts a
  * plain `http` upload URL, whatever the host.
  *
@@ -80,6 +80,11 @@ internal fun validateUploadUrl(createUrl: String, uploadUrl: String, allowedHost
         ?: throw TusProtocolException("Invalid creation URL: \"$createUrl\"")
     val upload = parseHttpUrl(uploadUrl)
         ?: throw TusProtocolException("Invalid upload URL: \"$uploadUrl\"")
+    if (parseUriReference(uploadUrl)?.authority?.contains('@') == true) {
+        // Credentials in a server-supplied URL are never legitimate, and "https://good.example@evil.net"
+        // is a classic way to disguise the real host.
+        throw TusProtocolException("Upload URL must not contain user information: \"$uploadUrl\"")
+    }
 
     val createScheme = create.protocol.name.lowercase()
     val uploadScheme = upload.protocol.name.lowercase()

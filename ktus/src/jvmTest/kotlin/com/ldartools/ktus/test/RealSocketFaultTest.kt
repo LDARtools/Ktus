@@ -13,6 +13,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -65,6 +66,40 @@ class RealSocketFaultTest {
                 try {
                     channel.writeFully(bytes, offset.toInt(), (offset + length).toInt())
                     bytesWritten.addAndGet(length)
+                } finally {
+                    activeWriters.decrementAndGet()
+                    openHandles.decrementAndGet()
+                }
+            }.channel
+
+        override suspend fun fileReadLock(): AutoCloseable = AutoCloseable { }
+    }
+
+    /**
+     * A file written for Ktus 1.0: it implements only [readSection], with a detached writer coroutine, and
+     * relies on the default [ITusFile.writeSection]. Counts the same things as [TrackingFile].
+     */
+    class LegacyTrackingFile(private val bytes: ByteArray) : ITusFile {
+        val openHandles = AtomicInteger()
+        val activeWriters = AtomicInteger()
+        val bytesWritten = AtomicLong()
+
+        override val size: Long get() = bytes.size.toLong()
+        override val name: String get() = "legacy.bin"
+
+        override suspend fun readSection(offset: Long, length: Long): ByteReadChannel =
+            CoroutineScope(Dispatchers.IO).writer {
+                openHandles.incrementAndGet()
+                activeWriters.incrementAndGet()
+                try {
+                    var position = offset
+                    val end = offset + length
+                    while (position < end) {
+                        val n = minOf(64 * 1024L, end - position).toInt()
+                        channel.writeFully(bytes, position.toInt(), position.toInt() + n)
+                        position += n
+                        bytesWritten.addAndGet(n.toLong())
+                    }
                 } finally {
                     activeWriters.decrementAndGet()
                     openHandles.decrementAndGet()
@@ -223,10 +258,22 @@ class RealSocketFaultTest {
     // (6) ------------------------------------------------------------------------------------------------
 
     @Test
-    fun cancellingMidPatch_leavesNoOpenFileAndNoRunningWriter() = runBlocking {
+    fun cancellingMidPatch_leavesNoOpenFile() = runBlocking {
+        val file = TrackingFile(payload(64 * 1024 * 1024))
+        cancelMidPatch(file, file.openHandles, file.activeWriters, file.bytesWritten)
+    }
+
+    @Test
+    fun cancellingMidPatch_withALegacyReadSectionOnlyFile_leavesNoRunningWriter() = runBlocking {
+        // Here the bytes come from a detached writer the file itself launched (the 1.0 OkioTusFile shape), so
+        // only the default writeSection's cleanup can stop it.
+        val file = LegacyTrackingFile(payload(64 * 1024 * 1024))
+        cancelMidPatch(file, file.openHandles, file.activeWriters, file.bytesWritten)
+    }
+
+    private suspend fun cancelMidPatch(file: ITusFile, openHandles: AtomicInteger, activeWriters: AtomicInteger, bytesWritten: AtomicLong) = coroutineScope {
         RealSocketTusServer().use { server ->
             server.faults = { method, _ -> if (method == "PATCH") Fault.StallWithoutReading else Fault.None }
-            val file = TrackingFile(payload(64 * 1024 * 1024))
             val client = client()
             val job: Job = launch(Dispatchers.Default) {
                 client.createAndUploadTus("${server.baseUrl}/files", file,
@@ -237,19 +284,19 @@ class RealSocketFaultTest {
                 var last = -1L
                 while (true) {
                     delay(200)
-                    val now = file.bytesWritten.get()
-                    if (now > 0 && now == last && file.openHandles.get() > 0) break
+                    val now = bytesWritten.get()
+                    if (now > 0 && now == last && openHandles.get() > 0) break
                     last = now
                 }
             }
-            assertEquals(1, file.openHandles.get(), "precondition: the PATCH body is being written")
+            assertEquals(1, openHandles.get(), "precondition: the PATCH body is being written")
 
             withTimeout(10_000) { job.cancelAndJoin() }
 
-            awaitZero(file.openHandles, 2_000)
-            awaitZero(file.activeWriters, 2_000)
-            assertEquals(0, file.openHandles.get(), "the file section must be closed after cancellation")
-            assertEquals(0, file.activeWriters.get(), "no detached writer may outlive the request")
+            awaitZero(openHandles, 2_000)
+            awaitZero(activeWriters, 2_000)
+            assertEquals(0, openHandles.get(), "the file section must be closed after cancellation")
+            assertEquals(0, activeWriters.get(), "no writer may outlive the request")
             assertTrue(job.isCancelled)
             client.close()
         }
