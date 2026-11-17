@@ -126,19 +126,31 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
 - **Once a final PATCH has been sent in a call, it stays unresolved** until the server shows `offset == total` or
   a later PATCH is answered 204 below the total; a HEAD never resolves it. While unresolved, every failure of
   the call is `TusUploadOutcomeUnknownException`. The only exception is a definitive refusal of a final PATCH:
-  a 4xx, a redirect or a short local read, when no final PATCH earlier in the call (or in an earlier call, for a
-  marked entry) ended without a definitive answer. A 5xx answered to a final PATCH is never definitive.
-- **The `finalSentAt` mark is only cleared by a PATCH answered 204 below the total** (or a definitive refusal of
-  the final PATCH), never by a HEAD (which can be stale). The closed-client check runs before the mark is
+  a non-retried 4xx (408, 409, 423, 429 and 401 are retried and never definitive), a 3xx, or a short local
+  read, when no final PATCH earlier in the call (or in an earlier call, for a marked entry) ended without a
+  definitive answer. A 5xx, or an answer from another origin (the client followed a redirect), is never
+  definitive.
+- **Once any final PATCH ended without a definitive answer, that uncertainty is permanent.** For the rest of the
+  call every failure is `TusUploadOutcomeUnknownException`, even after a later 204 below the total let the
+  upload continue, and the store mark is kept, so the next call starts uncertain too. Only completing the
+  upload, or the app removing the entry, clears it.
+- **The `finalSentAt` mark is only cleared by a PATCH answered 204 below the total when no final PATCH ended
+  uncertain** (or by a definitive refusal of the final PATCH, a short read included), never by a HEAD (which can
+  be stale). The closed-client check runs before the mark is
   written, so a PATCH that was never sent leaves no mark. If removing the entry fails after the upload
   completed, the call still succeeds.
 - **`TusUrlStore` writes must be durable when they return.**
 - **`TusOffsetMismatchException` no longer makes `resumeOrCreateAndUploadTus` drop a stored upload** (it can be
   caused by a stale HEAD); the entry is kept.
 - **A short read is reported as `TusLocalFileException`** and is not retried; verified with real sockets on the
-  Darwin engine as well as with MockEngine and okio's FakeFileSystem. Any failure of a marked entry, including a permanent 4xx, is `TusUploadOutcomeUnknownException`;
-  a marked entry is never dropped or re-created. A 2xx answer to the final PATCH with a missing or impossible
-  `Upload-Offset` is an unknown outcome too, and so is a client closed while the final PATCH is in flight.
+  Darwin engine as well as with MockEngine and okio's FakeFileSystem.
+- **Any failure of a marked entry, including a permanent 4xx, is `TusUploadOutcomeUnknownException`**; a marked
+  entry is never dropped or re-created.
+- **A malformed answer to the final PATCH is an unknown outcome**: a 2xx with a missing or impossible
+  `Upload-Offset`, and also a client closed while the final PATCH is in flight.
+- **A retry that the budget cannot cover is not sent.** When the remaining `maxElapsedMillis` is shorter than the
+  wait a retry requires (`minDelayMillis`, the 250 ms floor after 423, or an honoured `Retry-After`), Ktus gives up
+  with the last failure instead of retrying early.
 - **`OkioTusFile` reports a missing or deleted file as `TusLocalFileException`** (not retried); it used to report
   size 0 or a raw okio `IOException` that was retried.
 - **`activityHeartbeatMillis` must be positive or null**; it also sets the backoff heartbeat interval.

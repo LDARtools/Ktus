@@ -93,11 +93,14 @@ internal class Backoff(
         val remaining = options.maxElapsedMillis - start.elapsedNow().inWholeMilliseconds
         if (remaining <= 0) return false
 
-        var wait = maxOf(nextDelayMillis(failures), floorMillis, options.minDelayMillis)
+        // The shortest wait this retry needs: the configured floor, the 423 floor, and the server's Retry-After
+        // (capped at max(maxDelayMillis, 60 s)). If the budget cannot cover it, give up rather than retry early.
+        var required = maxOf(floorMillis, options.minDelayMillis)
         if (retryAfterMillis != null && options.honorRetryAfter) {
-            // Honour the server, but never wait longer than max(maxDelayMillis, 60 s) for one retry.
-            wait = maxOf(wait, min(retryAfterMillis, maxOf(options.maxDelayMillis, MAX_RETRY_AFTER_MILLIS)))
+            required = maxOf(required, min(retryAfterMillis, maxOf(options.maxDelayMillis, MAX_RETRY_AFTER_MILLIS)))
         }
+        if (required > remaining) return false
+        val wait = maxOf(nextDelayMillis(failures), required)
         sleepWithHeartbeat(min(wait, remaining))
         return true
     }
@@ -237,7 +240,7 @@ private suspend fun classifyResponse(
     val answeredUrl = response.call.request.url
     val target = try { Url(targetUrl) } catch (e: Exception) { null }
     if (target != null && !sameOrigin(answeredUrl, target)) {
-        return Outcome.Fail(TusProtocolException(
+        return Outcome.Fail(RedirectedAnswerException(
             "tus ${op.method} to $targetUrl was answered by $answeredUrl; the client followed a redirect to " +
                 "another origin. Configure the HttpClient with followRedirects = false."
         ))

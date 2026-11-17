@@ -368,7 +368,7 @@ class StatusPolicyTest {
     }
 
     @Test
-    fun retryAfter_isCappedByTheRemainingBudget() = runTest {
+    fun aRetryAfterBeyondTheRemainingBudget_givesUpAtOnce() = runTest {
         val server = ScriptedTusServer(clock = { currentTime })
         repeat(5) { server.script(HttpMethod.Post, Reply.Status(503, mapOf("Retry-After" to "3600"))) }
         val start = currentTime
@@ -377,8 +377,9 @@ class StatusPolicyTest {
                 options = TusUploadOptions(checkServerCapabilities = false,
                     retryOptions = fastRetry(maxRetries = 100).copy(maxElapsedMillis = 5_000)))
         }
-        assertEquals(5_000, currentTime - start, "the hour-long Retry-After is cut to the 5 s budget")
-        assertEquals(2, server.count(HttpMethod.Post))
+        // The (capped) Retry-After of 60 s exceeds the 5 s budget: no early retry.
+        assertEquals(0, currentTime - start)
+        assertEquals(1, server.count(HttpMethod.Post))
     }
 
     // ---------------------------------------------------------------- budget and backoff

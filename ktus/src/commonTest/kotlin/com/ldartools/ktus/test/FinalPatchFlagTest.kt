@@ -146,23 +146,42 @@ class FinalPatchFlagTest {
     // ---------------------------------------------------------------- M1
 
     @Test
-    fun aHeadBelowTheTotal_doesNotClearThePersistedFlag_butA204BelowTheTotalDoes() = runTest {
+    fun aMarkFromAnEarlierCall_isNeverClearedByA204_onlyByCompletion() = runTest {
         val writes = SyncList<String>()
-        val store = object : TusUrlStore {
-            val inner = InMemoryTusUrlStore()
-            override suspend fun get(fingerprint: String) = inner.get(fingerprint)
-            override suspend fun set(fingerprint: String, upload: TusUpload) {
-                writes += if (upload.finalSentAt == null) "clear" else "flag"; inner.set(fingerprint, upload)
-            }
-            override suspend fun remove(fingerprint: String) { writes += "remove"; inner.remove(fingerprint) }
-        }
+        val store = recordingStore(writes)
         store.inner.set("fp", TusUpload("https://example.com/files/old", 1000, finalSentAt = 1))
         val server = ScriptedTusServer().apply { uploadLength = 1000 }
         server.client().resumeOrCreateAndUploadTus(createUrl, InMemoryTusFile("f", testBytes(1000)), "fp", store,
             options = TusUploadOptions(chunkSize = 500, retryOptions = retry()))
-        // HEAD said 0 (no write), the 204 at 500 cleared the flag, the final PATCH re-flagged, success removed it.
-        assertEquals(listOf("clear", "flag", "remove"), writes)
+        // The earlier final PATCH's outcome was unknown: the 204 at 500 does not clear the mark; completion does.
+        assertEquals(listOf("remove"), writes)
     }
+
+    @Test
+    fun aMarkSetInThisCall_isClearedByA204BelowTheTotal_whenNothingWasUncertain() = runTest {
+        val writes = SyncList<String>()
+        val store = recordingStore(writes)
+        val server = ScriptedTusServer(location = "/files/new")
+        // The single (final) PATCH is answered 204 with only 500 of 1000 stored: a definitive, partial answer.
+        server.script(HttpMethod.Patch, Reply.Custom { _, body ->
+            server.data += body.copyOf(500)
+            respond("", HttpStatusCode.NoContent, headersOf("Upload-Offset", "500"))
+        })
+        server.client().resumeOrCreateAndUploadTus(createUrl, InMemoryTusFile("f", testBytes(1000)), "fp", store,
+            options = TusUploadOptions(retryOptions = retry()))
+        assertEquals(listOf("clear", "flag", "clear", "flag", "remove"), writes)
+    }
+
+    private class RecordingStore(val writes: SyncList<String>) : TusUrlStore {
+        val inner = InMemoryTusUrlStore()
+        override suspend fun get(fingerprint: String) = inner.get(fingerprint)
+        override suspend fun set(fingerprint: String, upload: TusUpload) {
+            writes += if (upload.finalSentAt == null) "clear" else "flag"; inner.set(fingerprint, upload)
+        }
+        override suspend fun remove(fingerprint: String) { writes += "remove"; inner.remove(fingerprint) }
+    }
+
+    private fun recordingStore(writes: SyncList<String>) = RecordingStore(writes)
 
     // ---------------------------------------------------------------- M2
 
@@ -497,7 +516,7 @@ class Adv6DefinitiveRefusalTest {
     }
 
     @Test
-    fun minDelayMillis_isStillCappedByTheBudget() = runTest {
+    fun minDelayMillis_largerThanTheRemainingBudget_givesUpInsteadOfRetryingEarly() = runTest {
         val server = ScriptedTusServer(clock = { currentTime })
         repeat(5) { server.script(HttpMethod.Post, Reply.Status(503)) }
         assertFailsWith<TusHttpException> {
@@ -505,7 +524,8 @@ class Adv6DefinitiveRefusalTest {
                 options = TusUploadOptions(checkServerCapabilities = false, retryOptions = RetryOptions(
                     minDelayMillis = 60_000, maxElapsedMillis = 5_000, timeSource = testScheduler.timeSource)))
         }
-        assertEquals(5_000, currentTime)
+        assertEquals(0, currentTime, "no early retry: gives up at once")
+        assertEquals(1, server.count(HttpMethod.Post))
     }
 
     /** L3: an offset mismatch (for example a stale HEAD) keeps the stored entry. */

@@ -237,9 +237,18 @@ A HEAD showing `offset < total` lets the upload continue, but does **not** resol
 without affinity, the HEAD may be answered by a stale server instance. While the final chunk is unresolved,
 **every** failure that ends the call (404/410, retries or budget exhausted, a network error, an HTTP error, a
 protocol or validation error, a closed client) is reported as **`TusUploadOutcomeUnknownException`**, with the
-original failure as its `cause`. The one exception is a **definitive refusal**: the PATCH carrying the last bytes was answered with a 4xx, a redirect, or failed on a
-short local read, and no final PATCH earlier in the same call (or in an earlier call, for a marked entry) ended
-without a definitive answer. Any 5xx is never definitive: a server may answer 5xx after it stored the bytes.
+original failure as its `cause`. The one exception is a **definitive refusal**: the PATCH carrying the last
+bytes was answered with a 4xx that Ktus does not retry (408, 409, 423, 429 and, by default, 401 are retried and
+are never definitive), or a 3xx, or failed on a short local read, and no final PATCH earlier in the same call
+(or in an earlier call, for a marked entry) ended without a definitive answer. Any 5xx is never definitive (a
+server may answer 5xx after it stored the bytes), and neither is an answer from another origin (the client
+followed a redirect, so the body may have reached the original server first).
+
+Once any final PATCH has ended without a definitive answer, that stays true: a later PATCH answered `204` below
+the total lets the upload continue, but every failure for the rest of the call is still
+`TusUploadOutcomeUnknownException` (the earlier PATCH may yet complete on another server instance), and the
+store mark is kept, so the next call starts in the same state. Only the upload completing, or you removing
+the entry, clears it.
 On a definitive refusal the original error is thrown. Cancelling the caller still throws
 `CancellationException`.
 
@@ -284,7 +293,28 @@ an upload per process, not across instances, so two instances can write to the s
 share its storage. Check that your server is safe for that (a storage-level lock, affinity, or a single
 writer), or set `RetryOptions.minDelayMillis` above the origin's own request timeout, so every retry waits at
 least that long (it is a floor applied after the jitter; raising `initialDelayMillis` alone does not guarantee
-it, because full jitter can draw any delay down to 0).
+it, because full jitter can draw any delay down to 0). When the remaining `maxElapsedMillis` budget is shorter
+than that floor (or than an honoured `Retry-After`), Ktus gives up instead of retrying early.
+
+### Things to avoid
+
+- **Ktor's `HttpRequestRetry` plugin** on the client used for tus. Ktus retries itself and decides after every
+  failure whether to ask the server with HEAD first; a plugin that silently re-sends a PATCH defeats that and can
+  append the same bytes twice.
+- **Two calls with the same fingerprint at the same time** (for example a foreground and a background worker).
+  They share one store entry and one server upload; their PATCHes conflict, and their marks overwrite each
+  other. Run at most one upload per fingerprint.
+
+### Stored entries that keep failing
+
+- A stored upload whose server keeps reporting an impossible offset (`TusOffsetMismatchException`) is kept, since
+  a stale HEAD can cause that too. It will keep failing until it expires (`expiresAt`), or forever if the server
+  sent no `Upload-Expires`. Resolve it like an outcome-unknown entry: check the server, then
+  `store.remove(fingerprint)`.
+- `expiresAt` is read once, from the creation response, and never refreshed from later responses. Ktus assumes
+  the server's expiry is absolute (set at creation). If your server extends the expiry on every PATCH, a stored
+  entry may be treated as expired early, and a new upload created; set a far expiry or omit `Upload-Expires`
+  if that matters.
 
 **When you get this exception, check on your server whether the file arrived before uploading it again**, then
 resolve the store entry yourself:

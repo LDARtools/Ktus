@@ -84,5 +84,11 @@ class TusUploadOutcomeUnknownException(
     cause,
 )
 
+/**
+ * The answer came from another origin because the client followed a redirect. The request (and its body) may
+ * have reached the original server first, so for a final PATCH the outcome is unknown.
+ */
+internal class RedirectedAnswerException(message: String) : TusProtocolException(message)
+
 /** Carries an exception thrown by one of the caller's callbacks (or store) so it is never reclassified. */
 internal class CallbackFailure(val error: Throwable) : RuntimeException(error)
