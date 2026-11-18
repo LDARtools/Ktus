@@ -73,6 +73,9 @@ class RealSocketTusServer : AutoCloseable {
     @Volatile var faults: (method: String, n: Int) -> Fault = { _, _ -> Fault.None }
 
     val log: MutableList<Logged> = Collections.synchronizedList(mutableListOf())
+
+    /** Every request as it arrives (method to ms since start), before any fault runs. */
+    val arrivals: MutableList<Pair<String, Long>> = Collections.synchronizedList(mutableListOf())
     private val counts = mutableMapOf<String, AtomicInteger>()
     val openConnections = AtomicInteger()
 
@@ -148,6 +151,7 @@ class RealSocketTusServer : AutoCloseable {
 
     /** Returns whether to keep the connection open for another request. */
     private fun handle(head: Head, input: InputStream, output: OutputStream, socket: Socket): Boolean {
+        arrivals += head.method to nowMillis()
         val n = synchronized(counts) { counts.getOrPut(head.method) { AtomicInteger() }.incrementAndGet() }
         val fault = faults(head.method, n)
         val contentLength = head.headers["content-length"]?.toLongOrNull()
