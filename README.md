@@ -140,7 +140,7 @@ httpClient.createAndUploadTus(
   runs out of budget. When `resumeOrCreateAndUploadTus` gets a definitive answer about a stored upload (gone,
   wrong length, a permanent refusal) and creates a new one, that also ends the run: the new upload starts with a
   full budget. Once it is spent, no request is sent except the single last resolution HEAD when Ktus gives up
-  retrying an unresolved final PATCH itself. So counted from when the run's first failing request was sent,
+  retrying a PATCH while a final PATCH is unresolved. So counted from when the run's first failing request was sent,
   Ktus gives up at worst after: that request + `maxElapsedMillis` + up to two request timeouts (a request still
   in flight when the budget ran out, then that last HEAD; both can happen when the request in flight is the
   final PATCH). Without a request timeout a request can run forever, so
@@ -230,10 +230,11 @@ client has `expectSuccess` set:
 
 After any PATCH whose outcome is unknown (network error, timeout, a retryable status, 409, or any 2xx other than
 `204`) Ktus backs off, then sends HEAD, and continues from the offset the server reports. When it gives up
-retrying an unresolved final PATCH itself (out of attempts or budget, or the required wait would not fit the
-budget), it sends one last HEAD without waiting: if that shows the whole file, the upload succeeded. If a
-recovery HEAD is what fails (its own retries run out, or the budget is spent without progress), no further HEAD
-is sent and the call ends with `TusUploadOutcomeUnknownException`. It never re-sends a chunk at the
+retrying a PATCH while a final PATCH is unresolved (out of attempts or budget, or the required wait would not
+fit the budget; the PATCH given up on can be a later, smaller one after the chunk was halved), it sends one last
+HEAD without waiting: if that shows the whole file, the upload succeeded. If a recovery HEAD is what fails (its
+own retries run out, or the budget is spent without progress), no further HEAD is sent and the call ends with
+`TusUploadOutcomeUnknownException`. It never re-sends a chunk at the
 old offset blindly. If that HEAD reports less than the server has already confirmed, Ktus asks again (up to 3
 times, with backoff, within the budget) and then fails with `TusOffsetMismatchException` rather than rewinding.
 
@@ -243,7 +244,10 @@ The one failure a retry cannot fix: Ktus sent the PATCH carrying the **last** by
 server stored them (the connection dropped, the request timed out, a gateway answered 5xx, the response was
 lost), and could not find out afterwards. The server may hold the complete file. tusdotnet even removes an
 upload once it is complete, so every later HEAD or PATCH answers 404, which looks exactly like an expired
-upload. Uploading again from scratch can make the server receive and process the file twice.
+upload. That includes the final PATCH itself, when another request (a replayed PATCH, a second worker, an earlier
+call whose mark was lost) completed the upload first. Uploading again from scratch can make the server receive
+and process the file twice, so a 404/410 answered to any final PATCH is never treated as "expired": it is
+`TusUploadOutcomeUnknownException` with `kind = UPLOAD_GONE`.
 
 Ktus follows one rule. Once a PATCH carrying the last bytes has been sent in a call, that final chunk stays
 **unresolved** until either
@@ -256,8 +260,8 @@ without affinity, the HEAD may be answered by a stale server instance. While the
 **every** failure that ends the call (404/410, retries or budget exhausted, a network error, an HTTP error, a
 protocol or validation error, a closed client) is reported as **`TusUploadOutcomeUnknownException`**, with the
 original failure as its `cause`. The one exception is a **definitive refusal**: the PATCH carrying the last
-bytes was answered with a 4xx that Ktus does not retry (408, 409, 423, 429 and, by default, 401 are retried and
-are never definitive), or a 3xx, or failed on a short local read, and no final PATCH earlier in the same call
+bytes was answered with a 4xx that Ktus does not retry, other than 404/410 (408, 409, 423, 429 and, by default,
+401 are retried and are never definitive; 404/410 are never definitive, see above), or a 3xx, or failed on a short local read, and no final PATCH earlier in the same call
 (or in an earlier call, for a marked entry) ended without a definitive answer. Any 5xx is never definitive (a
 server may answer 5xx after it stored the bytes), and neither is an answer from a different URL than the one
 requested (the client followed a redirect, so the body may have reached the original server first).
@@ -290,7 +294,7 @@ computed from the cause and the retry policy in use:
 
 | `e.kind` | Meaning | What to do |
 |---|---|---|
-| `UPLOAD_GONE` | 404/410 or `TusUploadExpiredException`, or no cause because the marked entry could not be resumed at all (expired, length no longer matches the file, host no longer allowed). Typically the server finished and removed the upload. | Ask your server whether the file arrived, then remove the entry. |
+| `UPLOAD_GONE` | 404/410 or `TusUploadExpiredException` (including a 404/410 answered to the final PATCH itself), or no cause because the marked entry could not be resumed at all (expired, length no longer matches the file, host no longer allowed). Typically the server finished and removed the upload. | Ask your server whether the file arrived, then remove the entry. Never re-create the upload without that check: the file may already be on the server. |
 | `SERVER_REFUSAL` | A 4xx your retry policy does not retry (such as 403 or 400, whether Ktor threw it or not), or a different `Upload-Length`. Retrying will not help. | Ask your server whether the file arrived, then remove the entry. |
 | `NETWORK_FAILURE` | Offline, a timeout, a connection lost. | Call `resumeOrCreateAndUploadTus` again later. Do not call your server-check API while offline. |
 | `UNKNOWN` | Anything else: an exhausted 5xx or 423, an offset mismatch (a stale server instance can cause it), a protocol error, a closed client. | Call again later. |

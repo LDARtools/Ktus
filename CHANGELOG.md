@@ -118,8 +118,9 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
   extra parameters or values, as client plugins add them, is fine)
   is rejected; on a final PATCH that is an unknown outcome.
 - **No request is sent once the retry budget is spent, except the single last resolution HEAD** (without waiting
-  or retrying) when giving up retrying an unresolved final PATCH itself; if it shows the whole file, the upload
-  succeeds. (When a recovery HEAD is what fails, no further HEAD is sent.) The budget measures a run of
+  or retrying) when Ktus gives up retrying a PATCH while a final PATCH is unresolved (also a later, smaller PATCH
+  after the chunk was halved); if it shows the whole file, the upload succeeds. (When a recovery HEAD is what
+  fails, no further HEAD is sent.) The budget measures a run of
   consecutive failures across the whole call: any request that succeeds at its job ends the run (a recovery HEAD
   that shows no new data does not), and so does the definitive answer that makes `resumeOrCreateAndUploadTus`
   drop a stored upload and create a new one. Counted from when the run's first failing request
@@ -144,12 +145,19 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
   has completed and removed an upload, exhausted retries and HTTP errors. A plain retry of such an upload
   raised `IOException` or `TusUploadExpiredException` before. `resumeOrCreateAndUploadTus` keeps the entry
   marked and never re-creates it; calling it again is safe and resumes the same upload. **Never start a fresh
-  upload of the file without checking the server first**; see "When the outcome is unknown" in the README. A 404/410 after an earlier chunk is still
-  `TusUploadExpiredException`.
+  upload of the file without checking the server first**; see "When the outcome is unknown" in the README.
+- **A 404/410 answered to a final PATCH is never "expired".** tusdotnet answers exactly that once another
+  request (a replayed PATCH, a second worker, a lost mark) completed the upload and removed it, so it is
+  `TusUploadOutcomeUnknownException` with `kind = UPLOAD_GONE` (cause: the `TusUploadExpiredException`), even on
+  the first final PATCH. `resumeOrCreateAndUploadTus` keeps the entry marked instead of re-creating the upload,
+  and `createAndUploadTus` no longer throws a plain `TusUploadExpiredException` that a caller would answer by
+  re-creating. On `UPLOAD_GONE`, check the server; never re-create blindly. A 404/410 on the first HEAD or on a
+  PATCH that does not carry the last bytes (with no final PATCH sent) is still `TusUploadExpiredException`.
 - **Once a final PATCH has been sent in a call, it stays unresolved** until the server shows `offset == total` or
   a later PATCH is answered 204 below the total; a HEAD never resolves it. While unresolved, every failure of
   the call is `TusUploadOutcomeUnknownException`. The only exception is a definitive refusal of a final PATCH:
-  a non-retried 4xx (408, 409, 423, 429 and 401 are retried and never definitive), a 3xx, or a short local
+  a non-retried 4xx other than 404/410 (408, 409, 423, 429 and 401 are retried and never definitive; 404/410
+  never are), a 3xx, or a short local
   read, when no final PATCH earlier in the call (or in an earlier call, for a marked entry) ended without a
   definitive answer. A 5xx, or an answer from another origin (the client followed a redirect), is never
   definitive.

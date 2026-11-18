@@ -18,7 +18,7 @@ import kotlin.time.TimeSource
  *   answered, a PATCH 204, a recovery HEAD showing more data). A recovery HEAD that shows no new data does not
  *   end it. When `resumeOrCreateAndUploadTus` drops a stored upload after a definitive answer and creates a new
  *   one, the run ends too. Once the budget is spent no request is sent, except one last HEAD when giving up
- *   retrying an unresolved final PATCH itself.
+ *   retrying a PATCH while a final PATCH is unresolved.
  * - [maxRetries] — the maximum number of **attempts** for one operation (one OPTIONS, POST, HEAD or
  *   DELETE, or the PATCHes for one chunk), including the first attempt. Despite its name it is not
  *   "retries after the first try": `maxRetries = 3` means at most 3 attempts. 423 Locked answers are not

@@ -14,7 +14,7 @@ import kotlinx.coroutines.sync.withLock
  *   carrying the last bytes. It is cleared only when the upload completes, or when a PATCH is answered 204 below the total while
  *   no final PATCH has ever ended uncertain (in this call or, for an entry carried over from an earlier call, before
  *   it: such an entry keeps its mark until completion), or by a definitive refusal of the final PATCH (a non-retried
- *   4xx, a 3xx or a short local read; never a 5xx). A HEAD never clears it. While it is set the upload's outcome may be unknown: Ktus never re-creates the upload, and any
+ *   4xx other than 404/410, a 3xx or a short local read; never a 5xx or a 404/410). A HEAD never clears it. While it is set the upload's outcome may be unknown: Ktus never re-creates the upload, and any
  *   failure (a 404/410 included) throws [TusUploadOutcomeUnknownException]. Persist it with the rest of the entry.
  */
 data class TusUpload(

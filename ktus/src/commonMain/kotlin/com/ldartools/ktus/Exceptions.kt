@@ -91,9 +91,10 @@ class TusUploadOutcomeUnknownException(
     enum class Kind {
         /**
          * The upload URL is gone or cannot be used: the server answered 404/410 (typically because it finished
-         * and removed the upload), or there is no cause because a marked stored entry could not be resumed at all
+         * and removed the upload; a 404/410 answered to a final PATCH always lands here), or there is no cause because a marked stored entry could not be resumed at all
          * (it expired, its length no longer matches the file, or its URL is on a host that is no longer allowed).
-         * Only the server can say whether the file arrived: check it.
+         * Only the server can say whether the file arrived: check it, and never re-create the upload without
+         * that check.
          */
         UPLOAD_GONE,
 
