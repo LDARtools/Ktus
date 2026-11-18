@@ -11,8 +11,10 @@ Adaptive chunk sizing and silence limits that do not depend on the HTTP engine. 
 - `TusUploadOptions.targetChunkMillis`: size each PATCH to take about this long. The first PATCH of a call uses
   `minChunkSize`; after each confirmed PATCH the next size is the smoothed goodput (bytes confirmed / time to its
   204, exponential average with weight 0.5) times the target, within `minChunkSize`..`chunkSize` and at most
-  twice the previous size. A timeout halves it and lowers the estimate; a resume within the call keeps it. With
-  a target, `minChunkSize` must be at least 16 KiB.
+  twice the previous size. A timeout or silence-limit cut drops the next PATCH straight to `minChunkSize` (one
+  cut per slowdown instead of one per halving); a resume within the call keeps the estimate. With a target,
+  `minChunkSize` must be at least 16 KiB and `adaptiveChunkSize` must be on (`IllegalArgumentException`
+  otherwise).
 - `TusUploadOptions.sendStallMillis`: abandon a request whose body makes no progress for this long while it is
   not fully sent. The clock starts when the request is handed to the engine and restarts on every body progress
   event. Requests without a body are fully sent once handed to the engine.
@@ -21,8 +23,10 @@ Adaptive chunk sizing and silence limits that do not depend on the HTTP engine. 
 - `TusUploadOptions.finalReplyTimeoutMillis`: the same for the PATCH carrying the last bytes.
 - `TusStallTimeoutException` (an `IOException`) with `kind` (`SEND_STALL`, `REPLY_TIMEOUT`,
   `FINAL_REPLY_TIMEOUT`) and `limitMillis`. An abandoned request is classified exactly like an engine timeout:
-  retried within the run budget, the chunk halved, and an abandoned final PATCH leaves its outcome unknown.
-  Caller cancellation stays a cancellation.
+  retried within the run budget, the chunk shrunk, and an abandoned final PATCH leaves its outcome unknown.
+  Caller cancellation stays a cancellation. A request is abandoned only on the client: bytes already handed to
+  the operating system can still reach the server, which may apply the abandoned PATCH; the offsets keep the
+  data correct (the next PATCH gets 409, then HEAD).
 - Each limit must be positive when set (`IllegalArgumentException` otherwise).
 
 Why: no client-side timer can tell a slow request from a dead one once its bytes are buffered (Ktor holds ~1 MiB
