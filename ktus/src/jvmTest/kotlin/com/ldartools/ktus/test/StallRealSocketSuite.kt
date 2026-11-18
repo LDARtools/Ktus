@@ -152,4 +152,67 @@ abstract class StallRealSocketSuite {
             assertEquals(100_000, server.offset)
         }
     }
+
+    // ---- Adaptive chunk sizing (targetChunkMillis) with the silence limits, scaled down from the recommended
+    // 10 s target / 30 s limits to 1 s / 3 s.
+
+    /** ~16 KiB/s: the server reads 4 KiB every 250 ms. */
+    private val slowLink: (String, Int) -> Fault = { m, _ -> if (m == "PATCH") Fault.SlowRead(4 * 1024, 250) else Fault.None }
+
+    private fun adaptive(target: Long?, maxRetries: Int = 5) = TusUploadOptions(chunkSize = 2L * 1024 * 1024,
+        minChunkSize = 16L * 1024, targetChunkMillis = target, activityHeartbeatMillis = null,
+        sendStallMillis = 3_000, replyTimeoutMillis = 3_000, finalReplyTimeoutMillis = 10_000,
+        retryOptions = RetryOptions(maxRetries = maxRetries, initialDelayMillis = 10, maxDelayMillis = 10, jitter = false))
+
+    /**
+     * A slow but steady link (~16 KiB/s) with the silence limits set: adaptive sizing keeps each PATCH near
+     * 1 s of data, so nothing is cut. (With sizing off, the same limits cut it: see the next test.)
+     */
+    @Test
+    fun aSlowSteadyLink_withAdaptiveSizing_completesWithoutACut() = runBlocking {
+        RealSocketTusServer().use { server ->
+            server.faults = slowLink
+            withTimeout(90_000) {
+                newClient().use { c ->
+                    c.createAndUploadTus("${server.baseUrl}/files", InMemoryTusFile("f", testBytes(160 * 1024)),
+                        options = adaptive(target = 1_000))
+                }
+            }
+            assertEquals(160L * 1024, server.offset)
+            assertEquals(1, server.arrivals.count { it.first == "HEAD" }, "no recovery HEAD, so no cut: ${server.log}")
+        }
+    }
+
+    /** The same link and limits without adaptive sizing: the whole body is buffered at once and the reply limit cuts it. */
+    @Test
+    fun aSlowSteadyLink_withoutAdaptiveSizing_isCut() = runBlocking {
+        RealSocketTusServer().use { server ->
+            server.faults = slowLink
+            runCatching {
+                withTimeout(90_000) {
+                    newClient().use { c ->
+                        c.createAndUploadTus("${server.baseUrl}/files", InMemoryTusFile("f", testBytes(160 * 1024)),
+                            options = adaptive(target = null, maxRetries = 2))
+                    }
+                }
+            }
+            assertTrue(server.arrivals.count { it.first == "HEAD" } > 1, "cut: ${server.log}")
+        }
+    }
+
+    /** With adaptive sizing on, a server that stops reading is still cut, and the upload resumes. */
+    @Test
+    fun withAdaptiveSizing_aServerThatStopsReading_isStillCut_andResumes() = runBlocking {
+        RealSocketTusServer().use { server ->
+            server.faults = { m, n -> if (m == "PATCH" && n == 3) Fault.StallWithoutReading else Fault.None }
+            withTimeout(60_000) {
+                newClient().use { c ->
+                    c.createAndUploadTus("${server.baseUrl}/files", InMemoryTusFile("f", testBytes(512 * 1024)),
+                        options = adaptive(target = 1_000))
+                }
+            }
+            assertEquals(512L * 1024, server.offset)
+            assertEquals(2, server.arrivals.count { it.first == "HEAD" }, "one cut, one recovery HEAD: ${server.log}")
+        }
+    }
 }

@@ -715,13 +715,14 @@ private suspend fun HttpClient.uploadInternal(
         finalMayHaveLanded = false
 
         val minChunkSize = options.effectiveMinChunkSize
-        var chunkSize = options.chunkSize
+        // Kept for the whole call, so a HEAD-driven resume continues at the current estimate.
+        val sizer = ChunkSizer(minChunkSize, options.chunkSize, options.targetChunkMillis)
         var patchAttempts = 0
 
         while (offset < total) {
             ensureSizeUnchanged(file, total)
             val start = offset
-            val length = min(chunkSize, total - start)
+            val length = min(sizer.size, total - start)
             val isFinal = start + length == total
             patchAttempts++
 
@@ -744,6 +745,7 @@ private suspend fun HttpClient.uploadInternal(
             }
 
             val body = TusPatchContent(file, start, length)
+            val patchStarted = retry.timeSource.markNow()
             // Silence limits for this attempt (null when they are all off): fed by the body progress below.
             val watch = stall?.watch(TusOp.PATCH, bodyLength = length, isFinal = isFinal)
             // Written on the engine's thread, read here: a CompletableDeferred is safe across threads.
@@ -803,6 +805,7 @@ private suspend fun HttpClient.uploadInternal(
                             "Server returned an invalid offset: $serverOffset (sent $length bytes at offset $start)")
                     }
                     offset = serverOffset
+                    sizer.confirmed(serverOffset - start, patchStarted.elapsedNow().inWholeMilliseconds)
                     patchAttempts = 0
                     backoff.reset()
                     // A 204 below the total proves the upload exists and is incomplete.
@@ -848,7 +851,7 @@ private suspend fun HttpClient.uploadInternal(
                         }
                     }
                     if (outcome.timedOut && options.adaptiveChunkSize) {
-                        chunkSize = max(minChunkSize, chunkSize / 2)
+                        sizer.timedOut()
                     }
                     // 423 Locked (tusdotnet's per-file lock) is bounded by the elapsed budget only.
                     val locked = outcome.statusCode == 423

@@ -379,4 +379,43 @@ class DarwinRealSocketTest {
             assertEquals(size, server.data.size)
         }
     }
+
+    private fun adaptive(target: Long?, maxRetries: Int = 5) = TusUploadOptions(chunkSize = 2L * 1024 * 1024,
+        minChunkSize = 16L * 1024, targetChunkMillis = target, activityHeartbeatMillis = null,
+        sendStallMillis = 3_000, replyTimeoutMillis = 3_000, finalReplyTimeoutMillis = 10_000,
+        retryOptions = RetryOptions(maxRetries = maxRetries, initialDelayMillis = 10, maxDelayMillis = 10, jitter = false))
+
+    /** ~16 KiB/s with the silence limits (scaled 1 s target / 3 s limits): adaptive sizing completes without a cut. */
+    @Test
+    fun aSlowSteadyLink_withAdaptiveSizing_completesWithoutACut() = runBlocking {
+        PosixTusServer().use { server ->
+            server.faults = { m, _ -> if (m == "PATCH") Fault.SlowRead else Fault.None }
+            server.slowReadBytes = 4 * 1024; server.slowReadPauseMicros = 250_000u
+            withTimeout(90_000) {
+                client().use {
+                    it.createAndUploadTus("${server.baseUrl}/files", TrackingFile(payload(160 * 1024)), options = adaptive(1_000))
+                }
+            }
+            assertEquals(160 * 1024, server.data.size)
+            assertEquals(1, server.arrivals.count { it.first == "HEAD" }, "no recovery HEAD, so no cut: ${server.log}")
+        }
+    }
+
+    /** The same without adaptive sizing: cut by the reply limit. */
+    @Test
+    fun aSlowSteadyLink_withoutAdaptiveSizing_isCut() = runBlocking {
+        PosixTusServer().use { server ->
+            server.faults = { m, _ -> if (m == "PATCH") Fault.SlowRead else Fault.None }
+            server.slowReadBytes = 4 * 1024; server.slowReadPauseMicros = 250_000u
+            runCatching {
+                withTimeout(90_000) {
+                    client().use {
+                        it.createAndUploadTus("${server.baseUrl}/files", TrackingFile(payload(160 * 1024)),
+                            options = adaptive(null, maxRetries = 2))
+                    }
+                }
+            }
+            assertTrue(server.arrivals.count { it.first == "HEAD" } > 1, "cut: ${server.log}")
+        }
+    }
 }

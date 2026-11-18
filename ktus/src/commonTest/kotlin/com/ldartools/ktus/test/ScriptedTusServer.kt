@@ -101,6 +101,9 @@ class ScriptedTusServer(
             this.followRedirects = followRedirects
         }
 
+    /** How long a PATCH of n bytes takes on the "link" (virtual time; null: instant). */
+    var patchMillis: ((bytes: Int) -> Long)? = null
+
     private suspend fun MockRequestHandleScope.handle(request: HttpRequestData): HttpResponseData {
         onRequest(request)
         val reply = scripts[request.method.value]?.removeFirstOrNull()
@@ -119,6 +122,7 @@ class ScriptedTusServer(
             timeMillis = clock(),
             headers = request.headers.entries().associate { it.key to it.value.joinToString(",") },
         )
+        if (request.method == HttpMethod.Patch) patchMillis?.let { kotlinx.coroutines.delay(it(body.size)) }
 
         if ((request.method == HttpMethod.Head || request.method == HttpMethod.Patch) && clock() < lockedUntil) {
             return respond("locked", HttpStatusCode.Locked)

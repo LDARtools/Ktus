@@ -35,13 +35,22 @@ package com.ldartools.ktus
  * @param finalReplyTimeoutMillis the same as [replyTimeoutMillis] for the PATCH carrying the last bytes, which
  *   a server may answer only after slow completion work (default null: off). [replyTimeoutMillis] does not
  *   apply to it.
+ * @param targetChunkMillis size each PATCH so it takes about this long on the link (default null: off, every
+ *   PATCH is [chunkSize]). The first PATCH of a call uses [minChunkSize]; after each PATCH the server confirmed,
+ *   the measured goodput (bytes confirmed / time from the PATCH's start to its 204, smoothed) times this target
+ *   gives the next size, within [minChunkSize]..[chunkSize] and at most twice the previous size. A timeout still
+ *   halves the size. This keeps the bytes in flight small relative to the link speed, which the silence limits
+ *   need (see "Weak links" in the README). When set, [minChunkSize] may be as low as 16 KiB; every PATCH is at
+ *   least that, so a server that stores each PATCH separately (for example one Azure block per PATCH, at most
+ *   50,000 blocks) limits the file size to about 50,000 × [minChunkSize] in the worst case.
  *
  * The three silence limits do not depend on the engine, and they do not replace its timeouts: keep the
  * engine's limits (Ktor `HttpTimeout`) as an outer cap, set at least as high as these. Progress means bytes
  * handed to Ktor, which buffers about 1 MiB of a body before the socket: a chunk of up to ~1 MiB counts as
  * fully sent almost at once (its transmission runs on the reply clock), and a larger one moves in ~1 MiB steps.
- * Size each limit above the time the slowest link needs for min([chunkSize], ~1 MiB). See "Weak links" in the
- * README, including why an engine socket timeout is not a silence limit on CIO.
+ * Size each limit above the time the slowest link needs for the bytes in flight, min(chunk, ~1 MiB), plus the
+ * server's answer time; [targetChunkMillis] keeps the chunk near a chosen duration so this holds. See "Weak
+ * links" in the README, including what each engine's own socket timeout does (pinned in tests).
  */
 data class TusUploadOptions(
     val checkServerCapabilities: Boolean = true,
@@ -57,6 +66,7 @@ data class TusUploadOptions(
     val sendStallMillis: Long? = null,
     val replyTimeoutMillis: Long? = null,
     val finalReplyTimeoutMillis: Long? = null,
+    val targetChunkMillis: Long? = null,
 ) {
     init {
         require(chunkSize > 0) { "chunkSize must be positive" }
@@ -68,6 +78,10 @@ data class TusUploadOptions(
         require(replyTimeoutMillis == null || replyTimeoutMillis > 0) { "replyTimeoutMillis must be positive, or null to turn it off" }
         require(finalReplyTimeoutMillis == null || finalReplyTimeoutMillis > 0) {
             "finalReplyTimeoutMillis must be positive, or null to turn it off"
+        }
+        require(targetChunkMillis == null || targetChunkMillis > 0) { "targetChunkMillis must be positive, or null to turn it off" }
+        require(targetChunkMillis == null || minChunkSize >= MIN_ADAPTIVE_CHUNK_SIZE) {
+            "minChunkSize must be at least ${MIN_ADAPTIVE_CHUNK_SIZE / 1024} KiB when targetChunkMillis is set"
         }
     }
 
@@ -124,6 +138,11 @@ data class TusUploadOptions(
         retryOptions: RetryOptions = this.retryOptions,
     ): TusUploadOptions = copy(checkServerCapabilities = checkServerCapabilities, chunkSize = chunkSize,
         useFileLock = useFileLock, retryOptions = retryOptions, allowEmptyUpload = allowEmptyUpload)
+
+    companion object {
+        /** The smallest [minChunkSize] allowed with [targetChunkMillis]: 16 KiB. */
+        const val MIN_ADAPTIVE_CHUNK_SIZE: Long = 16 * 1024
+    }
 
     /** The floor adaptive chunk sizing shrinks to: [minChunkSize], but never above [chunkSize]. */
     internal val effectiveMinChunkSize: Long get() = minOf(minChunkSize, chunkSize)
