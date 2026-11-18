@@ -34,3 +34,6 @@ replay_pid*
 /library/build
 /ktus-okio/build
 /ktus/build
+
+# Gradle build outputs in any module
+build/

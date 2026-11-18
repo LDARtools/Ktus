@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "com.ldartools"
-version = "1.0.3"
+version = "1.1.0"
 
 kotlin {
     jvm()
@@ -47,6 +47,17 @@ kotlin {
             implementation(libs.kotlinx.coroutines.test)
             implementation(libs.ktor.client.mock)
         }
+        iosTest.dependencies {
+            // Real-socket tests on the iOS simulator with the Darwin (NSURLSession) engine.
+            implementation(libs.ktor.client.darwin)
+        }
+
+        jvmTest.dependencies {
+            // Real-socket fault-injection tests: a raw ServerSocket fake tus server and the CIO engine.
+            implementation(libs.ktor.client.cio)
+            implementation(libs.ktor.client.okhttp)
+        }
+
     }
 }
 

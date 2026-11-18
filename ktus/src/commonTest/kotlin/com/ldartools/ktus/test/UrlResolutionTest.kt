@@ -1,8 +1,10 @@
 package com.ldartools.ktus.test
 
+import com.ldartools.ktus.TusProtocolException
 import com.ldartools.ktus.resolveUrl
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 
 /**
  * Tests for [resolveUrl] — the Location header URL resolution logic.
@@ -146,6 +148,56 @@ class UrlResolutionTest {
     fun tusdPattern_absolutePathWithBasePath() {
         val result = "https://example.com/files/".resolveUrl("/files/abcdef1234567890")
         assertEquals("https://example.com/files/abcdef1234567890", result)
+    }
+
+    // ========== 1.1: RFC 3986 details ==========
+
+    @Test
+    fun relativePath_withQuery_keepsTheQueryOutOfThePath() {
+        // 1.0.x put "abc?token=x" into a path segment and percent-encoded the '?'.
+        val result = "https://example.com/api/v1/files".resolveUrl("uploads/abc?token=x&y=1")
+        assertEquals("https://example.com/api/v1/uploads/abc?token=x&y=1", result)
+    }
+
+    @Test
+    fun absolutePath_withQuery() {
+        assertEquals("https://example.com/uploads/abc?sig=a%2Fb",
+            "https://example.com/files?old=1".resolveUrl("/uploads/abc?sig=a%2Fb"))
+    }
+
+    @Test
+    fun queryOnlyReference_keepsTheBasePath() {
+        assertEquals("https://example.com/files/abc?x=1", "https://example.com/files/abc?y=2".resolveUrl("?x=1"))
+    }
+
+    @Test
+    fun dotSegments_areRemoved() {
+        assertEquals("https://example.com/a/g", "https://example.com/a/b/c".resolveUrl("../g"))
+        assertEquals("https://example.com/a/b/g", "https://example.com/a/b/c".resolveUrl("./g"))
+        assertEquals("https://example.com/g", "https://example.com/a/b/c".resolveUrl("../../../../g"))
+        assertEquals("https://example.com/x/z", "https://example.com/a".resolveUrl("/x/y/../z"))
+    }
+
+    @Test
+    fun networkPathReference_keepsTheBaseScheme() {
+        assertEquals("https://cdn.example.com/u/1", "https://example.com/files".resolveUrl("//cdn.example.com/u/1"))
+    }
+
+    @Test
+    fun fragments_areDropped() {
+        assertEquals("https://example.com/uploads/abc", "https://example.com/files".resolveUrl("/uploads/abc#frag"))
+    }
+
+    @Test
+    fun unparseableLocations_throw() {
+        for (location in listOf("", "   ", "http://exa mple.com/", "1abc:def", "/a\\b", "/a\"b", "/a\u0001b")) {
+            assertFailsWith<TusProtocolException>("\"$location\"") { "https://example.com/files".resolveUrl(location) }
+        }
+    }
+
+    @Test
+    fun aRelativeBase_throws() {
+        assertFailsWith<TusProtocolException> { "/files".resolveUrl("uploads/abc") }
     }
 
     @Test

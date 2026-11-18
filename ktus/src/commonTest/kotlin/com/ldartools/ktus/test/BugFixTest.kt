@@ -30,7 +30,7 @@ class BugFixTest {
         val testFile = InMemoryTusFile("test.bin", fileData)
         var serverOffset = 0L
         var patchAttempts = 0
-        val receivedBytes = mutableListOf<ByteArray>()
+        val receivedBytes = SyncList<ByteArray>()
 
         val engine = MockEngine { request ->
             when (request.method) {
@@ -99,7 +99,7 @@ class BugFixTest {
         val testFile = InMemoryTusFile("test.bin", fileData)
         var serverOffset = 0L
         var patchAttempts = 0
-        val byteSizesPerAttempt = mutableListOf<Int>()
+        val byteSizesPerAttempt = SyncList<Int>()
 
         val engine = MockEngine { request ->
             when (request.method) {
@@ -322,7 +322,8 @@ class BugFixTest {
                 uploadUrl = "https://example.com/files/uploads/123",
                 file = testFile,
                 options = TusUploadOptions(
-                    chunkSize = 200L,
+                    chunkSize = 100L, // Not the final chunk: an exhausted final PATCH is TusUploadOutcomeUnknownException (see ProductionHardeningTest).
+                    
                     retryOptions = RetryOptions(maxRetries = maxRetries, initialDelayMillis = 1, maxDelayMillis = 10)
                 )
             )
@@ -421,7 +422,7 @@ class BugFixTest {
         var patchCount = 0
         var headCount = 0
         var serverOffset = 0L
-        val patchOffsets = mutableListOf<Long>()
+        val patchOffsets = SyncList<Long>()
 
         val engine = MockEngine { request ->
             when (request.method) {
@@ -566,7 +567,8 @@ class BugFixTest {
                 uploadUrl = "https://example.com/files/uploads/123",
                 file = testFile,
                 options = TusUploadOptions(
-                    chunkSize = 200L,
+                    chunkSize = 100L, // Not the final chunk: an exhausted final PATCH is TusUploadOutcomeUnknownException (see ProductionHardeningTest).
+                    
                     retryOptions = RetryOptions(maxRetries = 3, initialDelayMillis = 1, maxDelayMillis = 10)
                 )
             )
@@ -720,7 +722,8 @@ class BugFixTest {
             createUrl = "https://example.com/files",
             file = testFile,
             metadata = mapOf("is-confidential" to ""),
-            options = TusUploadOptions(checkServerCapabilities = false)
+            // 1.1 omits empty values by default; this test covers the opt-out.
+            options = TusUploadOptions(checkServerCapabilities = false, omitEmptyMetadataValues = false)
         )
 
         assertNotNull(receivedMetadata, "Upload-Metadata header should be present")
@@ -762,7 +765,8 @@ class BugFixTest {
             createUrl = "https://example.com/files",
             file = testFile,
             metadata = mapOf("filename" to "test.bin", "is-confidential" to ""),
-            options = TusUploadOptions(checkServerCapabilities = false)
+            // 1.1 omits empty values by default; this test covers the opt-out.
+            options = TusUploadOptions(checkServerCapabilities = false, omitEmptyMetadataValues = false)
         )
 
         assertNotNull(receivedMetadata, "Upload-Metadata header should be present")
@@ -876,7 +880,8 @@ class BugFixTest {
         client.createAndUploadTus(
             createUrl = "https://example.com/api/v1/files",
             file = testFile,
-            options = TusUploadOptions(checkServerCapabilities = false),
+            // 1.1: a Location on another host is only accepted when the host is allow-listed.
+            options = TusUploadOptions(checkServerCapabilities = false, allowedUploadHosts = setOf("cdn.example.com")),
             onCreate = { resolvedUrl = it }
         )
 

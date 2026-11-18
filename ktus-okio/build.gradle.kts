@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "com.ldartools"
-version = "1.0.3"
+version = "1.1.0"
 
 kotlin {
     jvm()
@@ -40,13 +40,15 @@ kotlin {
         commonMain.dependencies {
             //put your multiplatform dependencies here
             implementation(libs.ktor.client.core)
-            implementation(project(":ktus"))
+            api(project(":ktus"))
             implementation(libs.okio)
         }
 
         commonTest.dependencies {
             implementation(libs.kotlin.test)
             implementation(libs.kotlinx.coroutines.test)
+            implementation(libs.ktor.client.mock)
+            implementation(libs.okio.fakefilesystem)
         }
     }
 }
