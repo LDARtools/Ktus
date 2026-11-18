@@ -8,6 +8,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * The body of one PATCH request: [length] bytes of [file] starting at [offset].
@@ -42,7 +43,32 @@ internal class TusPatchContent(
      */
     fun localFailure(): TusLocalFileException? = if (localFailure.isCompleted) localFailure.getCompleted() else null
 
+    private val writeStarted = CompletableDeferred<Unit>()
+    private val writeFinished = CompletableDeferred<Unit>()
+
+    /**
+     * Waits until a body write the engine started has finished (written, failed or cancelled by [abandon]), so
+     * [localFailure] does not depend on which thread got there first: an engine can return (an exception or a
+     * server answer) while the writer, on another thread, is still between its short read and recording it.
+     * Returns at once when no write was started or it already finished (the normal case). Call after [abandon];
+     * the wait is bounded in case a file read ignores cancellation.
+     */
+    suspend fun awaitWriteSettled() {
+        if (writeStarted.isCompleted && !writeFinished.isCompleted) {
+            withTimeoutOrNull(WRITE_SETTLE_MILLIS) { writeFinished.await() }
+        }
+    }
+
     override suspend fun writeTo(channel: ByteWriteChannel) {
+        writeStarted.complete(Unit)
+        try {
+            write(channel)
+        } finally {
+            writeFinished.complete(Unit)
+        }
+    }
+
+    private suspend fun write(channel: ByteWriteChannel) {
         coroutineScope {
             val write = async {
                 try {
@@ -71,5 +97,8 @@ internal class TusPatchContent(
 
     companion object {
         val OFFSET_OCTET_STREAM: ContentType = ContentType.parse("application/offset+octet-stream")
+
+        /** Longest wait for an abandoned body write to finish before classifying the attempt without it. */
+        const val WRITE_SETTLE_MILLIS = 5_000L
     }
 }

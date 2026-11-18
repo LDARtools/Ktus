@@ -132,15 +132,82 @@ class ShortReadPrecedenceTest {
         })
     }
 
-    /** A success-like answer to a body we know was short: what the server kept is unknown, the mark stays. */
-    @Test
-    fun serverAnswers204ToTheTruncatedBody_isAnUnknownOutcome() = runTest {
-        val (error, store) = run { failure ->
-            assertIs<TusLocalFileException>(failure)
-            respond("", HttpStatusCode.NoContent, headersOf("Upload-Offset", "$claimed"))
+    /**
+     * A file whose short read surfaces only after the engine has already returned: the writer has written what it
+     * has, then fails in a step that ignores cancellation (like a blocking read), [delayMillis] later.
+     */
+    private class LateShortFile(
+        private val bytes: ByteArray,
+        private val claimed: Long,
+        val started: kotlinx.coroutines.CompletableDeferred<Unit>,
+        private val delayMillis: Long = 200,
+    ) : ITusFile {
+        override val size: Long get() = claimed
+        override val name: String get() = "late-short.bin"
+        override suspend fun writeSection(offset: Long, length: Long, channel: ByteWriteChannel) {
+            val avail = (bytes.size - offset).coerceAtLeast(0).coerceAtMost(length)
+            if (avail > 0) channel.writeFully(bytes, offset.toInt(), (offset + avail).toInt())
+            started.complete(Unit)
+            if (avail < length) {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) { kotlinx.coroutines.delay(delayMillis) }
+                throw TusLocalFileException("late short read at $offset")
+            }
         }
+        override suspend fun readSection(offset: Long, length: Long): ByteReadChannel = error("unused")
+        override suspend fun fileReadLock(): AutoCloseable = AutoCloseable { }
+    }
+
+    /**
+     * The engine returns the server's [status] while the body writer is still running; the writer's short read
+     * surfaces only afterwards. Runs on real threads (the writer's late failure is real time).
+     */
+    private suspend fun runLate(status: HttpStatusCode, headers: io.ktor.http.Headers = io.ktor.http.Headers.Empty):
+        Pair<Throwable?, InMemoryTusUrlStore> = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+        var file: LateShortFile? = null
+        val writers = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default)
+        val engine = MockEngine { request ->
+            when (request.method) {
+                HttpMethod.Head -> respond("", HttpStatusCode.OK, headersOf(
+                    "Upload-Offset" to listOf("0"), "Upload-Length" to listOf("$claimed"), "Tus-Resumable" to listOf("1.0.0")))
+                HttpMethod.Patch -> {
+                    writers.launch { drain(request.body) }
+                    file!!.started.await() // the writer is running: answer now, before it fails
+                    respond("", status, headers)
+                }
+                else -> respond("", HttpStatusCode.MethodNotAllowed)
+            }
+        }
+        val store = InMemoryTusUrlStore()
+        store.set("fp", TusUpload(url, claimed))
+        val error = runCatching {
+            HttpClient(engine) { followRedirects = false }.use { client ->
+                client.resumeOrCreateAndUploadTus(createUrl, LateShortFile(ByteArray(40) { it.toByte() }, claimed,
+                    kotlinx.coroutines.CompletableDeferred()).also { file = it }, "fp", store,
+                    options = TusUploadOptions(activityHeartbeatMillis = null,
+                        retryOptions = RetryOptions(maxRetries = 1)))
+            }
+        }.exceptionOrNull()
+        writers.coroutineContext[kotlinx.coroutines.Job]?.cancel()
+        error to store
+    }
+
+    /**
+     * The server answers 204 (offset = total) while the writer is still running, and the short read surfaces
+     * after the engine returned. Ktus must still see it (it waits for the abandoned write to settle): a
+     * success-like answer to a body we know was short is an unknown outcome, and the mark stays. Without the
+     * wait the call reported success for a file that was never fully read.
+     */
+    @Test
+    fun serverAnswers204_beforeTheShortReadSurfaces_isAnUnknownOutcome() = runTest {
+        val (error, store) = runLate(HttpStatusCode.NoContent, headersOf("Upload-Offset", "$claimed"))
         val unknown = assertIs<TusUploadOutcomeUnknownException>(error, "$error")
-        assertIs<TusLocalFileException>(unknown.cause)
+        assertIs<TusLocalFileException>(unknown.cause, "${unknown.cause}")
         assertNotNull(store.get("fp")?.finalSentAt, "the mark stays")
+    }
+
+    /** The same ordering with a 409: the short read still wins, the mark is cleared, nothing is retried. */
+    @Test
+    fun serverAnswers409_beforeTheShortReadSurfaces() = runTest {
+        assertLocalFileErrorAndNoMark(runLate(HttpStatusCode.Conflict))
     }
 }
