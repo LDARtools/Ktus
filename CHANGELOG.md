@@ -119,9 +119,9 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
 - **No request is sent once the retry budget is spent, except the single last resolution HEAD** (without waiting
   or retrying) when giving up on an unresolved final PATCH; if it shows the whole file, the upload succeeds. The
   budget measures a run of consecutive failures across the whole call: any request that succeeds at its job ends
-  the run (a recovery HEAD that shows no new data does not). From the start of a run a call gives up at worst
-  after the request in flight when it started + `maxElapsedMillis` + up to two request timeouts (a request in
-  flight when the budget ran out, then that last HEAD).
+  the run (a recovery HEAD that shows no new data does not). Counted from when the run's first failing request
+  was sent, a call gives up at worst after that request + `maxElapsedMillis` + up to two request timeouts (a
+  request still in flight when the budget ran out, then that last HEAD).
 - **`minDelayMillis` must be below `maxElapsedMillis`** (when it is set), otherwise no retry could be sent.
 - **404/410 from POST or OPTIONS** is a `TusHttpException`, no longer a `TusUploadExpiredException`.
 - **Retry defaults are longer.** `maxRetries` 3 → 10, `maxDelayMillis` 10 s → 30 s, plus a new 10-minute

@@ -138,9 +138,10 @@ httpClient.createAndUploadTus(
   it (OPTIONS answered, POST 201, the first HEAD answered, a PATCH 204, a recovery HEAD showing more data). A
   recovery HEAD that shows no new data does not end it, so a server that answers but never accepts data still
   runs out of budget. Once it is spent, no request is sent except the single last
-  resolution HEAD for an unresolved final PATCH. So from the start of a run, Ktus gives up at worst after: the
-  request in flight when the run started + `maxElapsedMillis` + up to two request timeouts (a request already in
-  flight when the budget ran out, then that last HEAD). Without a request timeout a request can run forever, so
+  resolution HEAD for an unresolved final PATCH. So counted from when the run's first failing request was sent,
+  Ktus gives up at worst after: that request + `maxElapsedMillis` + up to two request timeouts (a request still
+  in flight when the budget ran out, then that last HEAD; both can happen when the request in flight is the
+  final PATCH). Without a request timeout a request can run forever, so
   set one. Size `maxElapsedMillis` to what you can really wait, or put a finite outer limit (`withTimeout`)
   around the call.
 - Callbacks can run on different threads: the in-flight ticker on the caller's dispatcher, and

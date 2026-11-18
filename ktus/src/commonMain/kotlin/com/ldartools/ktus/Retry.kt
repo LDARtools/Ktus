@@ -61,8 +61,9 @@ internal sealed class Outcome {
  * Exponential backoff with full jitter over one run of consecutive failures.
  *
  * The elapsed-time budget ([RetryOptions.maxElapsedMillis]) starts at the first failure of the run and the
- * delay exponent grows with every failure in it. [reset] ends the run; Ktus calls it whenever the upload
- * makes progress, so a long upload is never cut short by the budget as long as it keeps moving.
+ * delay exponent grows with every failure in it. [reset] ends the run; Ktus calls it whenever a request
+ * succeeds at its job (OPTIONS, POST, the first HEAD, a PATCH, a recovery HEAD showing progress), so neither
+ * a long upload that keeps moving nor an early blip shortens later retries.
  */
 internal class Backoff(
     private val options: RetryOptions,
