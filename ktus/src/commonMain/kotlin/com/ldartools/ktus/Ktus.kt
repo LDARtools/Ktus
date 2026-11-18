@@ -82,9 +82,11 @@ suspend fun HttpClient.createTusUpload(
  * Sends a HEAD first to learn the server's offset, then PATCHes the rest of the file in chunks. Every
  * failure whose outcome is unknown (network error, timeout, 500, 502, 503, 504, 408, 423, 429, 409, or any
  * 2xx other than 204) is followed by a backoff and then a HEAD, and the upload continues from the offset the server
- * reports; a chunk is never blindly re-sent at the old offset. When Ktus gives up retrying an unresolved final
- * PATCH itself (out of attempts or budget), it sends one last HEAD without waiting, and succeeds if that shows the
- * whole file. If a recovery HEAD is what fails, no further HEAD is sent.
+ * reports; a chunk is never blindly re-sent at the old offset. When Ktus gives up retrying a PATCH while a final
+ * PATCH is unresolved (out of attempts or budget), it sends one last HEAD without waiting, and succeeds if that
+ * shows the whole file. If a recovery HEAD is what fails, no further HEAD is sent. A 404/410 answered to a final
+ * PATCH is [TusUploadOutcomeUnknownException] ([TusUploadOutcomeUnknownException.Kind.UPLOAD_GONE]), never a plain
+ * [TusUploadExpiredException]: the server may have completed and removed the upload.
  * See [RetryOptions] for the limits; the elapsed budget measures a run of consecutive failures.
  *
  * The file size is read once at the start. The upload fails if the size changes before it completes,
@@ -243,7 +245,7 @@ suspend fun HttpClient.createAndUploadTus(
  * It is cleared only when the upload completes, or when a PATCH is answered 204 below the total while
  * no final PATCH has ever ended uncertain (in this call or, for an entry carried over from an earlier call, before
  * it: such an entry keeps its mark until completion), or by a definitive refusal of the final PATCH (a non-retried
- * 4xx, a 3xx or a short local read; never a 5xx). A HEAD never clears it.
+ * 4xx other than 404/410, a 3xx or a short local read; never a 5xx or a 404/410). A HEAD never clears it.
  * If the store cannot remove the entry after the upload completed, the call still succeeds; the entry stays
  * marked and the next call for it reports [TusUploadOutcomeUnknownException]. [store] writes must be durable
  * when they return; see [TusUrlStore].
@@ -327,13 +329,13 @@ private suspend fun HttpClient.resumeOrCreateInternal(
         } catch (e: CallbackFailure) {
             throw e
         } catch (e: TusUploadExpiredException) {
-            // Only reaches here when it is definitive: a 404/410 answered to the final PATCH with no earlier final
-            // PATCH left unknown (anything else is TusUploadOutcomeUnknownException). The server never had
-            // the upload, so forget it.
+            // Only reaches here before any final PATCH was sent (the first HEAD or a non-final PATCH answered
+            // 404/410): the upload expired without the file, so forget it. After a final PATCH a 404/410 is
+            // TusUploadOutcomeUnknownException (UPLOAD_GONE): the server may have completed and removed it.
             guardedStore { store.remove(fingerprint) }
             throw e
         } catch (e: Throwable) {
-            // Also definitive (for example a 403 answered to the final PATCH, never a 5xx): the bytes did not
+            // Also definitive (for example a 403 answered to the final PATCH, never a 5xx or 404/410): the bytes did not
             // land, so the mark set for that PATCH no longer applies.
             if (entry.finalSentAt != null) {
                 entry = entry.copy(finalSentAt = null)
@@ -798,9 +800,10 @@ private suspend fun HttpClient.uploadInternal(
                         // client followed a redirect elsewhere): unknown outcome.
                         if ((error !is TusProtocolException && error !is ResponseException) ||
                             error is RedirectedAnswerException) finalMayHaveLanded = true
-                        // Definitive only when the server (or the local file) answered, with a 4xx, a redirect or a
-                        // short read, and no final PATCH in this call ever ended unknown. Any 5xx may come after
-                        // the bytes were stored, so it is never definitive.
+                        // Definitive only when the server (or the local file) answered, with a 4xx other than
+                        // 404/410, a redirect or a short read, and no final PATCH in this call ever ended unknown. Any
+                        // 5xx may come after the bytes were stored, and a 404/410 after another request completed
+                        // and removed the upload, so neither is ever definitive.
                         if (!unresolvedBefore && !finalEverUncertain && isDefinitiveRefusal(error)) {
                             freshDefinitiveRefusal = true
                         } else {
@@ -888,7 +891,7 @@ private suspend fun HttpClient.uploadInternal(
         throw e
     } catch (e: Throwable) {
         // Once a final PATCH has been sent and not proved incomplete by a later 204, any failure leaves the
-        // outcome unknown; only a definitive refusal (4xx, redirect, short read) with no earlier unknown final
+        // outcome unknown; only a definitive refusal (4xx but 404/410, redirect, short read) with no earlier unknown final
         // PATCH in the call is not.
         if (finalMayHaveLanded || finalEverUncertain || (finalUnresolved && !freshDefinitiveRefusal)) {
             throw TusUploadOutcomeUnknownException(uploadUrl, e, classifyOutcomeUnknown(e, retry))
@@ -900,15 +903,22 @@ private suspend fun HttpClient.uploadInternal(
 /** Statuses a gateway answers while the origin may still be working on the request. */
 private val GATEWAY_STATUSES = setOf(502, 503, 504)
 
+/** "Upload gone" statuses. */
+private val GONE_STATUSES = setOf(404, 410)
+
 /** How many times a HEAD below the confirmed offset is asked again before the upload fails. */
 private const val MAX_STALE_HEADS = 3
 
-/** A refusal of a PATCH that proves its bytes did not (all) land: a 4xx, a redirect, or a short local read. */
+/**
+ * A refusal of a PATCH that proves its bytes did not (all) land: a 4xx, a redirect, or a short local read.
+ * Never 404/410: tusdotnet answers that once another request completed the upload and the server removed it.
+ */
 private fun isDefinitiveRefusal(error: Throwable): Boolean = when (error) {
-    is TusHttpException -> error.statusCode in 400..499
-    is ResponseException -> error.response.status.value in 400..499
+    is TusUploadExpiredException -> false
+    is TusHttpException -> error.statusCode in 400..499 && error.statusCode !in GONE_STATUSES
+    is ResponseException -> error.response.status.value.let { it in 400..499 && it !in GONE_STATUSES }
     is RedirectedAnswerException -> false // the body may have reached the original server first
-    is TusUploadExpiredException, is TusLocalFileException -> true
+    is TusLocalFileException -> true
     is TusProtocolException -> true // a redirect or another protocol error raised for a 3xx/4xx answer
     else -> false
 }

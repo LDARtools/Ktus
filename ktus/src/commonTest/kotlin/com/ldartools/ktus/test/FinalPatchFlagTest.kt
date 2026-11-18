@@ -348,20 +348,27 @@ class FinalPatchFlagTest {
         assertNotNull(store.get("fp")?.finalSentAt)
     }
 
-    /** A 404 answered directly to the first-ever final PATCH is definitive: no permanent mark is left behind. */
+    /**
+     * A 404 answered to the first-ever final PATCH is NOT definitive: tusdotnet answers it too once another request
+     * completed the upload and removed it. The outcome is unknown (UPLOAD_GONE), the mark stays, nothing is
+     * re-created, and the next call reports the same.
+     */
     @Test
-    fun a404AnsweredToTheFirstFinalPatch_isExpired_andLeavesNoMark() = runTest {
+    fun a404AnsweredToTheFirstFinalPatch_isUploadGone_andKeepsTheMark() = runTest {
         val srv = Srv(500)
         val store = InMemoryTusUrlStore()
         val file = InMemoryTusFile("f", testBytes(500))
         val opts = TusUploadOptions(chunkSize = 500, activityHeartbeatMillis = null, retryOptions = retry())
         srv.patchHook = { _, _, _ -> srv.uploads.clear(); null } // the server lost the upload before the PATCH
         val e1 = runCatching { srv.client().resumeOrCreateAndUploadTus(createUrl, file, "fp", store, options = opts) }.exceptionOrNull()
-        assertIs<TusUploadExpiredException>(e1, "a 404 to a never-before-sent final PATCH: the server never had it")
-        assertNull(store.get("fp"), "no stuck mark")
+        val unknown = assertIs<TusUploadOutcomeUnknownException>(e1)
+        assertEquals(TusUploadOutcomeUnknownException.Kind.UPLOAD_GONE, unknown.kind)
+        assertNotNull(store.get("fp")?.finalSentAt, "the mark stays")
         srv.patchHook = { _, _, _ -> null }
-        srv.client().resumeOrCreateAndUploadTus(createUrl, file, "fp", store, options = opts)
-        assertEquals(1, srv.processed.size)
+        val e2 = runCatching { srv.client().resumeOrCreateAndUploadTus(createUrl, file, "fp", store, options = opts) }.exceptionOrNull()
+        assertIs<TusUploadOutcomeUnknownException>(e2, "a marked entry is never re-created")
+        assertEquals(0, srv.processed.size)
+        assertNotNull(store.get("fp")?.finalSentAt)
     }
 
     /** A direct 403 to the first final PATCH clears the mark it just set (the bytes did not land). */

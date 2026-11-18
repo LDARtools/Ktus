@@ -126,9 +126,17 @@ class StatusPolicyTest {
                     val server = server()
                     server.script(method, Reply.Status(status))
                     val client = server.client(expectSuccess)
-                    assertFailsWith<TusUploadExpiredException>("$method $status expectSuccess=$expectSuccess") {
+                    val call = suspend {
                         client.uploadTus("https://example.com/files/abc", InMemoryTusFile("f", testBytes(fileSize)),
                             options = TusUploadOptions(retryOptions = fastRetry()))
+                    }
+                    if (method == HttpMethod.Head) {
+                        assertFailsWith<TusUploadExpiredException>("$method $status expectSuccess=$expectSuccess") { call() }
+                    } else {
+                        // The only PATCH carries the last bytes: tusdotnet also answers 404/410 once another request
+                        // completed the upload and removed it, so the outcome is unknown, never "expired".
+                        val e = assertFailsWith<TusUploadOutcomeUnknownException>("$method $status expectSuccess=$expectSuccess") { call() }
+                        assertEquals(TusUploadOutcomeUnknownException.Kind.UPLOAD_GONE, e.kind)
                     }
                     assertEquals(1, server.count(method), "$method $status must not be retried")
                 }
