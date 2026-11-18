@@ -18,6 +18,8 @@ import io.ktor.util.encodeBase64
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
 import kotlin.math.max
@@ -719,12 +721,15 @@ private suspend fun HttpClient.uploadInternal(
             val isFinal = start + length == total
             patchAttempts++
 
+            // A cancelled caller, or a closed client, means this PATCH is never sent: it cannot have landed. Both are
+            // checked before onFinalPatch and before the store is marked, so a PATCH that never left leaves no mark
+            // behind. (`isActive` below is the client's scope, not the caller's, hence the explicit check here.)
+            currentCoroutineContext().ensureActive()
             if (!isActive || !engine.isActive) {
-                // Closed before this PATCH was sent: it cannot have landed. Checked before onFinalPatch and
-                // before the store is marked, so a PATCH that never left leaves no mark behind.
                 throw IllegalStateException("The HttpClient (or its engine) is closed; tus requests cannot be sent with it")
             }
             val unresolvedBefore = finalUnresolved
+            val mayHaveLandedBefore = finalMayHaveLanded
             if (isFinal) {
                 onFinalPatch?.invoke()
                 if (hooks != null && !persistedFlag) {
@@ -824,8 +829,15 @@ private suspend fun HttpClient.uploadInternal(
 
                 is Outcome.Retry -> {
                     if (isFinal) {
-                        finalMayHaveLanded = true
-                        finalEverUncertain = true
+                        if (outcome.statusCode in NOT_APPLIED_RETRY_STATUSES) {
+                            // The server refused this PATCH before applying any of it (auth, offset mismatch, lock):
+                            // it changes nothing about whether a final PATCH landed. Undo what sending it set.
+                            finalUnresolved = unresolvedBefore
+                            finalMayHaveLanded = mayHaveLandedBefore
+                        } else {
+                            finalMayHaveLanded = true
+                            finalEverUncertain = true
+                        }
                     }
                     if (outcome.timedOut && options.adaptiveChunkSize) {
                         chunkSize = max(minChunkSize, chunkSize / 2)
@@ -911,6 +923,13 @@ private suspend fun HttpClient.uploadInternal(
 
 /** Statuses a gateway answers while the origin may still be working on the request. */
 private val GATEWAY_STATUSES = setOf(502, 503, 504)
+
+/**
+ * Retried PATCH answers that prove the server applied none of the request: 401 (the token is refreshed and the
+ * PATCH re-sent), 409 (Upload-Offset mismatch) and 423 (another request holds the upload's lock). tus servers
+ * check all three before reading the body.
+ */
+private val NOT_APPLIED_RETRY_STATUSES = setOf(401, 409, 423)
 
 /** "Upload gone" statuses. */
 private val GONE_STATUSES = setOf(404, 410)

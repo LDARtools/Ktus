@@ -52,8 +52,12 @@ interface ITusFile {
      * therefore never leak the file handle: if the request is cancelled or fails, this function is
      * cancelled with it.
      *
-     * It must throw [TusProtocolException] if the file holds fewer than [length] bytes at [offset]; a
-     * shorter body would otherwise reach the server as a truncated chunk.
+     * It must throw [TusLocalFileException] if the file holds fewer than [length] bytes at [offset] (a
+     * shorter body would otherwise reach the server as a truncated chunk), or if reading the file fails.
+     * Ktus treats that exception as a problem with the local file: it is not retried, and a stored upload is
+     * kept rather than discarded. Any other exception, including a plain [TusProtocolException], is treated
+     * as a failure of the request. Only failures reading the file should be wrapped; let a failure writing to
+     * [channel] (the connection) propagate as it is.
      *
      * The default implementation copies from [readSection], for implementations written for Ktus 1.0.
      */

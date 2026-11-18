@@ -42,7 +42,7 @@ class OkioTusFile(private val path: Path, private val fileSystem: FileSystem) : 
         // request's coroutine: cancelling the request cancels the read and closes the file.
         withContext(Dispatchers.IO) {
             localFile { fileSystem.openReadOnly(path) }.use { handle ->
-                handle.source(offset).buffer().use { source ->
+                localFile { handle.source(offset).buffer() }.use { source ->
                     copySection(source, offset, length) { buffer, count -> channel.writeFully(buffer, 0, count) }
                 }
             }
@@ -92,7 +92,8 @@ class OkioTusFile(private val path: Path, private val fileSystem: FileSystem) : 
         var remaining = length
         while (remaining > 0) {
             val toRead = minOf(buffer.size.toLong(), remaining).toInt()
-            val read = source.read(buffer, 0, toRead)
+            // Only the file read is wrapped: a failure in write() is the connection's, and stays a network error.
+            val read = localFile { source.read(buffer, 0, toRead) }
             if (read == -1) {
                 throw TusLocalFileException(
                     "File \"${path.name}\" ended early: expected $length bytes at offset $offset, got ${length - remaining}")

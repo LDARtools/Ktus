@@ -2,6 +2,7 @@ package com.ldartools.ktus.okio.test
 
 import com.ldartools.ktus.RetryOptions
 import com.ldartools.ktus.TusHttpException
+import com.ldartools.ktus.TusLocalFileException
 import com.ldartools.ktus.TusProtocolException
 import com.ldartools.ktus.TusUploadOptions
 import com.ldartools.ktus.createAndUploadTus
@@ -206,11 +207,47 @@ class OkioTusFileFakeFsTest {
         awaitNoOpenFiles(fs)
     }
 
+    @Test
+    fun aReadErrorPartwayThroughAChunk_isALocalFileFailure_notRetried() = runTest {
+        val (fake, _) = fs(600 * 1024)
+        val server = Server(600 * 1024)
+        var patches = 0
+        server.patchHandler = { request ->
+            patches++
+            (request.body as OutgoingContent.ReadChannelContent).readFrom().readRemaining()
+            respond("", HttpStatusCode.NoContent, headersOf("Upload-Offset", "0"))
+        }
+        val failing = FailingReadFileSystem(fake, failAt = 100 * 1024)
+        val e = assertFailsWith<TusLocalFileException> {
+            server.client.uploadTus("https://example.com/files/abc", OkioTusFile(path, failing), options = quick)
+        }
+        assertIs<okio.IOException>(e.cause)
+        assertEquals(1, patches, "a failure reading the file must not be retried like a network error")
+        awaitNoOpenFiles(fake)
+    }
+
     private suspend fun awaitNoOpenFiles(fs: FakeFileSystem) {
         withContext(Dispatchers.Default) {
             withTimeout(2_000) { while (fs.openPaths.isNotEmpty()) delay(10) }
         }
         fs.checkNoOpenFiles()
+    }
+}
+
+/** Fails every read at or past [failAt] with an I/O error, like EIO or a stale network-share handle. */
+private class FailingReadFileSystem(delegate: FileSystem, private val failAt: Long) : ForwardingFileSystem(delegate) {
+    override fun openReadOnly(file: Path): FileHandle = Handle(super.openReadOnly(file), failAt)
+
+    private class Handle(private val delegate: FileHandle, private val failAt: Long) : FileHandle(false) {
+        override fun protectedRead(fileOffset: Long, array: ByteArray, arrayOffset: Int, byteCount: Int): Int {
+            if (fileOffset + byteCount > failAt) throw okio.IOException("simulated read error at $fileOffset")
+            return delegate.read(fileOffset, array, arrayOffset, byteCount)
+        }
+        override fun protectedWrite(fileOffset: Long, array: ByteArray, arrayOffset: Int, byteCount: Int) = error("read-only")
+        override fun protectedFlush() = Unit
+        override fun protectedResize(size: Long) = error("read-only")
+        override fun protectedSize(): Long = delegate.size()
+        override fun protectedClose() = delegate.close()
     }
 }
 
