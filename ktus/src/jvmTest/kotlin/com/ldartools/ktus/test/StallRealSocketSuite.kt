@@ -33,6 +33,8 @@ class CioStallRealSocketTest : StallRealSocketSuite() {
                 }
             }.exceptionOrNull()
             assertNotNull(e, "CIO's socket timeout let the slow body through; the README claim would be wrong")
+            val timeout = generateSequence(e) { it.cause }.firstOrNull { it is java.net.SocketTimeoutException }
+            assertNotNull(timeout, "cut by the socket timeout: $e")
             Unit
         }
     }

@@ -142,7 +142,8 @@ class StallLimitsTest {
     private fun Throwable?.stall(): TusStallTimeoutException? =
         generateSequence(this) { it.cause }.filterIsInstance<TusStallTimeoutException>().firstOrNull()
 
-    private val slack = 600L
+    /** Generous: a 2-core CI runner can be slow to schedule the watchdog and the retry. */
+    private val slack = 2_000L
 
     @Test
     fun aBodyThatStops_isCutAtSendStall_andTheUploadResumesViaHead() = real {

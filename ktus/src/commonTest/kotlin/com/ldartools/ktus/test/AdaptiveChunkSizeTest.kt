@@ -85,7 +85,7 @@ class AdaptiveChunkSizeTest {
     }
 
     @Test
-    fun aTimeout_halvesTheChunk_andLowersTheEstimate() = runTest {
+    fun aTimeout_dropsToTheFloor_thenGrowsBackAtMost2x() = runTest {
         val total = 1000 * k
         val server = server(total) { 16L * k }
         var offset = 0
@@ -96,8 +96,28 @@ class AdaptiveChunkSizeTest {
         server.script(HttpMethod.Patch, Reply.Throw(io.ktor.client.network.sockets.SocketTimeoutException("read timed out")))
         upload(server, total, opts())
         val sizes = server.patchSizes()
-        assertEquals(80 * k, sizes[5], "halved after the timeout: $sizes")
-        assertTrue(sizes[6] in (80 * k + 1) until 160 * k, "grows back from the lowered estimate: $sizes")
+        assertEquals(32 * k, sizes[5], "straight to the floor after the timeout: $sizes")
+        assertEquals(64 * k, sizes[6], "then at most 2x per confirmed PATCH: $sizes")
+    }
+
+    /**
+     * The link is fast until the chunk reaches the cap, then falls to ~3 KB/s. The first slow PATCH (the
+     * remaining 320 KiB, ~110 s at 3 KB/s) is cut after 30 s; the next one starts at the floor (32 KiB, ~11 s)
+     * and succeeds, so the slowdown costs exactly one cut instead of one per halving.
+     */
+    @Test
+    fun aLinkThatFallsToAFewKBps_costsExactlyOneCut() = runTest {
+        val fast = listOf(32, 64, 128, 256, 512, 1024, 2048).map { it * k }
+        val total = fast.sum() + 10 * 32 * k
+        val server = server(total) { i -> if (i < fast.size) 100L * 1024 * k else 3_000L }
+        server.linkTimeoutMillis = 30_000
+        upload(server, total, opts().copy(retryOptions = RetryOptions(maxElapsedMillis = 180_000,
+            initialDelayMillis = 10, maxDelayMillis = 10, jitter = false, timeSource = testScheduler.timeSource)))
+        val sizes = server.patchSizes()
+        assertEquals(fast + (320 * k), sizes.take(fast.size + 1), "ramped to the cap, then the cut PATCH: $sizes")
+        assertEquals(32 * k, sizes[fast.size + 1], "straight to the floor: $sizes")
+        assertEquals(2, server.count(HttpMethod.Head), "the first HEAD and exactly one recovery HEAD: ${server.methods()}")
+        assertEquals(List(10) { 32 * k }, sizes.drop(fast.size + 1), "the floor fits the 3 KB/s link: $sizes")
     }
 
     @Test
@@ -114,6 +134,7 @@ class AdaptiveChunkSizeTest {
         assertFailsWith<IllegalArgumentException> { TusUploadOptions(targetChunkMillis = 10_000, minChunkSize = 8L * 1024) }
         TusUploadOptions(targetChunkMillis = 10_000, minChunkSize = 16L * 1024)
         TusUploadOptions(minChunkSize = 8L * 1024) // unchanged without a target
+        assertFailsWith<IllegalArgumentException> { TusUploadOptions(targetChunkMillis = 10_000, adaptiveChunkSize = false) }
         assertNull(TusUploadOptions().targetChunkMillis)
     }
 }

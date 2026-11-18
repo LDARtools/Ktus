@@ -18,8 +18,10 @@ import kotlin.time.TimeSource
  * [TusUploadOptions.replyTimeoutMillis], [TusUploadOptions.finalReplyTimeoutMillis]).
  *
  * It is a network failure like an engine timeout: the request is retried within the retry budget, and an
- * abandoned final PATCH leaves its outcome unknown exactly as a timeout does. Only that request is abandoned,
- * never the upload.
+ * abandoned final PATCH leaves its outcome unknown exactly as a timeout does. Only that request is abandoned, not the upload, and only on the client: bytes already handed to the
+ * operating system can still reach the server, which may then apply the abandoned PATCH after all. The
+ * offset checks keep the data correct (a later PATCH at the old offset is answered 409, and Ktus asks with
+ * HEAD before continuing).
  *
  * @property kind which limit was reached.
  * @property limitMillis the limit that was reached, in milliseconds.

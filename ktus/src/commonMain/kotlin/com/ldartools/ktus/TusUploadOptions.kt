@@ -26,20 +26,25 @@ package com.ldartools.ktus
  *   sent (default null: off). The clock starts when the request is handed to the engine, so a stalled connect
  *   or TLS handshake counts, and restarts on every body progress event (the events behind `onProgress`).
  *   A request without a body (OPTIONS, HEAD, POST, DELETE) is fully sent as soon as it is handed to the
- *   engine, so this limit never applies to it; [replyTimeoutMillis] does. Only that request is abandoned, as a
+ *   engine, so this limit never applies to it; [replyTimeoutMillis] does. The request is abandoned as a
  *   timed-out network failure ([TusStallTimeoutException]): it is retried within the retry budget, and an
- *   abandoned final PATCH leaves its outcome unknown exactly as an engine timeout does.
+ *   abandoned final PATCH leaves its outcome unknown exactly as an engine timeout does. Only that request is
+ *   abandoned, not the upload, and only on the client: bytes already handed to the operating system can still
+ *   reach the server, which may apply the abandoned PATCH after all; the offset checks keep the data correct (a
+ *   later PATCH at the old offset gets 409, then HEAD). The same holds for [replyTimeoutMillis] and
+ *   [finalReplyTimeoutMillis].
  * @param replyTimeoutMillis abandon a request that has been fully sent (every body byte handed to the engine)
  *   when no response arrives within this long (default null: off). Applies to every request except the PATCH
  *   carrying the last bytes, which uses [finalReplyTimeoutMillis].
  * @param finalReplyTimeoutMillis the same as [replyTimeoutMillis] for the PATCH carrying the last bytes, which
  *   a server may answer only after slow completion work (default null: off). [replyTimeoutMillis] does not
- *   apply to it.
+ *   apply to it. Setting only [replyTimeoutMillis] leaves the final PATCH with no Ktus limit.
  * @param targetChunkMillis size each PATCH so it takes about this long on the link (default null: off, every
  *   PATCH is [chunkSize]). The first PATCH of a call uses [minChunkSize]; after each PATCH the server confirmed,
  *   the measured goodput (bytes confirmed / time from the PATCH's start to its 204, smoothed) times this target
- *   gives the next size, within [minChunkSize]..[chunkSize] and at most twice the previous size. A timeout still
- *   halves the size. This keeps the bytes in flight small relative to the link speed, which the silence limits
+ *   gives the next size, within [minChunkSize]..[chunkSize] and at most twice the previous size. A timeout or
+ *   silence-limit cut drops the next PATCH straight to [minChunkSize] (instead of halving). Requires
+ *   [adaptiveChunkSize]. This keeps the bytes in flight small relative to the link speed, which the silence limits
  *   need (see "Weak links" in the README). When set, [minChunkSize] may be as low as 16 KiB; every PATCH is at
  *   least that, so a server that stores each PATCH separately (for example one Azure block per PATCH, at most
  *   50,000 blocks) limits the file size to about 50,000 × [minChunkSize] in the worst case.
@@ -80,6 +85,9 @@ data class TusUploadOptions(
             "finalReplyTimeoutMillis must be positive, or null to turn it off"
         }
         require(targetChunkMillis == null || targetChunkMillis > 0) { "targetChunkMillis must be positive, or null to turn it off" }
+        require(targetChunkMillis == null || adaptiveChunkSize) {
+            "targetChunkMillis needs adaptiveChunkSize: without it a timeout would not shrink the chunk"
+        }
         require(targetChunkMillis == null || minChunkSize >= MIN_ADAPTIVE_CHUNK_SIZE) {
             "minChunkSize must be at least ${MIN_ADAPTIVE_CHUNK_SIZE / 1024} KiB when targetChunkMillis is set"
         }

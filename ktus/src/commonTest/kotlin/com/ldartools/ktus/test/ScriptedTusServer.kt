@@ -104,6 +104,12 @@ class ScriptedTusServer(
     /** How long a PATCH of n bytes takes on the "link" (virtual time; null: instant). */
     var patchMillis: ((bytes: Int) -> Long)? = null
 
+    /**
+     * A PATCH whose [patchMillis] exceeds this is cut after this long with a socket timeout, like a silence limit
+     * or an engine timeout firing on a slow link (null: never). Its bytes are not stored.
+     */
+    var linkTimeoutMillis: Long? = null
+
     private suspend fun MockRequestHandleScope.handle(request: HttpRequestData): HttpResponseData {
         onRequest(request)
         val reply = scripts[request.method.value]?.removeFirstOrNull()
@@ -122,7 +128,15 @@ class ScriptedTusServer(
             timeMillis = clock(),
             headers = request.headers.entries().associate { it.key to it.value.joinToString(",") },
         )
-        if (request.method == HttpMethod.Patch) patchMillis?.let { kotlinx.coroutines.delay(it(body.size)) }
+        if (request.method == HttpMethod.Patch) patchMillis?.let {
+            val millis = it(body.size)
+            val limit = linkTimeoutMillis
+            if (limit != null && millis > limit) {
+                kotlinx.coroutines.delay(limit)
+                throw io.ktor.client.network.sockets.SocketTimeoutException("cut after $limit ms on a slow link")
+            }
+            kotlinx.coroutines.delay(millis)
+        }
 
         if ((request.method == HttpMethod.Head || request.method == HttpMethod.Patch) && clock() < lockedUntil) {
             return respond("locked", HttpStatusCode.Locked)
