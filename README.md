@@ -137,8 +137,10 @@ httpClient.createAndUploadTus(
   (`maxElapsedMillis`) measures a run of consecutive failures: it starts at the first failure, and any request that succeeds at its job ends
   it (OPTIONS answered, POST 201, the first HEAD answered, a PATCH 204, a recovery HEAD showing more data). A
   recovery HEAD that shows no new data does not end it, so a server that answers but never accepts data still
-  runs out of budget. Once it is spent, no request is sent except the single last
-  resolution HEAD for an unresolved final PATCH. So counted from when the run's first failing request was sent,
+  runs out of budget. When `resumeOrCreateAndUploadTus` gets a definitive answer about a stored upload (gone,
+  wrong length, a permanent refusal) and creates a new one, that also ends the run: the new upload starts with a
+  full budget. Once it is spent, no request is sent except the single last resolution HEAD when Ktus gives up
+  retrying an unresolved final PATCH itself. So counted from when the run's first failing request was sent,
   Ktus gives up at worst after: that request + `maxElapsedMillis` + up to two request timeouts (a request still
   in flight when the budget ran out, then that last HEAD; both can happen when the request in flight is the
   final PATCH). Without a request timeout a request can run forever, so
@@ -227,9 +229,11 @@ client has `expectSuccess` set:
 | A closed `HttpClient` | `IllegalStateException` at once, no retries |
 
 After any PATCH whose outcome is unknown (network error, timeout, a retryable status, 409, or any 2xx other than
-`204`) Ktus backs off, then sends HEAD, and continues from the offset the server reports. When it gives up on an
-unresolved final PATCH (out of attempts or budget, or the required wait would not fit the budget), it sends one
-last HEAD without waiting: if that shows the whole file, the upload succeeded. It never re-sends a chunk at the
+`204`) Ktus backs off, then sends HEAD, and continues from the offset the server reports. When it gives up
+retrying an unresolved final PATCH itself (out of attempts or budget, or the required wait would not fit the
+budget), it sends one last HEAD without waiting: if that shows the whole file, the upload succeeded. If a
+recovery HEAD is what fails (its own retries run out, or the budget is spent without progress), no further HEAD
+is sent and the call ends with `TusUploadOutcomeUnknownException`. It never re-sends a chunk at the
 old offset blindly. If that HEAD reports less than the server has already confirmed, Ktus asks again (up to 3
 times, with backoff, within the budget) and then fails with `TusOffsetMismatchException` rather than rewinding.
 

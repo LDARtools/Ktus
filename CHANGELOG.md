@@ -118,9 +118,11 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
   extra parameters or values, as client plugins add them, is fine)
   is rejected; on a final PATCH that is an unknown outcome.
 - **No request is sent once the retry budget is spent, except the single last resolution HEAD** (without waiting
-  or retrying) when giving up on an unresolved final PATCH; if it shows the whole file, the upload succeeds. The
-  budget measures a run of consecutive failures across the whole call: any request that succeeds at its job ends
-  the run (a recovery HEAD that shows no new data does not). Counted from when the run's first failing request
+  or retrying) when giving up retrying an unresolved final PATCH itself; if it shows the whole file, the upload
+  succeeds. (When a recovery HEAD is what fails, no further HEAD is sent.) The budget measures a run of
+  consecutive failures across the whole call: any request that succeeds at its job ends the run (a recovery HEAD
+  that shows no new data does not), and so does the definitive answer that makes `resumeOrCreateAndUploadTus`
+  drop a stored upload and create a new one. Counted from when the run's first failing request
   was sent, a call gives up at worst after that request + `maxElapsedMillis` + up to two request timeouts (a
   request still in flight when the budget ran out, then that last HEAD).
 - **`minDelayMillis` must be below `maxElapsedMillis`** (when it is set), otherwise no retry could be sent.
