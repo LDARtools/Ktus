@@ -366,8 +366,9 @@ still moving. **No timer on the client can tell those apart once the bytes are b
   server reading a 2 MiB body steadily over ~13 s,
   - **CIO** cuts it after ~1 s: its socket timeout runs from the connection, so it caps the whole send.
   - **OkHttp** (read/write timeouts per socket operation) and **Darwin** (NSURLSession's idle timeout) cut it
-    late, after 7-13 s: once the engine has written the last byte, the time the server needs to read what is
-    still buffered counts as silence.
+    before the server has read it all (after 7-13 s on a Mac, earlier on CI runners with larger socket
+    buffers): once the engine has written the last byte, the time the server needs to read what is still
+    buffered counts as silence.
   - All three cut a server that stops reading at ~2.5 s, and wait for a slow answer only as long as the limit.
 
 So any silence limit, the engine's or Ktus's, holds only if a request's bytes in flight are small next to the

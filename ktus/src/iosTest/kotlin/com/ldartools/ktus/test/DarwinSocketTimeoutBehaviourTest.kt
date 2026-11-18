@@ -16,8 +16,9 @@ import kotlin.test.*
  * off. Ktor 3.2.2 maps it to `NSMutableURLRequest.timeoutInterval` (`setupSocketTimeout` in
  * ktor-client-darwin), NSURLSession's idle timeout.
  *
- * Measured: like OkHttp, a body read steadily for ~13 s was cut after 7.5-10 s by a 2.5 s timeout, once the
- * last bytes were in the kernel's buffers and only the server's reading of them was left.
+ * Measured: like OkHttp, a body read steadily for ~13 s was cut by a 2.5 s timeout before the server had read it
+ * all, once the last bytes were in the kernel's buffers and only the server's reading of them was left (after
+ * 7.5-10 s on a Mac; earlier on CI runners).
  */
 class DarwinSocketTimeoutBehaviourTest {
     private val chunk = 2L * 1024 * 1024
@@ -30,7 +31,10 @@ class DarwinSocketTimeoutBehaviourTest {
         override fun toString() = "cuts=$cuts firstCutAfter=$firstCutAfter patches=${patchStarts.size} stored=$stored error=$error"
     }
 
-    private fun run(socketTimeout: Long, size: Long, maxRetries: Int = 3, setup: PosixTusServer.() -> Unit): Run = runBlocking {
+    private fun run(
+        socketTimeout: Long, size: Long, maxRetries: Int = 3, inspect: (PosixTusServer) -> Unit = {},
+        setup: PosixTusServer.() -> Unit,
+    ): Run = runBlocking {
         PosixTusServer().use { server ->
             server.setup()
             val error = runCatching {
@@ -45,18 +49,36 @@ class DarwinSocketTimeoutBehaviourTest {
                     }
                 }
             }.exceptionOrNull()
+            inspect(server)
             Run(error, server.arrivals, server.data.size)
         }
     }
 
+    /**
+     * 2 MiB read steadily (16 KiB per 100 ms, ~13 s): cut by a 2.5 s timeout while the body is still moving. The
+     * time of the cut depends on the OS socket buffers, so the test pins the order instead: the client gave up
+     * before the server had finished reading the body (or the server never got all of it).
+     */
     @Test
-    fun aSlowSteadyRead_isCut_lateInTheBody() {
-        val r = run(2_500, chunk, maxRetries = 1) {
+    fun aSlowSteadyRead_isCut_whileTheBodyIsStillMoving() {
+        var ends: List<PosixTusServer.SlowReadEnd> = emptyList()
+        val r = run(2_500, chunk, maxRetries = 1, inspect = { server ->
+            val deadline = kotlin.time.TimeSource.Monotonic.markNow() + kotlin.time.Duration.parse("30s")
+            while (server.slowReadEnds.isEmpty() && deadline.hasNotPassedNow()) platform.posix.usleep(20_000u)
+            ends = server.slowReadEnds
+        }) {
             faults = { m, _ -> if (m == "PATCH") Fault.SlowRead else Fault.None }
             slowReadBytes = 16 * 1024; slowReadPauseMicros = 100_000u
         }
         assertTrue(r.cuts >= 1, "$r")
-        assertTrue(r.firstCutAfter!! >= 4_000, "cut only after much of the body was read: $r")
+        val end = ends.firstOrNull() ?: fail("the server's body read never ended: $r")
+        assertEquals(chunk, end.declared)
+        assertTrue(end.read > 0, "$end $r")
+        // The body was still moving when the client gave up: either the server never got all of it, or it was
+        // still reading the buffered rest when the client's recovery HEAD arrived.
+        val cutAt = r.heads[1]
+        assertTrue(end.read < end.declared || cutAt < end.atMillis,
+            "cut at $cutAt ms while the body was still moving: $end $r")
     }
 
     @Test

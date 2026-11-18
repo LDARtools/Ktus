@@ -19,7 +19,8 @@ import kotlin.test.*
  *
  * Measured: the write timeout never fires while the server keeps reading, but the read timeout starts once
  * OkHttp has handed the last byte to the kernel, so the time the server needs to read what is still buffered
- * counts against it: a body read steadily for ~13 s was cut after 8-13 s by a 2.5 s timeout.
+ * counts against it: a body read steadily for ~13 s was cut by a 2.5 s timeout before the server had read it
+ * all (after 8-13 s on a Mac; earlier on CI runners, whose socket buffers hold more).
  */
 class OkHttpSocketTimeoutBehaviourTest {
     private val chunk = 2L * 1024 * 1024
@@ -33,7 +34,10 @@ class OkHttpSocketTimeoutBehaviourTest {
         override fun toString() = "cuts=$cuts firstCutAfter=$firstCutAfter patches=${patchStarts.size} stored=$stored error=$error"
     }
 
-    private fun run(socketTimeout: Long, size: Long, maxRetries: Int = 3, fault: (String, Int) -> Fault): Run = runBlocking {
+    private fun run(
+        socketTimeout: Long, size: Long, maxRetries: Int = 3, inspect: (RealSocketTusServer) -> Unit = {},
+        fault: (String, Int) -> Fault,
+    ): Run = runBlocking {
         RealSocketTusServer().use { server ->
             server.faults = fault
             val error = runCatching {
@@ -47,16 +51,35 @@ class OkHttpSocketTimeoutBehaviourTest {
                     }
                 }
             }.exceptionOrNull()
+            inspect(server)
             Run(error, server.arrivals.toList(), server.offset)
         }
     }
 
-    /** 2 MiB read steadily (16 KiB per 100 ms, ~13 s): cut by a 2.5 s socket timeout, but late, not at the start. */
+    /**
+     * 2 MiB read steadily (16 KiB per 100 ms, ~13 s): cut by a 2.5 s socket timeout while the body is still
+     * moving. When the cut lands depends on how much the OS socket buffers absorb (later on a Mac, earlier on CI
+     * runners), so the test pins the order instead: the client gave up before the server had finished reading the
+     * body (or the server never got all of it).
+     */
     @Test
-    fun aSlowSteadyRead_isCut_lateInTheBody() {
-        val r = run(2_500, chunk, maxRetries = 1) { m, _ -> if (m == "PATCH") Fault.SlowRead(16 * 1024, 100) else Fault.None }
+    fun aSlowSteadyRead_isCut_whileTheBodyIsStillMoving() {
+        var ends: List<RealSocketTusServer.SlowReadEnd> = emptyList()
+        val r = run(2_500, chunk, maxRetries = 1, inspect = { server ->
+            // The server reads what is still buffered until the EOF or reset reaches it.
+            val deadline = System.nanoTime() + 30_000_000_000L
+            while (server.slowReadEnds.isEmpty() && System.nanoTime() < deadline) Thread.sleep(20)
+            ends = server.slowReadEnds.toList()
+        }) { m, _ -> if (m == "PATCH") Fault.SlowRead(16 * 1024, 100) else Fault.None }
         assertTrue(r.cuts >= 1, "$r")
-        assertTrue(r.firstCutAfter!! >= 4_000, "cut only after much of the body was read: $r")
+        val end = ends.firstOrNull() ?: fail("the server's body read never ended: $r")
+        assertEquals(chunk, end.declared)
+        assertTrue(end.read > 0, "$end $r")
+        // The body was still moving when the client gave up: either the server never got all of it, or it was
+        // still reading the buffered rest when the client's recovery HEAD arrived.
+        val cutAt = r.heads[1]
+        assertTrue(end.read < end.declared || cutAt < end.atMillis,
+            "cut at $cutAt ms while the body was still moving: $end $r")
         val timeout = generateSequence(r.error) { it.cause }.firstOrNull { it is java.net.SocketTimeoutException }
         assertNotNull(timeout, "a socket timeout: $r")
     }

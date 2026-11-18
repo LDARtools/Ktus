@@ -33,6 +33,13 @@ class PosixTusServer : AutoCloseable {
     @Volatile var slowReadPauseMicros: UInt = 50_000u
     @Volatile var answerAfterMillis: Long = 0
 
+    /** How a [Fault.SlowRead] body read ended: bytes read, declared length, and when (ms since start). */
+    data class SlowReadEnd(val read: Long, val declared: Long, val atMillis: Long)
+
+    /** Every [Fault.SlowRead] PATCH body read, once it ended (complete, EOF or reset). */
+    val slowReadEnds: List<SlowReadEnd> get() = locked { slowReadList.toList() }
+    private val slowReadList = mutableListOf<SlowReadEnd>()
+
     /** Every request as it arrives (method to ms since start), before any fault runs. */
     val arrivals: List<Pair<String, Long>> get() = locked { arrivalList.toList() }
     private val arrivalList = mutableListOf<Pair<String, Long>>()
@@ -214,10 +221,17 @@ class PosixTusServer : AutoCloseable {
             }
             "PATCH" -> {
                 val bytes = body()
+                if (faults(method, n) == Fault.SlowRead) {
+                    val end = SlowReadEnd(bytes.size.toLong(), contentLength ?: 0, nowMillis())
+                    locked { slowReadList += end }
+                }
                 if (faults(method, n) == Fault.AnswerAfter) usleep((answerAfterMillis * 1000).toUInt())
                 // A body shorter than its Content-Length means the client aborted the request: like a server that
                 // only applies complete requests, store nothing (and answer nothing).
-                if (contentLength != null && bytes.size.toLong() != contentLength) { log("aborted"); return }
+                if (contentLength != null && bytes.size.toLong() != contentLength) {
+                    log("aborted")
+                    return
+                }
                 val accepted = locked {
                     if (requestOffset == stored.size.toLong()) { stored += bytes; true } else false
                 }
