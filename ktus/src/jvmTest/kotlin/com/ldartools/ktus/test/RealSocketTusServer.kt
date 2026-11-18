@@ -37,6 +37,12 @@ class RealSocketTusServer : AutoCloseable {
 
         /** Read the headers, then neither read the body nor answer. */
         data object StallWithoutReading : Fault()
+
+        /** Read the PATCH body [bytesPerTick] at a time, sleeping [tickMillis] between reads, then behave normally. */
+        data class SlowRead(val bytesPerTick: Int, val tickMillis: Long) : Fault()
+
+        /** Read the PATCH body, wait [millis], then behave normally. */
+        data class AnswerAfter(val millis: Long) : Fault()
     }
 
     data class Logged(val method: String, val uploadOffset: Long?, val contentLength: Long?, val atMillis: Long, val result: String)
@@ -67,6 +73,15 @@ class RealSocketTusServer : AutoCloseable {
     @Volatile var faults: (method: String, n: Int) -> Fault = { _, _ -> Fault.None }
 
     val log: MutableList<Logged> = Collections.synchronizedList(mutableListOf())
+
+    /** How a [Fault.SlowRead] body read ended: bytes read, declared length, and when (ms since start). */
+    data class SlowReadEnd(val read: Long, val declared: Long, val atMillis: Long)
+
+    /** Every [Fault.SlowRead] PATCH body read, once it ended (complete, EOF or reset). */
+    val slowReadEnds: MutableList<SlowReadEnd> = Collections.synchronizedList(mutableListOf())
+
+    /** Every request as it arrives (method to ms since start), before any fault runs. */
+    val arrivals: MutableList<Pair<String, Long>> = Collections.synchronizedList(mutableListOf())
     private val counts = mutableMapOf<String, AtomicInteger>()
     val openConnections = AtomicInteger()
 
@@ -126,14 +141,19 @@ class RealSocketTusServer : AutoCloseable {
         return Head(method, path, headers)
     }
 
-    private fun readBody(input: InputStream, length: Long): ByteArray {
+    private fun readBody(
+        input: InputStream, length: Long, perRead: Int = 64 * 1024, sleepMillis: Long = 0,
+        progress: java.util.concurrent.atomic.AtomicLong? = null,
+    ): ByteArray {
         val out = ByteArrayOutputStream()
-        val buffer = ByteArray(64 * 1024)
+        val buffer = ByteArray(perRead)
         var remaining = length
         while (remaining > 0) {
+            if (sleepMillis > 0) Thread.sleep(sleepMillis)
             val read = input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
             if (read == -1) break
             out.write(buffer, 0, read)
+            progress?.addAndGet(read.toLong())
             remaining -= read
         }
         return out.toByteArray()
@@ -141,6 +161,7 @@ class RealSocketTusServer : AutoCloseable {
 
     /** Returns whether to keep the connection open for another request. */
     private fun handle(head: Head, input: InputStream, output: OutputStream, socket: Socket): Boolean {
+        arrivals += head.method to nowMillis()
         val n = synchronized(counts) { counts.getOrPut(head.method) { AtomicInteger() }.incrementAndGet() }
         val fault = faults(head.method, n)
         val contentLength = head.headers["content-length"]?.toLongOrNull()
@@ -195,7 +216,18 @@ class RealSocketTusServer : AutoCloseable {
                 }, isHead = true)
             }
             "PATCH" -> {
-                val body = readBody(input, contentLength ?: 0)
+                val body = if (fault is Fault.SlowRead) {
+                    val declared = contentLength ?: 0
+                    val progress = java.util.concurrent.atomic.AtomicLong()
+                    try {
+                        readBody(input, declared, fault.bytesPerTick, fault.tickMillis, progress)
+                            .also { slowReadEnds += SlowReadEnd(it.size.toLong(), declared, nowMillis()) }
+                    } catch (e: java.io.IOException) {
+                        slowReadEnds += SlowReadEnd(progress.get(), declared, nowMillis())
+                        throw e
+                    }
+                } else readBody(input, contentLength ?: 0)
+                if (fault is Fault.AnswerAfter) Thread.sleep(fault.millis)
                 if (locked) { log("423"); respond(output, 423, emptyMap()); return true }
                 when (fault) {
                     is Fault.Status -> { log("${fault.status}"); respond(output, fault.status, fault.headers); return true }

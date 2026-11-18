@@ -21,7 +21,28 @@ import kotlin.time.TimeSource
  */
 class PosixTusServer : AutoCloseable {
 
-    enum class Fault { None, ApplyThenDrop, Stall, StallWithoutReading }
+    enum class Fault {
+        None, ApplyThenDrop, Stall, StallWithoutReading,
+        /** Read the PATCH body [slowReadBytes] at a time with [slowReadPauseMicros] pauses, then behave normally. */
+        SlowRead,
+        /** Read the PATCH body, wait [answerAfterMillis], then behave normally. */
+        AnswerAfter,
+    }
+
+    @Volatile var slowReadBytes: Int = 64 * 1024
+    @Volatile var slowReadPauseMicros: UInt = 50_000u
+    @Volatile var answerAfterMillis: Long = 0
+
+    /** How a [Fault.SlowRead] body read ended: bytes read, declared length, and when (ms since start). */
+    data class SlowReadEnd(val read: Long, val declared: Long, val atMillis: Long)
+
+    /** Every [Fault.SlowRead] PATCH body read, once it ended (complete, EOF or reset). */
+    val slowReadEnds: List<SlowReadEnd> get() = locked { slowReadList.toList() }
+    private val slowReadList = mutableListOf<SlowReadEnd>()
+
+    /** Every request as it arrives (method to ms since start), before any fault runs. */
+    val arrivals: List<Pair<String, Long>> get() = locked { arrivalList.toList() }
+    private val arrivalList = mutableListOf<Pair<String, Long>>()
 
     data class Logged(val method: String, val uploadOffset: Long?, val contentLength: Long?, val atMillis: Long, val result: String)
 
@@ -118,10 +139,11 @@ class PosixTusServer : AutoCloseable {
             }
         }
 
-        fun readExactly(n: Long): ByteArray {
+        fun readExactly(n: Long, slow: Boolean = false): ByteArray {
             val out = ByteArray(n.toInt())
             var i = 0
             while (i < n) {
+                if (slow && i % slowReadBytes == 0) usleep(slowReadPauseMicros)
                 val b = readByte()
                 if (b == -1) break
                 out[i++] = b.toByte()
@@ -149,12 +171,13 @@ class PosixTusServer : AutoCloseable {
             if (i > 0) headers[line.substring(0, i).trim().lowercase()] = line.substring(i + 1).trim()
         }
         val method = requestLine.substringBefore(' ')
+        locked { arrivalList += method to nowMillis() }
         val n = locked { (counts[method] ?: 0).plus(1).also { counts[method] = it } }
         val contentLength = headers["content-length"]?.toLongOrNull()
         val requestOffset = headers["upload-offset"]?.toLongOrNull()
         fun log(result: String) = locked { logList += Logged(method, requestOffset, contentLength, nowMillis(), result) }
         fun body(): ByteArray = when {
-            contentLength != null -> conn.readExactly(contentLength)
+            contentLength != null -> conn.readExactly(contentLength, slow = faults(method, n) == Fault.SlowRead)
             headers["transfer-encoding"]?.contains("chunked") == true -> readChunked(conn)
             else -> ByteArray(0)
         }
@@ -198,9 +221,17 @@ class PosixTusServer : AutoCloseable {
             }
             "PATCH" -> {
                 val bytes = body()
+                if (faults(method, n) == Fault.SlowRead) {
+                    val end = SlowReadEnd(bytes.size.toLong(), contentLength ?: 0, nowMillis())
+                    locked { slowReadList += end }
+                }
+                if (faults(method, n) == Fault.AnswerAfter) usleep((answerAfterMillis * 1000).toUInt())
                 // A body shorter than its Content-Length means the client aborted the request: like a server that
                 // only applies complete requests, store nothing (and answer nothing).
-                if (contentLength != null && bytes.size.toLong() != contentLength) { log("aborted"); return }
+                if (contentLength != null && bytes.size.toLong() != contentLength) {
+                    log("aborted")
+                    return
+                }
                 val accepted = locked {
                     if (requestOffset == stored.size.toLong()) { stored += bytes; true } else false
                 }

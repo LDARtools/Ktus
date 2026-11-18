@@ -22,6 +22,41 @@ package com.ldartools.ktus
  * @param activityHeartbeatMillis while a request is in flight, call `onActivity` this often from a side job
  *   that is cancelled with the request (default 5 s; null turns it off). Also the longest gap between
  *   `onActivity` calls while Ktus waits to retry.
+ * @param sendStallMillis abandon a request whose body makes no progress for this long while it is not fully
+ *   sent (default null: off). The clock starts when the request is handed to the engine (after the caller's
+ *   request block, which may for example refresh a token, and after the client's plugins), so a stalled
+ *   connect or TLS handshake counts, and restarts on every body progress event (the events behind `onProgress`).
+ *   A request without a body (OPTIONS, HEAD, POST, DELETE) is fully sent as soon as it is handed to the
+ *   engine, so this limit never applies to it; [replyTimeoutMillis] does. The request is abandoned as a
+ *   timed-out network failure ([TusStallTimeoutException]): it is retried within the retry budget, and an
+ *   abandoned final PATCH leaves its outcome unknown exactly as an engine timeout does. Only that request is
+ *   abandoned, not the upload, and only on the client: bytes already handed to the operating system can still
+ *   reach the server, which may apply the abandoned PATCH after all; the offset checks keep the data correct (a
+ *   later PATCH at the old offset gets 409, then HEAD). The same holds for [replyTimeoutMillis] and
+ *   [finalReplyTimeoutMillis].
+ * @param replyTimeoutMillis abandon a request that has been fully sent (every body byte handed to the engine)
+ *   when no response arrives within this long (default null: off). Applies to every request except the PATCH
+ *   carrying the last bytes, which uses [finalReplyTimeoutMillis].
+ * @param finalReplyTimeoutMillis the same as [replyTimeoutMillis] for the PATCH carrying the last bytes, which
+ *   a server may answer only after slow completion work (default null: off). [replyTimeoutMillis] does not
+ *   apply to it. Setting only [replyTimeoutMillis] leaves the final PATCH with no Ktus limit.
+ * @param targetChunkMillis size each PATCH so it takes about this long on the link (default null: off, every
+ *   PATCH is [chunkSize]). The first PATCH of a call uses [minChunkSize]; after each PATCH the server confirmed,
+ *   the measured goodput (bytes confirmed / time from the PATCH's start to its 204, smoothed) times this target
+ *   gives the next size, within [minChunkSize]..[chunkSize] and at most twice the previous size. A timeout or
+ *   silence-limit cut drops the next PATCH straight to [minChunkSize] (instead of halving). Requires
+ *   [adaptiveChunkSize]. This keeps the bytes in flight small relative to the link speed, which the silence limits
+ *   need (see "Weak links" in the README). When set, [minChunkSize] may be as low as 16 KiB; every PATCH is at
+ *   least that, so a server that stores each PATCH separately (for example one Azure block per PATCH, at most
+ *   50,000 blocks) limits the file size to about 50,000 × [minChunkSize] in the worst case.
+ *
+ * The three silence limits do not depend on the engine, and they do not replace its timeouts: keep the
+ * engine's limits (Ktor `HttpTimeout`) as an outer cap, set at least as high as these. Progress means bytes
+ * handed to Ktor, which buffers about 1 MiB of a body before the socket: a chunk of up to ~1 MiB counts as
+ * fully sent almost at once (its transmission runs on the reply clock), and a larger one moves in ~1 MiB steps.
+ * Size each limit above the time the slowest link needs for the bytes in flight, min(chunk, ~1 MiB), plus the
+ * server's answer time; [targetChunkMillis] keeps the chunk near a chosen duration so this holds. See "Weak
+ * links" in the README, including what each engine's own socket timeout does (pinned in tests).
  */
 data class TusUploadOptions(
     val checkServerCapabilities: Boolean = true,
@@ -34,6 +69,10 @@ data class TusUploadOptions(
     val adaptiveChunkSize: Boolean = true,
     val minChunkSize: Long = 256 * 1024,
     val activityHeartbeatMillis: Long? = 5_000,
+    val sendStallMillis: Long? = null,
+    val replyTimeoutMillis: Long? = null,
+    val finalReplyTimeoutMillis: Long? = null,
+    val targetChunkMillis: Long? = null,
 ) {
     init {
         require(chunkSize > 0) { "chunkSize must be positive" }
@@ -41,7 +80,54 @@ data class TusUploadOptions(
         require(activityHeartbeatMillis == null || activityHeartbeatMillis > 0) {
             "activityHeartbeatMillis must be positive, or null to turn the heartbeat off"
         }
+        require(sendStallMillis == null || sendStallMillis > 0) { "sendStallMillis must be positive, or null to turn it off" }
+        require(replyTimeoutMillis == null || replyTimeoutMillis > 0) { "replyTimeoutMillis must be positive, or null to turn it off" }
+        require(finalReplyTimeoutMillis == null || finalReplyTimeoutMillis > 0) {
+            "finalReplyTimeoutMillis must be positive, or null to turn it off"
+        }
+        require(targetChunkMillis == null || targetChunkMillis > 0) { "targetChunkMillis must be positive, or null to turn it off" }
+        require(targetChunkMillis == null || adaptiveChunkSize) {
+            "targetChunkMillis needs adaptiveChunkSize: without it a timeout would not shrink the chunk"
+        }
+        require(targetChunkMillis == null || minChunkSize >= MIN_ADAPTIVE_CHUNK_SIZE) {
+            "minChunkSize must be at least ${MIN_ADAPTIVE_CHUNK_SIZE / 1024} KiB when targetChunkMillis is set"
+        }
     }
+
+    /** Binary-compatibility constructor for callers compiled against Ktus 1.1.x. */
+    @Deprecated("Kept for binary compatibility with Ktus 1.1.x", level = DeprecationLevel.HIDDEN)
+    constructor(
+        checkServerCapabilities: Boolean = true,
+        chunkSize: Long = 2 * 1024 * 1024,
+        useFileLock: Boolean = false,
+        retryOptions: RetryOptions = RetryOptions(),
+        allowEmptyUpload: Boolean = false,
+        allowedUploadHosts: Set<String> = emptySet(),
+        omitEmptyMetadataValues: Boolean = true,
+        adaptiveChunkSize: Boolean = true,
+        minChunkSize: Long = 256 * 1024,
+        activityHeartbeatMillis: Long? = 5_000,
+    ) : this(checkServerCapabilities, chunkSize, useFileLock, retryOptions, allowEmptyUpload, allowedUploadHosts,
+        omitEmptyMetadataValues, adaptiveChunkSize, minChunkSize, activityHeartbeatMillis, sendStallMillis = null)
+
+    /** Binary-compatibility `copy` for callers compiled against Ktus 1.1.x. */
+    @Deprecated("Kept for binary compatibility with Ktus 1.1.x", level = DeprecationLevel.HIDDEN)
+    fun copy(
+        checkServerCapabilities: Boolean = this.checkServerCapabilities,
+        chunkSize: Long = this.chunkSize,
+        useFileLock: Boolean = this.useFileLock,
+        retryOptions: RetryOptions = this.retryOptions,
+        allowEmptyUpload: Boolean = this.allowEmptyUpload,
+        allowedUploadHosts: Set<String> = this.allowedUploadHosts,
+        omitEmptyMetadataValues: Boolean = this.omitEmptyMetadataValues,
+        adaptiveChunkSize: Boolean = this.adaptiveChunkSize,
+        minChunkSize: Long = this.minChunkSize,
+        activityHeartbeatMillis: Long? = this.activityHeartbeatMillis,
+    ): TusUploadOptions = copy(checkServerCapabilities = checkServerCapabilities, chunkSize = chunkSize,
+        useFileLock = useFileLock, retryOptions = retryOptions, allowEmptyUpload = allowEmptyUpload,
+        allowedUploadHosts = allowedUploadHosts, omitEmptyMetadataValues = omitEmptyMetadataValues,
+        adaptiveChunkSize = adaptiveChunkSize, minChunkSize = minChunkSize,
+        activityHeartbeatMillis = activityHeartbeatMillis, sendStallMillis = sendStallMillis)
 
     /** Binary-compatibility constructor for callers compiled against Ktus 1.0.x. */
     @Deprecated("Kept for binary compatibility with Ktus 1.0.x", level = DeprecationLevel.HIDDEN)
@@ -61,6 +147,11 @@ data class TusUploadOptions(
         retryOptions: RetryOptions = this.retryOptions,
     ): TusUploadOptions = copy(checkServerCapabilities = checkServerCapabilities, chunkSize = chunkSize,
         useFileLock = useFileLock, retryOptions = retryOptions, allowEmptyUpload = allowEmptyUpload)
+
+    companion object {
+        /** The smallest [minChunkSize] allowed with [targetChunkMillis]: 16 KiB. */
+        const val MIN_ADAPTIVE_CHUNK_SIZE: Long = 16 * 1024
+    }
 
     /** The floor adaptive chunk sizing shrinks to: [minChunkSize], but never above [chunkSize]. */
     internal val effectiveMinChunkSize: Long get() = minOf(minChunkSize, chunkSize)

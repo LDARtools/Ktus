@@ -18,6 +18,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
 import kotlinx.io.IOException
 import kotlin.math.min
 import kotlin.math.pow
@@ -167,12 +168,18 @@ internal suspend fun attemptTus(
     client: HttpClient? = null,
     onActivity: (() -> Unit)? = null,
     heartbeatMillis: Long? = null,
+    watch: StallWatch? = null,
     send: suspend () -> HttpResponse,
 ): Outcome {
     // Callbacks run outside the try below: whatever they throw reaches the caller as it is.
     onActivity?.invoke()
     val outcome = try {
-        val response = withHeartbeat(onActivity, heartbeatMillis) { send() }
+        val response = if (watch == null) {
+            withHeartbeat(onActivity, heartbeatMillis) { send() }
+        } else {
+            if (client != null) client.ensureStallArming() else watch.arm()
+            watch.guard { withContext(StallWatchElement(watch)) { withHeartbeat(onActivity, heartbeatMillis) { send() } } }
+        }
         classifyResponse(op, targetUrl, response, options, cause = null)
     } catch (e: CallbackFailure) {
         throw e
@@ -360,6 +367,7 @@ private fun Throwable.isTimeout(): Boolean {
         // A connect timeout says nothing about the chunk size.
         if (current is ConnectTimeoutException) return false
         if (current is HttpRequestTimeoutException || current is SocketTimeoutException) return true
+        if (current is TusStallTimeoutException) return true
         // Fallback for platform timeouts Ktor does not wrap (for example java.net.SocketTimeoutException
         // or a Darwin timeout): an IOException whose class name ends in "TimeoutException".
         if (current is IOException && current::class.simpleName?.endsWith("TimeoutException") == true) return true
@@ -391,6 +399,7 @@ internal suspend fun <T> retryTusOperation(
     client: HttpClient? = null,
     onActivity: (() -> Unit)? = null,
     heartbeatMillis: Long? = null,
+    stall: StallLimits? = null,
     resetOnSuccess: Boolean = true,
     send: suspend () -> HttpResponse,
     onSuccess: suspend (HttpResponse) -> T,
@@ -398,7 +407,8 @@ internal suspend fun <T> retryTusOperation(
     var attempts = 0
     while (true) {
         attempts++
-        when (val outcome = attemptTus(op, targetUrl, options, client, onActivity, heartbeatMillis, send)) {
+        val watch = stall?.watch(op, bodyLength = 0, isFinal = false)
+        when (val outcome = attemptTus(op, targetUrl, options, client, onActivity, heartbeatMillis, watch, send)) {
             is Outcome.Ok -> {
                 val result = onSuccess(outcome.response)
                 // The operation succeeded: the run of consecutive failures (and its elapsed budget) is over.
@@ -474,7 +484,11 @@ internal suspend fun <T> retryWithBackoff(
 /** The URL of a tus request as Ktus built it, after the caller's request block. */
 internal val RequestTargetKey = io.ktor.util.AttributeKey<Url>("KtusRequestTarget")
 
-/** Records the request's URL once the caller's block has run; see [RequestTargetKey]. */
-internal fun io.ktor.client.request.HttpRequestBuilder.markRequestTarget() {
+/**
+ * Records the request's URL once the caller's block has run (see [RequestTargetKey]), and attaches the
+ * attempt's silence watch, if any, so the send pipeline can arm it at the hand-off to the engine.
+ */
+internal suspend fun io.ktor.client.request.HttpRequestBuilder.markRequestTarget() {
     attributes.put(RequestTargetKey, url.build())
+    currentCoroutineContext()[StallWatchElement]?.let { attributes.put(StallWatchKey, it.watch) }
 }

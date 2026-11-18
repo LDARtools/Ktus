@@ -335,4 +335,101 @@ class DarwinRealSocketTest {
             client.close()
         }
     }
+
+    /** Ktus's reply limit on Darwin: a non-final PATCH whose answer never comes is abandoned, and the upload resumes. */
+    @Test
+    fun replyTimeout_firesOnDarwin_andTheUploadResumes() = runBlocking {
+        PosixTusServer().use { server ->
+            server.faults = { m, n -> if (m == "PATCH" && n == 1) Fault.Stall else Fault.None }
+            withTimeout(60_000) {
+                client().use {
+                    it.createAndUploadTus("${server.baseUrl}/files", TrackingFile(payload(200_000)),
+                        options = TusUploadOptions(chunkSize = 100_000, activityHeartbeatMillis = null,
+                            sendStallMillis = 1_000, replyTimeoutMillis = 1_000, finalReplyTimeoutMillis = 10_000,
+                            retryOptions = quickRetry()))
+                }
+            }
+            assertEquals(200_000, server.data.size)
+            val firstPatch = server.log.first { it.method == "PATCH" }.atMillis
+            val recoveryHead = server.log.filter { it.method == "HEAD" }[1].atMillis
+            val cut = recoveryHead - firstPatch
+            assertTrue(cut in 1_000..1_000 + 1_500, "cut after $cut ms: ${server.log}")
+        }
+    }
+
+    /**
+     * Body progress comes in ~1 MiB steps (Ktor buffers about 1 MiB of the body; the same on CIO and OkHttp), so
+     * the gap between progress events is ~1 MiB ÷ the link speed: ~0.3-0.8 s on a Mac at ~1.3 MB/s, longer on a
+     * slower CI runner. What is pinned is the rule, not a speed: a send stall is never reported while progress
+     * keeps arriving within the limit. Either the upload went through in one PATCH, or a real gap of at least
+     * the limit preceded the cut.
+     */
+    @Test
+    fun noFalseSendStall_onDarwin() = runBlocking {
+        PosixTusServer().use { server ->
+            server.faults = { m, _ -> if (m == "PATCH") Fault.SlowRead else Fault.None }
+            val size = 96 * 64 * 1024 // ~5 s at 64 KiB per 50 ms, so a wrong cut at the limit would show
+            val limit = 2_000L
+            val clock = TimeSource.Monotonic.markNow()
+            var last = 0L
+            var maxGap = 0L
+            withTimeout(60_000) {
+                client().use {
+                    it.createAndUploadTus("${server.baseUrl}/files", TrackingFile(payload(size)),
+                        options = TusUploadOptions(chunkSize = size.toLong(), activityHeartbeatMillis = null,
+                            sendStallMillis = limit, replyTimeoutMillis = 30_000, finalReplyTimeoutMillis = 30_000,
+                            retryOptions = quickRetry()),
+                        onProgress = { _, _ ->
+                            val now = clock.elapsedNow().inWholeMilliseconds
+                            maxGap = maxOf(maxGap, now - last)
+                            last = now
+                        })
+                }
+            }
+            val patches = server.arrivals.count { it.first == "PATCH" }
+            val measured = "patches=$patches maxProgressGap=$maxGap ms elapsed=${clock.elapsedNow().inWholeMilliseconds} ms " +
+                "stored=${server.data.size}/$size log=${server.log}"
+            assertEquals(size, server.data.size, measured)
+            assertTrue(patches == 1 || maxGap >= limit, "a send stall without a progress gap of $limit ms: $measured")
+        }
+    }
+
+    private fun adaptive(target: Long?, maxRetries: Int = 5) = TusUploadOptions(chunkSize = 2L * 1024 * 1024,
+        minChunkSize = 16L * 1024, targetChunkMillis = target, activityHeartbeatMillis = null,
+        sendStallMillis = 3_000, replyTimeoutMillis = 3_000, finalReplyTimeoutMillis = 10_000,
+        retryOptions = RetryOptions(maxRetries = maxRetries, initialDelayMillis = 10, maxDelayMillis = 10, jitter = false))
+
+    /** ~16 KiB/s with the silence limits (scaled 1 s target / 3 s limits): adaptive sizing completes without a cut. */
+    @Test
+    fun aSlowSteadyLink_withAdaptiveSizing_completesWithoutACut() = runBlocking {
+        PosixTusServer().use { server ->
+            server.faults = { m, _ -> if (m == "PATCH") Fault.SlowRead else Fault.None }
+            server.slowReadBytes = 4 * 1024; server.slowReadPauseMicros = 250_000u
+            withTimeout(90_000) {
+                client().use {
+                    it.createAndUploadTus("${server.baseUrl}/files", TrackingFile(payload(160 * 1024)), options = adaptive(1_000))
+                }
+            }
+            assertEquals(160 * 1024, server.data.size)
+            assertEquals(1, server.arrivals.count { it.first == "HEAD" }, "no recovery HEAD, so no cut: ${server.log}")
+        }
+    }
+
+    /** The same without adaptive sizing: cut by the reply limit. */
+    @Test
+    fun aSlowSteadyLink_withoutAdaptiveSizing_isCut() = runBlocking {
+        PosixTusServer().use { server ->
+            server.faults = { m, _ -> if (m == "PATCH") Fault.SlowRead else Fault.None }
+            server.slowReadBytes = 4 * 1024; server.slowReadPauseMicros = 250_000u
+            runCatching {
+                withTimeout(90_000) {
+                    client().use {
+                        it.createAndUploadTus("${server.baseUrl}/files", TrackingFile(payload(160 * 1024)),
+                            options = adaptive(null, maxRetries = 2))
+                    }
+                }
+            }
+            assertTrue(server.arrivals.count { it.first == "HEAD" } > 1, "cut: ${server.log}")
+        }
+    }
 }

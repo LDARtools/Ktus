@@ -182,6 +182,10 @@ val options = TusUploadOptions(
     omitEmptyMetadataValues = true,        // drop metadata entries whose value is ""
     adaptiveChunkSize = true,              // halve the chunk after a PATCH timeout / 408 / 504 ...
     minChunkSize = 256 * 1024,             // ... down to this floor
+    targetChunkMillis = 10_000,            // size each PATCH to ~10 s on the measured link (default off)
+    sendStallMillis = 30_000,              // abandon a request whose body stops moving (default off)
+    replyTimeoutMillis = 30_000,           // ... or that got no answer this long after it was sent (default off)
+    finalReplyTimeoutMillis = 300_000,     // the same for the PATCH carrying the last bytes (default off)
     retryOptions = RetryOptions(
         maxRetries = 10,                   // attempts per operation, including the first
         initialDelayMillis = 500,
@@ -348,6 +352,103 @@ guarantee it, because full jitter can draw any delay down to 0. When the remaini
 shorter than the wait a retry requires, Ktus gives up instead of retrying early; `minDelayMillis` must be below
 `maxElapsedMillis`.
 
+### Weak links: adaptive chunks and silence limits
+
+On a weak mobile link you want a dead request to fail fast and be retried, without cutting one that is slow but
+still moving. **No timer on the client can tell those apart once the bytes are buffered**, and they always are:
+
+- Ktus sees a body's progress only as bytes handed to Ktor. Ktor buffers about 1 MiB of a request body before
+  the socket, on every engine: a chunk of up to ~1 MiB is handed over at once (on Darwin before the connection
+  even exists), and a larger one moves in ~1 MiB steps.
+- Below Ktor, the kernel's send and receive buffers hold more. An engine's own timeout cannot see past them
+  either. Ktus pins what the engines do in tests (`OkHttpSocketTimeoutBehaviourTest`,
+  `DarwinSocketTimeoutBehaviourTest`, `CioStallRealSocketTest`): with a 2.5 s `socketTimeoutMillis` and a
+  server reading a 2 MiB body steadily over ~13 s,
+  - **CIO** cuts it at about the timeout (2.5 s): its socket timeout runs from the connection, so it caps the
+    whole request.
+  - **OkHttp** (read/write timeouts per socket operation) and **Darwin** (NSURLSession's idle timeout) cut it
+    before the server has read it all (after 7-13 s on a Mac, earlier on CI runners with larger socket
+    buffers): once the engine has written the last byte, the time the server needs to read what is still
+    buffered counts as silence.
+  - All three cut a server that stops reading at ~2.5 s, and wait for a slow answer only as long as the limit.
+
+So any silence limit, the engine's or Ktus's, holds only if a request's bytes in flight are small next to the
+link speed: **limit > bytes in flight ÷ slowest speed + the server's answer time.** Ktus keeps the bytes in
+flight small with adaptive chunk sizing, and then applies its own engine-independent limits.
+
+**Adaptive chunk sizing** (`targetChunkMillis`, off by default). The first PATCH of a call uses `minChunkSize`.
+After each PATCH the server confirmed, Ktus measures the end-to-end goodput (bytes confirmed ÷ time from the
+PATCH's start to its `204`; the server's answer is the only measure of bytes really delivered), smooths it
+(exponential average, weight 0.5), and sizes the next PATCH to take `targetChunkMillis`: within
+`minChunkSize`..`chunkSize`, and at most twice the previous size, so one fast sample cannot jump to the cap. A
+timeout or a silence-limit cut drops the next PATCH straight to `minChunkSize` (a cut gives no goodput sample,
+and halving from 2 MiB on a link that just fell to ~3 KB/s would cost one more cut per halving); it grows back
+at most 2× per confirmed PATCH. It needs `adaptiveChunkSize` (the default). A resume within the same call (after a HEAD) keeps the
+estimate; a new call starts again from `minChunkSize`. With a target, `minChunkSize` may be as low as 16 KiB.
+More, smaller PATCHes cost the server more requests: a store that keeps each PATCH as a separate piece (for
+example one Azure block-blob block per PATCH, at most 50,000 blocks) limits the file to about
+50,000 × `minChunkSize` in the worst case (1.5 GiB at 32 KiB).
+
+**Silence limits** (all off by default; they work the same on every engine):
+
+- `sendStallMillis`: abandon a request whose body makes no progress for this long while it is not fully sent.
+  The clock starts when the request is handed to the engine, after your request block (a token refresh there
+  does not count) and the client's plugins, so a stalled connect or TLS handshake counts; it restarts on every
+  body progress event, the same events behind `onProgress`. A request without a body
+  (OPTIONS, HEAD, POST, DELETE) is fully sent as soon as it is handed to the engine, so only the reply limit
+  applies to it.
+- `replyTimeoutMillis`: once a request is fully sent (every body byte handed to the engine), abandon it if no
+  response arrives within this long. Every request except the PATCH carrying the last bytes.
+- `finalReplyTimeoutMillis`: the same for the PATCH carrying the last bytes, which a server may answer only
+  after slow completion work (storing or processing the whole file). Setting only `replyTimeoutMillis` leaves
+  the final PATCH with no Ktus limit.
+
+An abandoned request is a timed-out network failure (`TusStallTimeoutException`, an `IOException` whose `kind`
+says which limit was reached): it is retried within the retry budget (it counts as a failure of the run, like
+any other), the chunk shrinks as after an engine timeout, and an abandoned final PATCH leaves its outcome unknown
+exactly as an engine timeout does. Cancelling the caller is still a plain cancellation.
+
+**An abandoned request is abandoned only on the client.** Ktus stops the request and closes or releases the
+connection, but bytes already handed to the operating system can still be delivered (an engine usually closes
+the socket gracefully), so the link stays busy for a while after a cut and the server may still receive the
+whole body and apply the abandoned PATCH. That is safe: tus offsets keep the data correct. The next PATCH is
+sent at the offset the HEAD reported; if the abandoned one lands first, the server answers that next PATCH
+with 409, Ktus asks with HEAD again and continues from the new offset, and no byte is applied twice
+(`AbandonedPatchRealSocketTest`). Ktor offers no engine-neutral way to make a cancelled request reset the
+connection instead.
+
+**Recommended together**, for a mobile client behind Azure Front Door (240 s origin timeout):
+
+```kotlin
+TusUploadOptions(
+    chunkSize = 2 * 1024 * 1024,        // the cap
+    minChunkSize = 32 * 1024,           // the floor, and the first PATCH of each call
+    targetChunkMillis = 10_000,         // each PATCH ~10 s of data on the measured link
+    sendStallMillis = 30_000,           // 3x the target
+    replyTimeoutMillis = 30_000,
+    finalReplyTimeoutMillis = 300_000,  // the gateway's 240 s + ~3x the target (see below)
+)
+```
+
+The final reply clock starts when the last byte is handed to Ktor, not when it reaches the server, so it also
+covers sending what is still buffered: set `finalReplyTimeoutMillis` to at least the proxy's timeout plus about
+3 × `targetChunkMillis` (280-300 s behind a 240 s proxy). The proxy then answers first with its own 504 when the
+origin is slow.
+
+The 3× margin covers the kernel buffers and a link that slows down between two PATCHes. The floor still has to
+fit: at ~3 KB/s a 32 KiB PATCH takes ~11 s, inside 30 s; on a link slower than about `minChunkSize` ÷ limit,
+every attempt is cut until the retry budget ends.
+
+**Engine timeouts stay an outer cap, well above these, or off.** CIO's `socketTimeoutMillis` counts the whole
+request from the connection, and OkHttp's and Darwin's cut a moving body once only the buffered tail is left
+(above). Use at least 4 × (`sendStallMillis` + `replyTimeoutMillis`) for the PATCHes before the last one, and at
+least `finalReplyTimeoutMillis` plus the time to send the final chunk for the final PATCH; an engine timeout is
+per client, so in practice that means the larger value, or leaving it off and relying on Ktus's limits.
+
+**In tests under `runTest`**, pass the test scheduler's clock (`RetryOptions(timeSource = testScheduler.timeSource)`):
+the silence limits, the adaptive sizing and the retry budget all measure time with `RetryOptions.timeSource`, and
+with the default real clock the watchdog would mix virtual delays with real time.
+
 ### Things to avoid
 
 - **Ktor's `HttpRequestRetry` plugin** on the client used for tus. Ktus retries itself and decides after every
@@ -455,7 +556,7 @@ Add the following libraries to your `.toml` file.
 
 ```toml
 [versions]
-ktus = "1.1.0"
+ktus = "1.2.0"
 
 [libraries]
 ktus = { module = "com.ldartools:ktus", version.ref = "ktus" }
