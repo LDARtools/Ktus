@@ -37,6 +37,12 @@ class RealSocketTusServer : AutoCloseable {
 
         /** Read the headers, then neither read the body nor answer. */
         data object StallWithoutReading : Fault()
+
+        /** Read the PATCH body [bytesPerTick] at a time, sleeping [tickMillis] between reads, then behave normally. */
+        data class SlowRead(val bytesPerTick: Int, val tickMillis: Long) : Fault()
+
+        /** Read the PATCH body, wait [millis], then behave normally. */
+        data class AnswerAfter(val millis: Long) : Fault()
     }
 
     data class Logged(val method: String, val uploadOffset: Long?, val contentLength: Long?, val atMillis: Long, val result: String)
@@ -126,11 +132,12 @@ class RealSocketTusServer : AutoCloseable {
         return Head(method, path, headers)
     }
 
-    private fun readBody(input: InputStream, length: Long): ByteArray {
+    private fun readBody(input: InputStream, length: Long, perRead: Int = 64 * 1024, sleepMillis: Long = 0): ByteArray {
         val out = ByteArrayOutputStream()
-        val buffer = ByteArray(64 * 1024)
+        val buffer = ByteArray(perRead)
         var remaining = length
         while (remaining > 0) {
+            if (sleepMillis > 0) Thread.sleep(sleepMillis)
             val read = input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
             if (read == -1) break
             out.write(buffer, 0, read)
@@ -195,7 +202,9 @@ class RealSocketTusServer : AutoCloseable {
                 }, isHead = true)
             }
             "PATCH" -> {
-                val body = readBody(input, contentLength ?: 0)
+                val body = if (fault is Fault.SlowRead) readBody(input, contentLength ?: 0, fault.bytesPerTick, fault.tickMillis)
+                    else readBody(input, contentLength ?: 0)
+                if (fault is Fault.AnswerAfter) Thread.sleep(fault.millis)
                 if (locked) { log("423"); respond(output, 423, emptyMap()); return true }
                 when (fault) {
                     is Fault.Status -> { log("${fault.status}"); respond(output, fault.status, fault.headers); return true }

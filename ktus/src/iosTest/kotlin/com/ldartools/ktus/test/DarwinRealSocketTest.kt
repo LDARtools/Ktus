@@ -335,4 +335,48 @@ class DarwinRealSocketTest {
             client.close()
         }
     }
+
+    /** Ktus's reply limit on Darwin: a non-final PATCH whose answer never comes is abandoned, and the upload resumes. */
+    @Test
+    fun replyTimeout_firesOnDarwin_andTheUploadResumes() = runBlocking {
+        PosixTusServer().use { server ->
+            server.faults = { m, n -> if (m == "PATCH" && n == 1) Fault.Stall else Fault.None }
+            withTimeout(60_000) {
+                client().use {
+                    it.createAndUploadTus("${server.baseUrl}/files", TrackingFile(payload(200_000)),
+                        options = TusUploadOptions(chunkSize = 100_000, activityHeartbeatMillis = null,
+                            sendStallMillis = 1_000, replyTimeoutMillis = 1_000, finalReplyTimeoutMillis = 10_000,
+                            retryOptions = quickRetry()))
+                }
+            }
+            assertEquals(200_000, server.data.size)
+            val firstPatch = server.log.first { it.method == "PATCH" }.atMillis
+            val recoveryHead = server.log.filter { it.method == "HEAD" }[1].atMillis
+            val cut = recoveryHead - firstPatch
+            assertTrue(cut in 1_000..1_000 + 1_500, "cut after $cut ms: ${server.log}")
+        }
+    }
+
+    /**
+     * Body progress comes in ~1 MiB steps (Ktor buffers about 1 MiB of the body; the same on CIO and OkHttp).
+     * Measured here: the first ~1 MiB at once, then ~1 MiB every ~0.3-0.8 s while the server reads ~1.3 MB/s.
+     * A send-stall limit above that step is not falsely reached; one below it would be (README "Weak links").
+     */
+    @Test
+    fun noFalseSendStall_onDarwin() = runBlocking {
+        PosixTusServer().use { server ->
+            server.faults = { m, _ -> if (m == "PATCH") Fault.SlowRead else Fault.None }
+            val size = 48 * 64 * 1024 // ~2.4 s at 64 KiB per 50 ms
+            withTimeout(60_000) {
+                client().use {
+                    it.createAndUploadTus("${server.baseUrl}/files", TrackingFile(payload(size)),
+                        options = TusUploadOptions(chunkSize = size.toLong(), activityHeartbeatMillis = null,
+                            sendStallMillis = 3_000, replyTimeoutMillis = 30_000, finalReplyTimeoutMillis = 30_000,
+                            retryOptions = quickRetry()))
+                }
+            }
+            assertEquals(1, server.log.count { it.method == "PATCH" }, "${server.log}")
+            assertEquals(size, server.data.size)
+        }
+    }
 }

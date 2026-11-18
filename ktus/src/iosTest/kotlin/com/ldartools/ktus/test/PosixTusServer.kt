@@ -21,7 +21,11 @@ import kotlin.time.TimeSource
  */
 class PosixTusServer : AutoCloseable {
 
-    enum class Fault { None, ApplyThenDrop, Stall, StallWithoutReading }
+    enum class Fault {
+        None, ApplyThenDrop, Stall, StallWithoutReading,
+        /** Read the PATCH body 64 KiB at a time with 50 ms pauses, then behave normally. */
+        SlowRead,
+    }
 
     data class Logged(val method: String, val uploadOffset: Long?, val contentLength: Long?, val atMillis: Long, val result: String)
 
@@ -118,10 +122,11 @@ class PosixTusServer : AutoCloseable {
             }
         }
 
-        fun readExactly(n: Long): ByteArray {
+        fun readExactly(n: Long, slow: Boolean = false): ByteArray {
             val out = ByteArray(n.toInt())
             var i = 0
             while (i < n) {
+                if (slow && i % (64 * 1024) == 0) usleep(50_000u)
                 val b = readByte()
                 if (b == -1) break
                 out[i++] = b.toByte()
@@ -154,7 +159,7 @@ class PosixTusServer : AutoCloseable {
         val requestOffset = headers["upload-offset"]?.toLongOrNull()
         fun log(result: String) = locked { logList += Logged(method, requestOffset, contentLength, nowMillis(), result) }
         fun body(): ByteArray = when {
-            contentLength != null -> conn.readExactly(contentLength)
+            contentLength != null -> conn.readExactly(contentLength, slow = faults(method, n) == Fault.SlowRead)
             headers["transfer-encoding"]?.contains("chunked") == true -> readChunked(conn)
             else -> ByteArray(0)
         }
