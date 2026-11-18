@@ -1,6 +1,10 @@
 package com.ldartools.ktus
 
+import io.ktor.client.HttpClient
+import io.ktor.client.request.HttpSendPipeline
+import io.ktor.util.AttributeKey
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
@@ -11,6 +15,9 @@ import kotlinx.io.IOException
 import kotlin.concurrent.atomics.AtomicLong
 import kotlin.concurrent.atomics.AtomicReference
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
+import kotlin.time.TimeMark
 import kotlin.time.TimeSource
 
 /**
@@ -69,9 +76,13 @@ internal fun TusUploadOptions.stallLimits(): StallLimits? =
 /**
  * The silence watchdog of one request attempt.
  *
- * The send clock starts when the request is handed to the engine (so a stalled connect or TLS handshake is
- * covered) and restarts on every body progress event. Once the bytes handed to the engine reach [bodyLength]
- * the request is fully sent and the reply clock starts. Thread-safe: progress comes from the engine's thread.
+ * Its clocks start at the hand-off to the engine ([arm]), after the caller's request block (which may, for
+ * example, refresh a token) and after the client's own plugins: a send-pipeline interceptor installed by
+ * [ensureStallArming] arms the watch in [HttpSendPipeline.Monitoring], the phase right before
+ * [HttpSendPipeline.Engine], where every Ktor engine executes the request. From there the send clock covers a
+ * stalled connect or TLS handshake and restarts on every body progress event. Once the bytes handed to the
+ * engine reach [bodyLength] the request is fully sent and the reply clock starts. Thread-safe: progress comes
+ * from the engine's thread.
  */
 @OptIn(ExperimentalAtomicApi::class)
 internal class StallWatch(
@@ -80,21 +91,30 @@ internal class StallWatch(
     private val sendStallMillis: Long?,
     private val replyMillis: Long?,
     private val replyKind: TusStallTimeoutException.Kind,
-    timeSource: TimeSource,
+    private val timeSource: TimeSource,
 ) {
-    private val start = timeSource.markNow()
-    private fun now(): Long = start.elapsedNow().inWholeMilliseconds
+    private val armedAt = AtomicReference<TimeMark?>(null)
+    private val armed = CompletableDeferred<Unit>()
 
-    /** Time (ms since [start]) of the last body progress. */
+    /** The request reached the engine: start the clocks. Only the first call counts (a plugin may re-send). */
+    fun arm() {
+        armedAt.compareAndSet(null, timeSource.markNow())
+        armed.complete(Unit)
+    }
+
+    private fun now(): Long = armedAt.load()?.elapsedNow()?.inWholeMilliseconds ?: 0L
+
+    /** Time (ms since [arm]) of the last body progress. */
     private val lastProgress = AtomicLong(0L)
 
-    /** Time (ms since [start]) the request became fully sent, or -1. A body-less request is sent at once. */
+    /** Time (ms since [arm]) the request became fully sent, or -1. A body-less request is sent at once. */
     private val fullySentAt = AtomicLong(if (bodyLength > 0) -1L else 0L)
 
     private val fired = AtomicReference<TusStallTimeoutException?>(null)
 
     /** Body progress: [bytesSent] of [bodyLength] bytes have been handed to the engine. */
     fun progress(bytesSent: Long) {
+        arm() // progress means the engine has the request
         val t = now()
         lastProgress.store(t)
         if (bytesSent >= bodyLength) fullySentAt.compareAndSet(-1L, t)
@@ -122,6 +142,7 @@ internal class StallWatch(
     suspend fun <T> guard(block: suspend () -> T): T = coroutineScope {
         val request = async { block() }
         val dog = launch {
+            armed.await() // nothing is timed before the hand-off to the engine
             while (true) {
                 val next = remaining()
                 if (next == null) {
@@ -151,5 +172,27 @@ internal class StallWatch(
     private companion object {
         /** Re-check interval, so a limit reached while waiting is noticed within this time. */
         const val POLL_MILLIS = 250L
+    }
+}
+
+/** Carries the watch of the current attempt to the request builder ([markRequestTarget]). */
+internal class StallWatchElement(val watch: StallWatch) : AbstractCoroutineContextElement(Key) {
+    companion object Key : CoroutineContext.Key<StallWatchElement>
+}
+
+/** The watch of a request, read by the send-pipeline interceptor that arms it. */
+internal val StallWatchKey = AttributeKey<StallWatch>("KtusStallWatch")
+
+private val StallArmingInstalledKey = AttributeKey<Unit>("KtusStallArming")
+
+/**
+ * Installs, once per client, a send-pipeline interceptor that arms a request's [StallWatch] at
+ * [HttpSendPipeline.Monitoring], right before the engine executes it. Requests without a watch pass through.
+ */
+internal fun HttpClient.ensureStallArming() {
+    attributes.computeIfAbsent(StallArmingInstalledKey) {
+        sendPipeline.intercept(HttpSendPipeline.Monitoring) {
+            context.attributes.getOrNull(StallWatchKey)?.arm()
+        }
     }
 }

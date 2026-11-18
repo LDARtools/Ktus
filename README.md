@@ -392,8 +392,9 @@ example one Azure block-blob block per PATCH, at most 50,000 blocks) limits the 
 **Silence limits** (all off by default; they work the same on every engine):
 
 - `sendStallMillis`: abandon a request whose body makes no progress for this long while it is not fully sent.
-  The clock starts when the request is handed to the engine (so a stalled connect or TLS handshake counts) and
-  restarts on every body progress event, the same events behind `onProgress`. A request without a body
+  The clock starts when the request is handed to the engine, after your request block (a token refresh there
+  does not count) and the client's plugins, so a stalled connect or TLS handshake counts; it restarts on every
+  body progress event, the same events behind `onProgress`. A request without a body
   (OPTIONS, HEAD, POST, DELETE) is fully sent as soon as it is handed to the engine, so only the reply limit
   applies to it.
 - `replyTimeoutMillis`: once a request is fully sent (every body byte handed to the engine), abandon it if no

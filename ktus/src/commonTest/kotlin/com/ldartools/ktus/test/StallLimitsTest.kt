@@ -309,4 +309,34 @@ class StallLimitsTest {
         val o = TusUploadOptions()
         assertNull(o.sendStallMillis); assertNull(o.replyTimeoutMillis); assertNull(o.finalReplyTimeoutMillis)
     }
+
+    /**
+     * The clocks start at the hand-off to the engine, not before the caller's request block: a block that
+     * suspends for twice every limit (a token refresh, say) cuts neither the first HEAD, a non-final PATCH nor
+     * the final PATCH.
+     */
+    @Test
+    fun aSlowRequestBlock_doesNotCountAgainstTheLimits() = real {
+        val server = ScriptedTusServer()
+        server.uploadLength = 300_000
+        server.client().uploadTus(url, InMemoryTusFile("f", testBytes(300_000)),
+            options = opts(100_000, send = 500, reply = 500, finalReply = 500, maxRetries = 1)) {
+            delay(1_000)
+        }
+        assertEquals(300_000, server.offset)
+        assertEquals(listOf("HEAD", "PATCH", "PATCH", "PATCH"), server.methods(), "no cut, no retry")
+    }
+
+    /** The same with the delay only on PATCHes (the non-final ones and the final one). */
+    @Test
+    fun aSlowRequestBlockOnPatches_doesNotCountAgainstTheLimits() = real {
+        val server = ScriptedTusServer()
+        server.uploadLength = 300_000
+        server.client().uploadTus(url, InMemoryTusFile("f", testBytes(300_000)),
+            options = opts(100_000, send = 500, reply = 500, finalReply = 500, maxRetries = 1)) {
+            if (method == HttpMethod.Patch) delay(1_000)
+        }
+        assertEquals(300_000, server.offset)
+        assertEquals(listOf("HEAD", "PATCH", "PATCH", "PATCH"), server.methods(), "no cut, no retry")
+    }
 }

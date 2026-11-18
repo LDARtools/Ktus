@@ -18,6 +18,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
 import kotlinx.io.IOException
 import kotlin.math.min
 import kotlin.math.pow
@@ -176,7 +177,8 @@ internal suspend fun attemptTus(
         val response = if (watch == null) {
             withHeartbeat(onActivity, heartbeatMillis) { send() }
         } else {
-            watch.guard { withHeartbeat(onActivity, heartbeatMillis) { send() } }
+            if (client != null) client.ensureStallArming() else watch.arm()
+            watch.guard { withContext(StallWatchElement(watch)) { withHeartbeat(onActivity, heartbeatMillis) { send() } } }
         }
         classifyResponse(op, targetUrl, response, options, cause = null)
     } catch (e: CallbackFailure) {
@@ -482,7 +484,11 @@ internal suspend fun <T> retryWithBackoff(
 /** The URL of a tus request as Ktus built it, after the caller's request block. */
 internal val RequestTargetKey = io.ktor.util.AttributeKey<Url>("KtusRequestTarget")
 
-/** Records the request's URL once the caller's block has run; see [RequestTargetKey]. */
-internal fun io.ktor.client.request.HttpRequestBuilder.markRequestTarget() {
+/**
+ * Records the request's URL once the caller's block has run (see [RequestTargetKey]), and attaches the
+ * attempt's silence watch, if any, so the send pipeline can arm it at the hand-off to the engine.
+ */
+internal suspend fun io.ktor.client.request.HttpRequestBuilder.markRequestTarget() {
     attributes.put(RequestTargetKey, url.build())
+    currentCoroutineContext()[StallWatchElement]?.let { attributes.put(StallWatchKey, it.watch) }
 }

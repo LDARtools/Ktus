@@ -23,8 +23,9 @@ package com.ldartools.ktus
  *   that is cancelled with the request (default 5 s; null turns it off). Also the longest gap between
  *   `onActivity` calls while Ktus waits to retry.
  * @param sendStallMillis abandon a request whose body makes no progress for this long while it is not fully
- *   sent (default null: off). The clock starts when the request is handed to the engine, so a stalled connect
- *   or TLS handshake counts, and restarts on every body progress event (the events behind `onProgress`).
+ *   sent (default null: off). The clock starts when the request is handed to the engine (after the caller's
+ *   request block, which may for example refresh a token, and after the client's plugins), so a stalled
+ *   connect or TLS handshake counts, and restarts on every body progress event (the events behind `onProgress`).
  *   A request without a body (OPTIONS, HEAD, POST, DELETE) is fully sent as soon as it is handed to the
  *   engine, so this limit never applies to it; [replyTimeoutMillis] does. The request is abandoned as a
  *   timed-out network failure ([TusStallTimeoutException]): it is retried within the retry budget, and an

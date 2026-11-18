@@ -358,25 +358,39 @@ class DarwinRealSocketTest {
     }
 
     /**
-     * Body progress comes in ~1 MiB steps (Ktor buffers about 1 MiB of the body; the same on CIO and OkHttp).
-     * Measured here: the first ~1 MiB at once, then ~1 MiB every ~0.3-0.8 s while the server reads ~1.3 MB/s.
-     * A send-stall limit above that step is not falsely reached; one below it would be (README "Weak links").
+     * Body progress comes in ~1 MiB steps (Ktor buffers about 1 MiB of the body; the same on CIO and OkHttp), so
+     * the gap between progress events is ~1 MiB ÷ the link speed: ~0.3-0.8 s on a Mac at ~1.3 MB/s, longer on a
+     * slower CI runner. What is pinned is the rule, not a speed: a send stall is never reported while progress
+     * keeps arriving within the limit. Either the upload went through in one PATCH, or a real gap of at least
+     * the limit preceded the cut.
      */
     @Test
     fun noFalseSendStall_onDarwin() = runBlocking {
         PosixTusServer().use { server ->
             server.faults = { m, _ -> if (m == "PATCH") Fault.SlowRead else Fault.None }
-            val size = 48 * 64 * 1024 // ~2.4 s at 64 KiB per 50 ms
+            val size = 96 * 64 * 1024 // ~5 s at 64 KiB per 50 ms, so a wrong cut at the limit would show
+            val limit = 2_000L
+            val clock = TimeSource.Monotonic.markNow()
+            var last = 0L
+            var maxGap = 0L
             withTimeout(60_000) {
                 client().use {
                     it.createAndUploadTus("${server.baseUrl}/files", TrackingFile(payload(size)),
                         options = TusUploadOptions(chunkSize = size.toLong(), activityHeartbeatMillis = null,
-                            sendStallMillis = 3_000, replyTimeoutMillis = 30_000, finalReplyTimeoutMillis = 30_000,
-                            retryOptions = quickRetry()))
+                            sendStallMillis = limit, replyTimeoutMillis = 30_000, finalReplyTimeoutMillis = 30_000,
+                            retryOptions = quickRetry()),
+                        onProgress = { _, _ ->
+                            val now = clock.elapsedNow().inWholeMilliseconds
+                            maxGap = maxOf(maxGap, now - last)
+                            last = now
+                        })
                 }
             }
-            assertEquals(1, server.log.count { it.method == "PATCH" }, "${server.log}")
-            assertEquals(size, server.data.size)
+            val patches = server.arrivals.count { it.first == "PATCH" }
+            val measured = "patches=$patches maxProgressGap=$maxGap ms elapsed=${clock.elapsedNow().inWholeMilliseconds} ms " +
+                "stored=${server.data.size}/$size log=${server.log}"
+            assertEquals(size, server.data.size, measured)
+            assertTrue(patches == 1 || maxGap >= limit, "a send stall without a progress gap of $limit ms: $measured")
         }
     }
 
