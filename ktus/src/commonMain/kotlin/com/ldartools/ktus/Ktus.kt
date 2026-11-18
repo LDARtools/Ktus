@@ -84,7 +84,7 @@ suspend fun HttpClient.createTusUpload(
  * 2xx other than 204) is followed by a backoff and then a HEAD, and the upload continues from the offset the server
  * reports; a chunk is never blindly re-sent at the old offset. When Ktus gives up on an unresolved final PATCH
  * (out of attempts or budget), it sends one last HEAD without waiting, and succeeds if that shows the whole file.
- * See [RetryOptions] for the limits; one elapsed budget covers the whole call.
+ * See [RetryOptions] for the limits; the elapsed budget measures a run of consecutive failures.
  *
  * The file size is read once at the start. The upload fails if the size changes before it completes,
  * if the server's `Upload-Length` differs from it, or if the server reports an impossible offset.
@@ -195,7 +195,8 @@ suspend fun HttpClient.createAndUploadTus(
         withFileLock(file, options) {
             val activity = onActivity?.serializedActivity()
             val total = snapshotSize(file, options)
-            // One elapsed budget for the whole call: OPTIONS, POST and the upload.
+            // One Backoff for the whole call (OPTIONS, POST and the upload); its budget measures a run of
+            // consecutive failures, ended by any success.
             val backoff = callBackoff(options, activity)
             val upload = createUploadInternal(createUrl, total, metadata, options, activity, block, backoff)
             onCreate?.invoke(upload.uploadUrl)
@@ -293,7 +294,8 @@ private suspend fun HttpClient.resumeOrCreateInternal(
     block: suspend HttpRequestBuilder.() -> Unit,
 ) {
     val total = snapshotSize(file, options)
-    // One elapsed budget for the whole call: resuming, and creating a new upload if needed.
+    // One Backoff for the whole call (resuming, and creating a new upload if needed); its budget measures a run
+    // of consecutive failures, ended by any success.
     val backoff = callBackoff(options, onActivity)
 
     // Uploads [entry], keeping its finalSentAt flag in the store up to date, and returns normally on success.
@@ -688,7 +690,7 @@ private suspend fun HttpClient.uploadInternal(
     }
 
     try {
-        // A successful first HEAD is not progress: the elapsed budget keeps running across the whole call.
+        // A successful first HEAD ends any run of failures (OPTIONS/POST before it); the budget restarts.
         var offset = headOffset(uploadUrl, total, retry, backoff, onActivity, heartbeat, block)
         var confirmed = offset
         if (offset == total) {
@@ -840,14 +842,18 @@ private suspend fun HttpClient.uploadInternal(
                         throw patchRetriesExhausted(outcome, patchAttempts)
                     }
                     // The PATCH may or may not have been applied: ask the server where it is.
-                    var serverOffset = headOffset(uploadUrl, total, retry, backoff, onActivity, heartbeat, block)
+                    // A recovery HEAD that shows no progress does not end the run (a flapping server could loop
+                    // forever); one that shows progress does, below.
+                    var serverOffset = headOffset(uploadUrl, total, retry, backoff, onActivity, heartbeat, block,
+                        resetOnSuccess = false)
                     // Below what the server already confirmed: probably a stale instance. Ask again a few times
                     // (with backoff, within the budget), but never rewind and re-send confirmed bytes.
                     var staleHeads = 0
                     while (serverOffset < confirmed && staleHeads < MAX_STALE_HEADS) {
                         staleHeads++
                         if (!backoff.awaitRetry(staleHeads, null)) break
-                        serverOffset = headOffset(uploadUrl, total, retry, backoff, onActivity, heartbeat, block)
+                        serverOffset = headOffset(uploadUrl, total, retry, backoff, onActivity, heartbeat, block,
+                            resetOnSuccess = false)
                     }
                     if (serverOffset < confirmed) {
                         throw TusOffsetMismatchException(
@@ -922,6 +928,7 @@ private suspend fun HttpClient.headOffset(
     onActivity: (() -> Unit)?,
     heartbeatMillis: Long?,
     block: suspend HttpRequestBuilder.() -> Unit,
+    resetOnSuccess: Boolean = true,
 ): Long = retryTusOperation(
     op = TusOp.HEAD,
     targetUrl = uploadUrl,
@@ -930,6 +937,7 @@ private suspend fun HttpClient.headOffset(
     client = this,
     onActivity = onActivity,
     heartbeatMillis = heartbeatMillis,
+    resetOnSuccess = resetOnSuccess,
     send = {
         head(uploadUrl) {
             tusVersionHeader()

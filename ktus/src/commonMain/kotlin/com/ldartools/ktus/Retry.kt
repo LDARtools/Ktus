@@ -390,6 +390,7 @@ internal suspend fun <T> retryTusOperation(
     client: HttpClient? = null,
     onActivity: (() -> Unit)? = null,
     heartbeatMillis: Long? = null,
+    resetOnSuccess: Boolean = true,
     send: suspend () -> HttpResponse,
     onSuccess: suspend (HttpResponse) -> T,
 ): T {
@@ -397,13 +398,20 @@ internal suspend fun <T> retryTusOperation(
     while (true) {
         attempts++
         when (val outcome = attemptTus(op, targetUrl, options, client, onActivity, heartbeatMillis, send)) {
-            is Outcome.Ok -> return onSuccess(outcome.response)
+            is Outcome.Ok -> {
+                val result = onSuccess(outcome.response)
+                // The operation succeeded: the run of consecutive failures (and its elapsed budget) is over.
+                if (resetOnSuccess) backoff.reset()
+                return result
+            }
             is Outcome.Fail -> throw outcome.error
             is Outcome.Retry -> {
                 // 423 Locked (tusdotnet's per-file lock) is bounded by the elapsed budget only.
                 val locked = outcome.statusCode == 423
                 if (locked) attempts--
-                if (!backoff.awaitRetry(attempts, outcome.retryAfterMillis, if (locked) LOCKED_MIN_DELAY_MILLIS else 0L)) {
+                if (!backoff.awaitRetry(attempts, outcome.retryAfterMillis, if (locked) LOCKED_MIN_DELAY_MILLIS else 0L) ||
+                    // The wait used up the rest of the budget: send nothing more.
+                    backoff.budgetExhausted()) {
                     throw retriesExhausted(op, targetUrl, outcome, attempts)
                 }
             }

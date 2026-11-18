@@ -13,8 +13,11 @@ import kotlin.time.TimeSource
  * failures so far. A `Retry-After` header on a retryable response is honoured when it asks for a longer wait.
  *
  * Retrying stops at whichever comes first:
- * - [maxElapsedMillis] — the primary cap. Time is counted from the first failure of the current run of
- *   consecutive failures; any upload progress (a PATCH the server accepted) starts a fresh run.
+ * - [maxElapsedMillis] — the primary cap, measured over a run of consecutive failures: the run starts at the
+ *   first failure, and any request that succeeds at its job ends it (OPTIONS answered, POST 201, the first HEAD
+ *   answered, a PATCH 204, a recovery HEAD showing more data). A recovery HEAD that shows no new data does not
+ *   end it. Once the budget is spent no request is sent, except one last HEAD when giving up on an unresolved
+ *   final PATCH.
  * - [maxRetries] — the maximum number of **attempts** for one operation (one OPTIONS, POST, HEAD or
  *   DELETE, or the PATCHes for one chunk), including the first attempt. Despite its name it is not
  *   "retries after the first try": `maxRetries = 3` means at most 3 attempts. 423 Locked answers are not

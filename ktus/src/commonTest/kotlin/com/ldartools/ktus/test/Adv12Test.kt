@@ -173,21 +173,4 @@ class Adv12Test {
         }
         assertEquals(listOf("HEAD", "PATCH"), server.methods())
     }
-
-    // ---------------------------------------------------------------- L1 one budget per call
-
-    /** OPTIONS, POST and the upload share one elapsed budget. */
-    @Test
-    fun oneBudgetForTheWholeCall() = runTest {
-        val server = ScriptedTusServer(clock = { currentTime })
-        repeat(6) { server.script(HttpMethod.Options, Reply.Status(503)) }
-        repeat(50) { server.script(HttpMethod.Post, Reply.Status(503)) }
-        assertFailsWith<TusHttpException> {
-            server.client().createAndUploadTus(createUrl, InMemoryTusFile("f", testBytes(10)), options = TusUploadOptions(
-                activityHeartbeatMillis = null, retryOptions = RetryOptions(maxRetries = 1_000, initialDelayMillis = 1_000,
-                    maxDelayMillis = 1_000, jitter = false, maxElapsedMillis = 10_000, timeSource = testScheduler.timeSource)))
-        }
-        assertTrue(currentTime <= 10_000, "one 10 s budget for OPTIONS and POST together, took $currentTime ms")
-        assertTrue(server.count(HttpMethod.Post) < 10, "the POST did not get a fresh budget: ${server.count(HttpMethod.Post)}")
-    }
 }

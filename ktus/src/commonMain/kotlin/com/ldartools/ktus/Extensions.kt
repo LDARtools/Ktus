@@ -121,7 +121,7 @@ internal fun sameOrigin(a: Url, b: Url): Boolean =
 internal fun sameTarget(answered: Url, target: Url): Boolean =
     sameOrigin(answered, target) &&
         answered.encodedPath.ifEmpty { "/" } == target.encodedPath.ifEmpty { "/" } &&
-        target.parameters.entries().all { (name, values) -> answered.parameters.getAll(name) == values }
+        target.parameters.entries().all { (name, values) -> answered.parameters.getAll(name)?.containsAll(values) == true }
 
 private fun parseHttpUrl(value: String): Url? {
     val parts = parseUriReference(value) ?: return null

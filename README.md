@@ -133,13 +133,16 @@ httpClient.createAndUploadTus(
   must then exceed the engine's socket/request timeout plus about 10 s. The in-flight ticker runs in a side job
   that is cancelled with the request.
 - Because the in-flight ticker keeps `onActivity` alive, a watchdog fed by it cannot catch a request that never
-  completes. Bound that with the engine's timeouts (Ktor `HttpTimeout`: socket/request timeout). One elapsed
-  budget covers the whole call (OPTIONS, POST and the upload; it restarts only on upload progress), and once it
-  is spent Ktus sends no further request except, when it is giving up on an unresolved final PATCH, one last
-  HEAD. So after the failures start it gives up, at worst, after about the first failing request +
-  `maxElapsedMillis` + one request timeout (the request in flight when the budget ran out, or that last HEAD).
-  Size `maxElapsedMillis` to what you can really wait, or put a finite outer limit (`withTimeout`) around the
-  call.
+  completes. Bound that with the engine's timeouts (Ktor `HttpTimeout`: socket/request timeout). The budget
+  (`maxElapsedMillis`) measures a run of consecutive failures: it starts at the first failure, and any request that succeeds at its job ends
+  it (OPTIONS answered, POST 201, the first HEAD answered, a PATCH 204, a recovery HEAD showing more data). A
+  recovery HEAD that shows no new data does not end it, so a server that answers but never accepts data still
+  runs out of budget. Once it is spent, no request is sent except the single last
+  resolution HEAD for an unresolved final PATCH. So from the start of a run, Ktus gives up at worst after: the
+  request in flight when the run started + `maxElapsedMillis` + up to two request timeouts (a request already in
+  flight when the budget ran out, then that last HEAD). Without a request timeout a request can run forever, so
+  set one. Size `maxElapsedMillis` to what you can really wait, or put a finite outer limit (`withTimeout`)
+  around the call.
 - Callbacks can run on different threads: the in-flight ticker on the caller's dispatcher, and
   `onProgress`/`onActivity` during the body write on the engine's thread. Ktus never runs `onActivity`
   concurrently with itself (an overlapping call is skipped), but make callbacks thread-safe anyway (for
@@ -333,7 +336,7 @@ failure; on iOS NSURLErrorDomain -1003, -1004, -1006, -1022 and -1201 to -1206),
 retries. Other iOS errors, such as -1009 "not connected to the internet", get the floor, because they can occur
 after bytes were sent. It is a floor applied after the jitter; raising `initialDelayMillis` alone does not
 guarantee it, because full jitter can draw any delay down to 0. When the remaining `maxElapsedMillis` budget is
-shorter than the wait a retry requires, Ktus gives up instead of retrying early; `minDelayMillis` may not exceed
+shorter than the wait a retry requires, Ktus gives up instead of retrying early; `minDelayMillis` must be below
 `maxElapsedMillis`.
 
 ### Things to avoid
@@ -391,9 +394,11 @@ landed. Treat it like a cancellation after `onFinalPatch`: check the server befo
 
 Backoff uses full jitter: each delay is random in `[0, min(maxDelayMillis, initialDelayMillis * factor^n)]`.
 Retrying stops at whichever comes first:
-- `maxElapsedMillis` (default 10 minutes), counted from the first failure of a run of consecutive failures. Any
-  progress (a PATCH the server accepted, or a HEAD showing more data) starts a fresh run, so a long upload over a
-  flaky network is not cut short while it keeps moving.
+- `maxElapsedMillis` (default 10 minutes), measured over a run of consecutive failures: it starts at the first failure, and any request that succeeds at its job ends
+  it (OPTIONS answered, POST 201, the first HEAD answered, a PATCH 204, a recovery HEAD showing more data). A
+  recovery HEAD that shows no new data does not end it, so a server that answers but never accepts data still
+  runs out of budget. A long upload over a
+  flaky network is not cut short while it keeps moving, and a blip early in a call does not shorten later retries.
 - `maxRetries` (default 10): the maximum number of attempts for one operation, including the first. Despite the
   name it counts attempts, not retries.
 
@@ -429,9 +434,11 @@ permanently: a protocol error or a status that is not retried, such as 403.
 - **No raw fallback.** An unparseable `Location` is an error; it is never used as-is.
 - **No redirects.** Any 3xx answer to a tus request is an error. Configure the client with
   `followRedirects = false`; if the client follows a redirect anyway (Ktor does for HEAD by default), an answer
-  from any URL other than the one requested is rejected (extra query parameters that client plugins add are
-  allowed). On iOS, NSURLSession does not follow redirects on its own; Ktor's redirect handling does, and is
-  caught the same way.
+  from any URL other than the one requested is rejected. The one tolerance: an answer for the same path whose
+  query has every requested parameter value plus extra parameters (or extra values) is accepted, because client
+  plugins add parameters that way after Ktus built the request; such an answer is for the same tus resource.
+  On iOS, NSURLSession does not follow redirects on its own; Ktor's redirect handling does, and is caught the same
+  way.
 
 ## Installation
 

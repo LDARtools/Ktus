@@ -23,7 +23,7 @@ Two new failure types are not `IOException`s, so a "network error, retry later" 
 - `TusUpload.finalSentAt`: set by `resumeOrCreateAndUploadTus` before the final PATCH; a marked entry is never
   dropped or re-created.
 - `TusLocalFileException` (a `TusProtocolException`) for problems with the local file (size changed, short read).
-- `RetryOptions.minDelayMillis` (default 0, at most `maxElapsedMillis`): the shortest wait before retrying a
+- `RetryOptions.minDelayMillis` (default 0, must be below `maxElapsedMillis` when set): the shortest wait before retrying a
   PATCH the origin may still be processing (a request/socket timeout, 502/503/504, 423, or any network error
   that does not prove the request never reached the origin), applied after the jitter. If the remaining budget
   is shorter than that wait, the call gives up instead of retrying early. It does not apply to failures that
@@ -116,10 +116,12 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
 - **Any 3xx answer is an error** (`TusProtocolException`), and an answer the client got by following a
   redirect (to any other URL, the same origin included; extra query parameters added by client plugins are fine)
   is rejected; on a final PATCH that is an unknown outcome.
-- **No request is sent once the retry budget is spent**, except one last HEAD (without waiting or retrying) when
-  giving up on an unresolved final PATCH; if it shows the whole file, the upload succeeds. One elapsed budget
-  covers the whole call (OPTIONS, POST and the upload), restarted only by upload progress, so a call gives up at
-  most about one request timeout after the budget ends.
+- **No request is sent once the retry budget is spent, except the single last resolution HEAD** (without waiting
+  or retrying) when giving up on an unresolved final PATCH; if it shows the whole file, the upload succeeds. The
+  budget measures a run of consecutive failures across the whole call: any request that succeeds at its job ends
+  the run (a recovery HEAD that shows no new data does not). From the start of a run a call gives up at worst
+  after the request in flight when it started + `maxElapsedMillis` + up to two request timeouts (a request in
+  flight when the budget ran out, then that last HEAD).
 - **`minDelayMillis` must be below `maxElapsedMillis`** (when it is set), otherwise no retry could be sent.
 - **404/410 from POST or OPTIONS** is a `TusHttpException`, no longer a `TusUploadExpiredException`.
 - **Retry defaults are longer.** `maxRetries` 3 → 10, `maxDelayMillis` 10 s → 30 s, plus a new 10-minute
@@ -159,7 +161,7 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
   budget) before the upload fails with `TusOffsetMismatchException`; confirmed bytes are never re-sent.
 - **`RetryOptions` validation.** Compared with 1.0.3 (which validated nothing):
   - negative `initialDelayMillis`, `maxDelayMillis`, `maxElapsedMillis` or `minDelayMillis`, a negative or NaN
-    `factor`, and `minDelayMillis` above `maxElapsedMillis` now throw `IllegalArgumentException`;
+    `factor`, and a `minDelayMillis` equal to or above `maxElapsedMillis` now throw `IllegalArgumentException`;
   - `maxRetries` of 0 or less still means a single attempt, as in 1.0.3;
   - `initialDelayMillis` above `maxDelayMillis` is accepted, and is now capped at `maxDelayMillis` (1.0.3 used it
     uncapped for the first wait);
