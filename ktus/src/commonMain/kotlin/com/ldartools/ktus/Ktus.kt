@@ -851,7 +851,8 @@ private suspend fun HttpClient.uploadInternal(
                     var staleHeads = 0
                     while (serverOffset < confirmed && staleHeads < MAX_STALE_HEADS) {
                         staleHeads++
-                        if (!backoff.awaitRetry(staleHeads, null)) break
+                        // The wait used up the rest of the budget: send no further HEAD.
+                        if (!backoff.awaitRetry(staleHeads, null) || backoff.budgetExhausted()) break
                         serverOffset = headOffset(uploadUrl, total, retry, backoff, onActivity, heartbeat, block,
                             resetOnSuccess = false)
                     }

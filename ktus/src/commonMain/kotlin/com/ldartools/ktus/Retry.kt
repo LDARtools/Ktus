@@ -462,11 +462,11 @@ internal suspend fun <T> retryWithBackoff(
                 status in 500..599 || status in options.retryableStatusCodes -> Unit
                 else -> throw e
             }
-            if (!backoff.awaitRetry(attempts, parseRetryAfterMillis(e.response))) throw e
+            if (!backoff.awaitRetry(attempts, parseRetryAfterMillis(e.response)) || backoff.budgetExhausted()) throw e
         } catch (e: TusProtocolException) {
             throw e
         } catch (e: IOException) {
-            if (!backoff.awaitRetry(attempts, null)) throw e
+            if (!backoff.awaitRetry(attempts, null) || backoff.budgetExhausted()) throw e
         }
     }
 }
