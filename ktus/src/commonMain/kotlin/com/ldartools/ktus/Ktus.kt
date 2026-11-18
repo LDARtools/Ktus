@@ -82,8 +82,9 @@ suspend fun HttpClient.createTusUpload(
  * Sends a HEAD first to learn the server's offset, then PATCHes the rest of the file in chunks. Every
  * failure whose outcome is unknown (network error, timeout, 500, 502, 503, 504, 408, 423, 429, 409, or any
  * 2xx other than 204) is followed by a backoff and then a HEAD, and the upload continues from the offset the server
- * reports; a chunk is never blindly re-sent at the old offset. When Ktus gives up on an unresolved final PATCH
- * (out of attempts or budget), it sends one last HEAD without waiting, and succeeds if that shows the whole file.
+ * reports; a chunk is never blindly re-sent at the old offset. When Ktus gives up retrying an unresolved final
+ * PATCH itself (out of attempts or budget), it sends one last HEAD without waiting, and succeeds if that shows the
+ * whole file. If a recovery HEAD is what fails, no further HEAD is sent.
  * See [RetryOptions] for the limits; the elapsed budget measures a run of consecutive failures.
  *
  * The file size is read once at the start. The upload fails if the size changes before it completes,
@@ -382,6 +383,9 @@ private suspend fun HttpClient.resumeOrCreateInternal(
         guardedStore { store.remove(fingerprint) }
     }
 
+    // A definitive answer about the stored upload (gone, wrong length, a permanent refusal) ends the run of
+    // failures before it: the new upload starts with a full budget.
+    backoff.reset()
     val created = createUploadInternal(createUrl, total, metadata, options, onActivity, block, backoff)
     guardedStore { store.set(fingerprint, created) }
     onCreate?.invoke(created.uploadUrl)
