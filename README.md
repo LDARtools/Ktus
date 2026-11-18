@@ -182,6 +182,9 @@ val options = TusUploadOptions(
     omitEmptyMetadataValues = true,        // drop metadata entries whose value is ""
     adaptiveChunkSize = true,              // halve the chunk after a PATCH timeout / 408 / 504 ...
     minChunkSize = 256 * 1024,             // ... down to this floor
+    sendStallMillis = 30_000,              // abandon a request whose body stops moving (default off)
+    replyTimeoutMillis = 30_000,           // ... or that got no answer this long after it was sent (default off)
+    finalReplyTimeoutMillis = 250_000,     // the same for the PATCH carrying the last bytes (default off)
     retryOptions = RetryOptions(
         maxRetries = 10,                   // attempts per operation, including the first
         initialDelayMillis = 500,
@@ -348,6 +351,57 @@ guarantee it, because full jitter can draw any delay down to 0. When the remaini
 shorter than the wait a retry requires, Ktus gives up instead of retrying early; `minDelayMillis` must be below
 `maxElapsedMillis`.
 
+### Weak links: silence limits
+
+On a weak mobile link you want a dead request to fail fast and be retried, without cutting one that is slow but
+still moving. Engine timeouts cannot do that on every engine:
+
+- **CIO** (Ktor's pure-Kotlin engine) starts its socket timeout when the connection opens, so
+  `HttpTimeout.socketTimeoutMillis` caps the time to send the whole chunk, not silence. A 30 s value cuts a
+  2 MiB chunk on a ~3 KB/s uplink that is moving the whole time. (Ktus's tests show it: a body read steadily
+  for ~12 s is cut by a 2.5 s CIO socket timeout, and not by a 2.5 s `sendStallMillis`.)
+- **OkHttp**'s read and write timeouts apply per socket operation, and **Darwin**'s (NSURLSession's
+  `timeoutIntervalForRequest`) is a true idle timeout.
+
+Ktus has three limits of its own that work the same on every engine (all off by default):
+
+- `sendStallMillis`: abandon a request whose body makes no progress for this long while it is not fully sent.
+  The clock starts when the request is handed to the engine (so a stalled connect or TLS handshake counts) and
+  restarts on every body progress event, the same events behind `onProgress`. A request without a body
+  (OPTIONS, HEAD, POST, DELETE) is fully sent as soon as it is handed to the engine, so only the reply limit
+  applies to it.
+- `replyTimeoutMillis`: once a request is fully sent (every body byte handed to the engine), abandon it if no
+  response arrives within this long. Every request except the PATCH carrying the last bytes.
+- `finalReplyTimeoutMillis`: the same for the PATCH carrying the last bytes, which a server may answer only
+  after slow completion work (storing or processing the whole file).
+
+An abandoned request is a timed-out network failure (`TusStallTimeoutException`, an `IOException` whose `kind`
+says which limit was reached): only that request is abandoned, it is retried within the retry budget (it counts
+as a failure of the run, like any other), the chunk is halved as after an engine timeout, and an abandoned final
+PATCH leaves its outcome unknown exactly as an engine timeout does. Cancelling the caller is still a plain
+cancellation.
+
+**Size the limits for your chunk size and your slowest link.** Ktus sees body progress only as bytes handed to
+Ktor, not as bytes on the wire, and Ktor buffers about 1 MiB of a request body between Ktus and the socket (on
+every engine; measured with CIO, OkHttp and Darwin). So:
+
+- A chunk of up to ~1 MiB is handed over at once and counts as fully sent almost immediately (on Darwin, before
+  the connection even exists). Its whole transmission then runs on the reply clock: `replyTimeoutMillis` (and
+  `finalReplyTimeoutMillis`) must exceed the time to send one chunk on the slowest link you want to keep, plus
+  the server's answer time.
+- A larger chunk shows progress in ~1 MiB steps, each as long as sending ~1 MiB takes. `sendStallMillis` must
+  exceed that step; a smaller value cuts a moving upload.
+- In practice: limit ≥ min(`chunkSize`, ~1 MiB) ÷ slowest throughput, with margin. At ~3 KB/s, 1 MiB takes about
+  6 minutes, so 30 s limits need `chunkSize` of about 64 KiB (~22 s per chunk) on such links. After a timeout
+  the chunk is halved down to `minChunkSize`, which does not help if even the smallest chunk exceeds the
+  limits: the upload then fails every attempt until the retry budget ends.
+
+With that sizing, suggested values for a mobile client behind Azure Front Door (240 s origin timeout):
+`sendStallMillis = 30_000`, `replyTimeoutMillis = 30_000`, `finalReplyTimeoutMillis = 250_000` (just above the
+gateway's 240 s, so the gateway's own 504 arrives first). Keep the engine's timeouts as an outer cap, at least
+as high as these (or off), so they never fire first. On iOS, NSURLSession's own idle timeout
+(`HttpTimeout.socketTimeoutMillis`) is an alternative to these limits.
+
 ### Things to avoid
 
 - **Ktor's `HttpRequestRetry` plugin** on the client used for tus. Ktus retries itself and decides after every
@@ -455,7 +509,7 @@ Add the following libraries to your `.toml` file.
 
 ```toml
 [versions]
-ktus = "1.1.0"
+ktus = "1.2.0"
 
 [libraries]
 ktus = { module = "com.ldartools:ktus", version.ref = "ktus" }

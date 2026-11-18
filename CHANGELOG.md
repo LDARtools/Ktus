@@ -2,6 +2,29 @@
 
 All notable changes to Ktus are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## 1.2.0
+
+Silence limits that do not depend on the HTTP engine. Everything is off by default, so 1.1 behaviour is
+unchanged; 1.1.x callers keep linking (hidden 1.1 `TusUploadOptions` constructor and `copy`).
+
+### Added
+- `TusUploadOptions.sendStallMillis`: abandon a request whose body makes no progress for this long while it is
+  not fully sent. The clock starts when the request is handed to the engine and restarts on every body progress
+  event. Requests without a body are fully sent once handed to the engine.
+- `TusUploadOptions.replyTimeoutMillis`: abandon a fully sent request that gets no answer within this long; every
+  request except the PATCH carrying the last bytes.
+- `TusUploadOptions.finalReplyTimeoutMillis`: the same for the PATCH carrying the last bytes.
+- `TusStallTimeoutException` (an `IOException`) with `kind` (`SEND_STALL`, `REPLY_TIMEOUT`,
+  `FINAL_REPLY_TIMEOUT`) and `limitMillis`. An abandoned request is classified exactly like an engine timeout:
+  retried within the run budget, the chunk halved, and an abandoned final PATCH leaves its outcome unknown.
+  Caller cancellation stays a cancellation.
+- Each limit must be positive when set (`IllegalArgumentException` otherwise).
+
+Why: Ktor's CIO engine starts its socket timeout at connect, so `socketTimeoutMillis` caps sending a whole chunk
+rather than measuring silence, and cuts a slow but moving upload. Ktus sees progress as bytes handed to Ktor,
+which buffers ~1 MiB of a body on every engine, so the limits must be sized for min(`chunkSize`, ~1 MiB) on the
+slowest link; see "Weak links" in the README.
+
 ## 1.1.0
 
 A reliability and security release. The 1.0.x function and constructor signatures remain in the binary as
