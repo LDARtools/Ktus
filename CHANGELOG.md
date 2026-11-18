@@ -4,10 +4,15 @@ All notable changes to Ktus are documented here. The project follows [Semantic V
 
 ## 1.2.0
 
-Silence limits that do not depend on the HTTP engine. Everything is off by default, so 1.1 behaviour is
-unchanged; 1.1.x callers keep linking (hidden 1.1 `TusUploadOptions` constructor and `copy`).
+Adaptive chunk sizing and silence limits that do not depend on the HTTP engine. Everything is off by default, so
+1.1 behaviour is unchanged; 1.1.x callers keep linking (hidden 1.1 `TusUploadOptions` constructor and `copy`).
 
 ### Added
+- `TusUploadOptions.targetChunkMillis`: size each PATCH to take about this long. The first PATCH of a call uses
+  `minChunkSize`; after each confirmed PATCH the next size is the smoothed goodput (bytes confirmed / time to its
+  204, exponential average with weight 0.5) times the target, within `minChunkSize`..`chunkSize` and at most
+  twice the previous size. A timeout halves it and lowers the estimate; a resume within the call keeps it. With
+  a target, `minChunkSize` must be at least 16 KiB.
 - `TusUploadOptions.sendStallMillis`: abandon a request whose body makes no progress for this long while it is
   not fully sent. The clock starts when the request is handed to the engine and restarts on every body progress
   event. Requests without a body are fully sent once handed to the engine.
@@ -20,10 +25,12 @@ unchanged; 1.1.x callers keep linking (hidden 1.1 `TusUploadOptions` constructor
   Caller cancellation stays a cancellation.
 - Each limit must be positive when set (`IllegalArgumentException` otherwise).
 
-Why: Ktor's CIO engine starts its socket timeout at connect, so `socketTimeoutMillis` caps sending a whole chunk
-rather than measuring silence, and cuts a slow but moving upload. Ktus sees progress as bytes handed to Ktor,
-which buffers ~1 MiB of a body on every engine, so the limits must be sized for min(`chunkSize`, ~1 MiB) on the
-slowest link; see "Weak links" in the README.
+Why: no client-side timer can tell a slow request from a dead one once its bytes are buffered (Ktor holds ~1 MiB
+of a body on every engine, the kernel more). CIO's socket timeout caps a whole PATCH; OkHttp's and Darwin's cut a
+slow but moving body once only the buffered tail is left (pinned in `OkHttpSocketTimeoutBehaviourTest` and
+`DarwinSocketTimeoutBehaviourTest`). Adaptive sizing keeps each PATCH's bytes in flight small next to the link
+speed, which is what makes the silence limits valid; see "Weak links" in the README for the rule and the
+recommended values.
 
 ## 1.1.0
 

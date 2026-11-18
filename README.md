@@ -182,6 +182,7 @@ val options = TusUploadOptions(
     omitEmptyMetadataValues = true,        // drop metadata entries whose value is ""
     adaptiveChunkSize = true,              // halve the chunk after a PATCH timeout / 408 / 504 ...
     minChunkSize = 256 * 1024,             // ... down to this floor
+    targetChunkMillis = 10_000,            // size each PATCH to ~10 s on the measured link (default off)
     sendStallMillis = 30_000,              // abandon a request whose body stops moving (default off)
     replyTimeoutMillis = 30_000,           // ... or that got no answer this long after it was sent (default off)
     finalReplyTimeoutMillis = 250_000,     // the same for the PATCH carrying the last bytes (default off)
@@ -351,19 +352,40 @@ guarantee it, because full jitter can draw any delay down to 0. When the remaini
 shorter than the wait a retry requires, Ktus gives up instead of retrying early; `minDelayMillis` must be below
 `maxElapsedMillis`.
 
-### Weak links: silence limits
+### Weak links: adaptive chunks and silence limits
 
 On a weak mobile link you want a dead request to fail fast and be retried, without cutting one that is slow but
-still moving. Engine timeouts cannot do that on every engine:
+still moving. **No timer on the client can tell those apart once the bytes are buffered**, and they always are:
 
-- **CIO** (Ktor's pure-Kotlin engine) starts its socket timeout when the connection opens, so
-  `HttpTimeout.socketTimeoutMillis` caps the time to send the whole chunk, not silence. A 30 s value cuts a
-  2 MiB chunk on a ~3 KB/s uplink that is moving the whole time. (Ktus's tests show it: a body read steadily
-  for ~12 s is cut by a 2.5 s CIO socket timeout, and not by a 2.5 s `sendStallMillis`.)
-- **OkHttp**'s read and write timeouts apply per socket operation, and **Darwin**'s (NSURLSession's
-  `timeoutIntervalForRequest`) is a true idle timeout.
+- Ktus sees a body's progress only as bytes handed to Ktor. Ktor buffers about 1 MiB of a request body before
+  the socket, on every engine: a chunk of up to ~1 MiB is handed over at once (on Darwin before the connection
+  even exists), and a larger one moves in ~1 MiB steps.
+- Below Ktor, the kernel's send and receive buffers hold more. An engine's own timeout cannot see past them
+  either. Ktus pins what the engines do in tests (`OkHttpSocketTimeoutBehaviourTest`,
+  `DarwinSocketTimeoutBehaviourTest`, `CioStallRealSocketTest`): with a 2.5 s `socketTimeoutMillis` and a
+  server reading a 2 MiB body steadily over ~13 s,
+  - **CIO** cuts it after ~1 s: its socket timeout runs from the connection, so it caps the whole send.
+  - **OkHttp** (read/write timeouts per socket operation) and **Darwin** (NSURLSession's idle timeout) cut it
+    late, after 7-13 s: once the engine has written the last byte, the time the server needs to read what is
+    still buffered counts as silence.
+  - All three cut a server that stops reading at ~2.5 s, and wait for a slow answer only as long as the limit.
 
-Ktus has three limits of its own that work the same on every engine (all off by default):
+So any silence limit, the engine's or Ktus's, holds only if a request's bytes in flight are small next to the
+link speed: **limit > bytes in flight ÷ slowest speed + the server's answer time.** Ktus keeps the bytes in
+flight small with adaptive chunk sizing, and then applies its own engine-independent limits.
+
+**Adaptive chunk sizing** (`targetChunkMillis`, off by default). The first PATCH of a call uses `minChunkSize`.
+After each PATCH the server confirmed, Ktus measures the end-to-end goodput (bytes confirmed ÷ time from the
+PATCH's start to its `204`; the server's answer is the only measure of bytes really delivered), smooths it
+(exponential average, weight 0.5), and sizes the next PATCH to take `targetChunkMillis`: within
+`minChunkSize`..`chunkSize`, and at most twice the previous size, so one fast sample cannot jump to the cap. A
+timeout halves the chunk and lowers the estimate. A resume within the same call (after a HEAD) keeps the
+estimate; a new call starts again from `minChunkSize`. With a target, `minChunkSize` may be as low as 16 KiB.
+More, smaller PATCHes cost the server more requests: a store that keeps each PATCH as a separate piece (for
+example one Azure block-blob block per PATCH, at most 50,000 blocks) limits the file to about
+50,000 × `minChunkSize` in the worst case (1.5 GiB at 32 KiB).
+
+**Silence limits** (all off by default; they work the same on every engine):
 
 - `sendStallMillis`: abandon a request whose body makes no progress for this long while it is not fully sent.
   The clock starts when the request is handed to the engine (so a stalled connect or TLS handshake counts) and
@@ -381,26 +403,23 @@ as a failure of the run, like any other), the chunk is halved as after an engine
 PATCH leaves its outcome unknown exactly as an engine timeout does. Cancelling the caller is still a plain
 cancellation.
 
-**Size the limits for your chunk size and your slowest link.** Ktus sees body progress only as bytes handed to
-Ktor, not as bytes on the wire, and Ktor buffers about 1 MiB of a request body between Ktus and the socket (on
-every engine; measured with CIO, OkHttp and Darwin). So:
+**Recommended together**, for a mobile client behind Azure Front Door (240 s origin timeout):
 
-- A chunk of up to ~1 MiB is handed over at once and counts as fully sent almost immediately (on Darwin, before
-  the connection even exists). Its whole transmission then runs on the reply clock: `replyTimeoutMillis` (and
-  `finalReplyTimeoutMillis`) must exceed the time to send one chunk on the slowest link you want to keep, plus
-  the server's answer time.
-- A larger chunk shows progress in ~1 MiB steps, each as long as sending ~1 MiB takes. `sendStallMillis` must
-  exceed that step; a smaller value cuts a moving upload.
-- In practice: limit ≥ min(`chunkSize`, ~1 MiB) ÷ slowest throughput, with margin. At ~3 KB/s, 1 MiB takes about
-  6 minutes, so 30 s limits need `chunkSize` of about 64 KiB (~22 s per chunk) on such links. After a timeout
-  the chunk is halved down to `minChunkSize`, which does not help if even the smallest chunk exceeds the
-  limits: the upload then fails every attempt until the retry budget ends.
+```kotlin
+TusUploadOptions(
+    chunkSize = 2 * 1024 * 1024,        // the cap
+    minChunkSize = 32 * 1024,           // the floor, and the first PATCH of each call
+    targetChunkMillis = 10_000,         // each PATCH ~10 s of data on the measured link
+    sendStallMillis = 30_000,           // 3x the target
+    replyTimeoutMillis = 30_000,
+    finalReplyTimeoutMillis = 250_000,  // just above the gateway's 240 s, so its own 504 arrives first
+)
+```
 
-With that sizing, suggested values for a mobile client behind Azure Front Door (240 s origin timeout):
-`sendStallMillis = 30_000`, `replyTimeoutMillis = 30_000`, `finalReplyTimeoutMillis = 250_000` (just above the
-gateway's 240 s, so the gateway's own 504 arrives first). Keep the engine's timeouts as an outer cap, at least
-as high as these (or off), so they never fire first. On iOS, NSURLSession's own idle timeout
-(`HttpTimeout.socketTimeoutMillis`) is an alternative to these limits.
+The 3× margin covers the kernel buffers and a link that slows down between two PATCHes. The floor still has to
+fit: at ~3 KB/s a 32 KiB PATCH takes ~11 s, inside 30 s; on a link slower than about `minChunkSize` ÷ limit,
+every attempt is cut until the retry budget ends. Keep the engine's own timeouts as an outer cap, at least as high
+as these (or off), so they never fire first; on CIO in particular, `socketTimeoutMillis` caps a whole PATCH.
 
 ### Things to avoid
 
