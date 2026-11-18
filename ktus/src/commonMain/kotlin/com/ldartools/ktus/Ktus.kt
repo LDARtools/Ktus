@@ -418,6 +418,7 @@ suspend fun HttpClient.terminateTus(
         options = retry,
         backoff = Backoff(retry),
         client = this,
+        stall = options.stallLimits(),
         send = {
             delete(uploadUrl) {
                 tusVersionHeader()
@@ -561,6 +562,7 @@ private suspend fun HttpClient.createUploadInternal(
             client = this,
             onActivity = onActivity,
             heartbeatMillis = options.activityHeartbeatMillis,
+            stall = options.stallLimits(),
             send = {
                 optionsRequest(urlString = createUrl) {
                     // Per TUS spec, Tus-Resumable MUST NOT be included in OPTIONS requests.
@@ -588,6 +590,7 @@ private suspend fun HttpClient.createUploadInternal(
         client = this,
         onActivity = onActivity,
         heartbeatMillis = options.activityHeartbeatMillis,
+        stall = options.stallLimits(),
         send = {
             post(urlString = createUrl) {
                 header("Upload-Length", total.toString())
@@ -646,6 +649,7 @@ private suspend fun HttpClient.uploadInternal(
 ) {
     val retry = options.retryOptions
     val heartbeat = options.activityHeartbeatMillis
+    val stall = options.stallLimits()
     val backoff = sharedBackoff ?: callBackoff(options, onActivity)
 
     // The outcome-unknown latch. Set while the PATCH carrying the last bytes may have landed and Ktus has
@@ -674,7 +678,7 @@ private suspend fun HttpClient.uploadInternal(
         val singleShot = retry.copy(maxRetries = 1, maxElapsedMillis = 0, minDelayMillis = 0)
         val serverOffset = try {
             headOffset(uploadUrl, total, singleShot, Backoff(singleShot, onActivity, heartbeat ?: HEARTBEAT_MILLIS),
-                onActivity, heartbeat, block)
+                onActivity, heartbeat, block, stall = stall)
         } catch (e: CancellationException) {
             throw e
         } catch (e: CallbackFailure) {
@@ -700,7 +704,7 @@ private suspend fun HttpClient.uploadInternal(
 
     try {
         // A successful first HEAD ends any run of failures (OPTIONS/POST before it); the budget restarts.
-        var offset = headOffset(uploadUrl, total, retry, backoff, onActivity, heartbeat, block)
+        var offset = headOffset(uploadUrl, total, retry, backoff, onActivity, heartbeat, block, stall = stall)
         var confirmed = offset
         if (offset == total) {
             onConfirmed?.invoke(total, total)
@@ -740,10 +744,13 @@ private suspend fun HttpClient.uploadInternal(
             }
 
             val body = TusPatchContent(file, start, length)
+            // Silence limits for this attempt (null when they are all off): fed by the body progress below.
+            val watch = stall?.watch(TusOp.PATCH, bodyLength = length, isFinal = isFinal)
             // Written on the engine's thread, read here: a CompletableDeferred is safe across threads.
             val callbackError = CompletableDeferred<Throwable>()
             val attemptOutcome = try {
-                attemptTus(TusOp.PATCH, uploadUrl, retry, client = this, onActivity = onActivity, heartbeatMillis = heartbeat) {
+                attemptTus(TusOp.PATCH, uploadUrl, retry, client = this, onActivity = onActivity, heartbeatMillis = heartbeat,
+                    watch = watch) {
                     patch(urlString = uploadUrl) {
                         tusVersionHeader()
                         header("Upload-Offset", start.toString())
@@ -756,6 +763,7 @@ private suspend fun HttpClient.uploadInternal(
                         // after the caller's block: Ktor keeps one upload listener per request, and Ktus needs
                         // this one (use onProgress rather than onUpload in the block).
                         onUpload { bytesSentTotal, _ ->
+                            watch?.progress(bytesSentTotal)
                             try {
                                 onActivity?.invoke()
                                 onProgress?.invoke(start + bytesSentTotal, total)
@@ -874,7 +882,7 @@ private suspend fun HttpClient.uploadInternal(
                     // A recovery HEAD that shows no progress does not end the run (a flapping server could loop
                     // forever); one that shows progress does, below.
                     var serverOffset = headOffset(uploadUrl, total, retry, backoff, onActivity, heartbeat, block,
-                        resetOnSuccess = false)
+                        resetOnSuccess = false, stall = stall)
                     // Below what the server already confirmed: probably a stale instance. Ask again a few times
                     // (with backoff, within the budget), but never rewind and re-send confirmed bytes.
                     var staleHeads = 0
@@ -883,7 +891,7 @@ private suspend fun HttpClient.uploadInternal(
                         // The wait used up the rest of the budget: send no further HEAD.
                         if (!backoff.awaitRetry(staleHeads, null) || backoff.budgetExhausted()) break
                         serverOffset = headOffset(uploadUrl, total, retry, backoff, onActivity, heartbeat, block,
-                            resetOnSuccess = false)
+                            resetOnSuccess = false, stall = stall)
                     }
                     if (serverOffset < confirmed) {
                         throw TusOffsetMismatchException(
@@ -973,6 +981,7 @@ private suspend fun HttpClient.headOffset(
     heartbeatMillis: Long?,
     block: suspend HttpRequestBuilder.() -> Unit,
     resetOnSuccess: Boolean = true,
+    stall: StallLimits? = null,
 ): Long = retryTusOperation(
     op = TusOp.HEAD,
     targetUrl = uploadUrl,
@@ -981,6 +990,7 @@ private suspend fun HttpClient.headOffset(
     client = this,
     onActivity = onActivity,
     heartbeatMillis = heartbeatMillis,
+    stall = stall,
     resetOnSuccess = resetOnSuccess,
     send = {
         head(uploadUrl) {
