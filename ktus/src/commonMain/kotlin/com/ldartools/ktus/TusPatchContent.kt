@@ -3,6 +3,7 @@ package com.ldartools.ktus
 import io.ktor.http.ContentType
 import io.ktor.http.content.OutgoingContent
 import io.ktor.utils.io.ByteWriteChannel
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -30,9 +31,27 @@ internal class TusPatchContent(
 
     private val abandoned = Job()
 
+    // Written on the engine's thread, read by Ktus after the attempt: a CompletableDeferred is safe across threads.
+    private val localFailure = CompletableDeferred<TusLocalFileException>()
+
+    /**
+     * The [TusLocalFileException] the body write failed with, if any. It is a local fact (the file is short or
+     * unreadable), so it takes precedence over whatever the engine reports for the aborted request: depending
+     * on timing, an engine reports the writer's exception, a cancellation, an `IOException`, or even the
+     * server's answer to the truncated body.
+     */
+    fun localFailure(): TusLocalFileException? = if (localFailure.isCompleted) localFailure.getCompleted() else null
+
     override suspend fun writeTo(channel: ByteWriteChannel) {
         coroutineScope {
-            val write = async { file.writeSection(offset, length, channel) }
+            val write = async {
+                try {
+                    file.writeSection(offset, length, channel)
+                } catch (e: TusLocalFileException) {
+                    localFailure.complete(e)
+                    throw e
+                }
+            }
             val watcher = launch {
                 abandoned.join()
                 write.cancel()

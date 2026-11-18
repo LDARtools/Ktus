@@ -184,8 +184,11 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
   request, so an `onUpload` set in the block is replaced; use `onProgress`.
 - **`TusOffsetMismatchException` no longer makes `resumeOrCreateAndUploadTus` drop a stored upload** (it can be
   caused by a stale HEAD); the entry is kept.
-- **A short read is reported as `TusLocalFileException`** and is not retried; verified with real sockets on the
-  Darwin engine as well as with MockEngine and okio's FakeFileSystem.
+- **A short read is reported as `TusLocalFileException`** and is not retried, whatever the engine reports for the
+  aborted request (the writer's exception, a cancellation, an `IOException`, or the server's answer to the
+  truncated body, depending on timing); verified with real sockets on the Darwin engine as well as with
+  MockEngine and okio's FakeFileSystem. A 2xx answered to a body Ktus knows was short is an unknown outcome on
+  the final PATCH.
 - **Any failure of a marked entry, including a permanent 4xx, is `TusUploadOutcomeUnknownException`**; a marked
   entry is never dropped or re-created.
 - **A malformed answer to the final PATCH is an unknown outcome**: a 2xx with a missing or impossible

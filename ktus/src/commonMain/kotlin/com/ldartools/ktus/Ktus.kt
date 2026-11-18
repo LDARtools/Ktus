@@ -767,7 +767,15 @@ private suspend fun HttpClient.uploadInternal(
                 body.abandon()
             }
             if (callbackError.isCompleted) throw CallbackFailure(callbackError.getCompleted())
-            val outcome = attemptOutcome
+            // A short or unreadable local file is a fact, whatever the engine reported for the aborted request
+            // (the writer's exception, a cancellation, an IOException, or the server's answer to the truncated
+            // body all happen, depending on timing). Classify it the same way in every case.
+            val localFailure = body.localFailure()
+            if (localFailure != null && attemptOutcome is Outcome.Ok && isFinal) {
+                // A success-like answer to a body we know was short: we cannot tell what the server kept.
+                finalMayHaveLanded = true
+            }
+            val outcome = if (localFailure != null) Outcome.Fail(localFailure) else attemptOutcome
 
             when (outcome) {
                 is Outcome.Ok -> {
