@@ -102,7 +102,8 @@ suspend fun HttpClient.createTusUpload(
  *   larger offset (a PATCH answered 204, or a HEAD after a failure), and exactly once with
  *   `offset == total` when the upload is complete, including when the HEAD shows it was already complete.
  * @param onActivity Optional callback invoked whenever Ktus is doing something: a request starts or gets
- *   its response, the PATCH body makes progress, and at least every 5 seconds while it waits to retry.
+ *   its response, the PATCH body makes progress, every [TusUploadOptions.activityHeartbeatMillis] (default 5 s)
+ *   while a request is in flight, and at least that often (every 5 s when it is null) while it waits to retry.
  *   Use it, not [onProgress], to feed a stall watchdog: recovery can legitimately send no body bytes for
  *   minutes, but it always reports activity.
  * @param onFinalPatch Optional callback invoked right before every attempt to send the PATCH carrying the last

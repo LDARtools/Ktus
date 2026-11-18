@@ -78,8 +78,8 @@ Two new failure types are not `IOException`s, so a "network error, retry later" 
 - After every PATCH whose outcome is unknown (network error, timeout, retryable status, 409, any 2xx other than
   204) Ktus backs off, sends HEAD, and continues from the server's offset. 1.0.x re-sent the same chunk at the
   old offset after a network error (and, with `expectSuccess = true`, after a 5xx).
-- Backoff uses full jitter and a total time budget (`maxElapsedMillis`, default 10 minutes, counted from the
-  first failure of a run and reset by progress). The non-204 PATCH path now backs off too.
+- Backoff uses full jitter and a time budget (`maxElapsedMillis`, default 10 minutes) for each run of
+  consecutive failures; any request that succeeds at its job ends the run. The non-204 PATCH path now backs off too.
 - `RetryOptions.maxRetries` is documented as what it always was: attempts per operation, including the first.
   Its default rose from 3 to 10, and `maxDelayMillis` from 10 s to 30 s, so the time budget is the main limit.
 - Validation: the file size is read once and must not change; HEAD `Upload-Offset` must be within the file and
@@ -114,7 +114,8 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
   the host is in `allowedUploadHosts`; https to http is always rejected, and so is a `Location` with user
   information (`user@host`).
 - **Any 3xx answer is an error** (`TusProtocolException`), and an answer the client got by following a
-  redirect (to any other URL, the same origin included; extra query parameters added by client plugins are fine)
+  redirect (to any other URL, the same origin included; the same path with every requested query value plus
+  extra parameters or values, as client plugins add them, is fine)
   is rejected; on a final PATCH that is an unknown outcome.
 - **No request is sent once the retry budget is spent, except the single last resolution HEAD** (without waiting
   or retrying) when giving up on an unresolved final PATCH; if it shows the whole file, the upload succeeds. The
@@ -126,9 +127,12 @@ Code that compiled against 1.0.x compiles against 1.1.0, but these differences c
 - **404/410 from POST or OPTIONS** is a `TusHttpException`, no longer a `TusUploadExpiredException`.
 - **Retry defaults are longer.** `maxRetries` 3 → 10, `maxDelayMillis` 10 s → 30 s, plus a new 10-minute
   `maxElapsedMillis` budget. Worst case for one operation that keeps failing: about 10 attempts with up to
-  30 s (random, full jitter) between them, so typically 1–2 minutes and never more than the 10-minute budget
-  plus one request. A `Retry-After` can stretch a single wait up to max(`maxDelayMillis`, 60 s). Any upload
-  progress restarts the budget. Pass `RetryOptions(maxRetries = 3, maxDelayMillis = 10_000)` for the old limits.
+  30 s (random, full jitter) between them, so typically 1–2 minutes. Counted from when a run's first failing
+  request was sent, a call gives up at worst after that request + `maxElapsedMillis` + up to two request
+  timeouts (a request still in flight when the budget ran out, then the last resolution HEAD for an unresolved
+  final PATCH). A `Retry-After` can stretch a single wait up to max(`maxDelayMillis`, 60 s). Any request that
+  succeeds at its job ends the run of failures; a recovery HEAD that shows no new data does not. Pass
+  `RetryOptions(maxRetries = 3, maxDelayMillis = 10_000)` for the old limits.
 - **HEAD before every re-PATCH.** After any PATCH whose outcome is unknown, Ktus waits, sends HEAD and
   continues from the server's offset, so a retry costs one extra request. If that HEAD reports an offset below
   one the server already confirmed, the upload fails with `TusOffsetMismatchException` instead of rewinding.

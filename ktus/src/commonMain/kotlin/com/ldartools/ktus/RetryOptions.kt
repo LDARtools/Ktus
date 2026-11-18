@@ -46,8 +46,8 @@ import kotlin.time.TimeSource
  *   `SSLHandshakeException`, Ktor's `ConnectTimeoutException`, and on Darwin the NSURLErrorDomain codes -1003,
  *   -1004, -1006, -1022 and -1201 to -1206). Nor does it apply to HEAD, OPTIONS, POST and DELETE retries.
  *   It is applied after the jitter. If the remaining
- *   [maxElapsedMillis] is shorter, the call gives up rather than retrying early; it must not exceed
- *   [maxElapsedMillis]. Use it to make a retry after a gateway timeout wait longer than the origin's own
+ *   [maxElapsedMillis] is shorter, the call gives up rather than retrying early; when set it must be
+ *   below [maxElapsedMillis]. Use it to make a retry after a gateway timeout wait longer than the origin's own
  *   request timeout; with full jitter, raising [initialDelayMillis] alone does not guarantee that.
  * @param timeSource monotonic clock for [maxElapsedMillis]. Replace only in tests (for example with
  *   `TestCoroutineScheduler.timeSource`).

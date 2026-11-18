@@ -230,8 +230,8 @@ After any PATCH whose outcome is unknown (network error, timeout, a retryable st
 `204`) Ktus backs off, then sends HEAD, and continues from the offset the server reports. When it gives up on an
 unresolved final PATCH (out of attempts or budget, or the required wait would not fit the budget), it sends one
 last HEAD without waiting: if that shows the whole file, the upload succeeded. It never re-sends a chunk at the
-old offset blindly. If that HEAD reports less than the server has already confirmed, the upload fails
-with `TusOffsetMismatchException` rather than rewinding.
+old offset blindly. If that HEAD reports less than the server has already confirmed, Ktus asks again (up to 3
+times, with backoff, within the budget) and then fails with `TusOffsetMismatchException` rather than rewinding.
 
 ## When the outcome is unknown
 
