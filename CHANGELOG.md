@@ -2,6 +2,21 @@
 
 All notable changes to Ktus are documented here. The project follows [Semantic Versioning](https://semver.org/).
 
+## 1.2.1
+
+1.2.0 was tagged, but its publish run failed its own test step, so it was never published. 1.2.1 is 1.2.0 plus
+test fixes; there is no library code change.
+
+### Tests and CI
+- The real-socket send-stall tests (`aBodyThatKeepsMovingSlowly_isOnlyCutAfterARealGap` on CIO and OkHttp)
+  assumed a link speed. Body progress comes in ~1 MiB steps, so on a slower runner the gap between progress
+  events can genuinely exceed the limit. They now pin the rule instead: either no cut, or a real progress gap of
+  at least the limit preceded the cut (measured up to the first retry). The same refinement applies to
+  `noFalseSendStall_onDarwin`. Assertion messages print the measured values.
+- The CIO real-socket stall tests turn off CIO's own `requestTimeout` (15 s by default), which cut the slow
+  body on a slower runner before any Ktus limit could; the README's engine-timeouts note now mentions it.
+- PR CI runs the JVM tests on macOS as well, as the publish workflow does.
+
 ## 1.2.0
 
 Adaptive chunk sizing and silence limits that do not depend on the HTTP engine. Everything is off by default, so

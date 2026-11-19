@@ -443,7 +443,10 @@ every attempt is cut until the retry budget ends.
 request from the connection, and OkHttp's and Darwin's cut a moving body once only the buffered tail is left
 (above). Use at least 4 × (`sendStallMillis` + `replyTimeoutMillis`) for the PATCHes before the last one, and at
 least `finalReplyTimeoutMillis` plus the time to send the final chunk for the final PATCH; an engine timeout is
-per client, so in practice that means the larger value, or leaving it off and relying on Ktus's limits.
+per client, so in practice that means the larger value, or leaving it off and relying on Ktus's limits. Note that CIO
+also has an engine-level `requestTimeout` of 15 s by default (Ktor 3.2.2 `CIOEngineConfig`), which caps every
+request including a slow PATCH; raise it or set it to 0 (`HttpClient(CIO) { engine { requestTimeout = 0 } }`),
+or override it with the `HttpTimeout` plugin.
 
 **In tests under `runTest`**, pass the test scheduler's clock (`RetryOptions(timeSource = testScheduler.timeSource)`):
 the silence limits, the adaptive sizing and the retry budget all measure time with `RetryOptions.timeSource`, and
@@ -556,7 +559,7 @@ Add the following libraries to your `.toml` file.
 
 ```toml
 [versions]
-ktus = "1.2.0"
+ktus = "1.2.1"
 
 [libraries]
 ktus = { module = "com.ldartools:ktus", version.ref = "ktus" }

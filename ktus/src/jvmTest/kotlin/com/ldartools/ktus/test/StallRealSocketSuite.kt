@@ -13,7 +13,12 @@ import kotlin.test.*
 
 /** The silence limits over real sockets on CIO (Chateau Mobile's Android engine). */
 class CioStallRealSocketTest : StallRealSocketSuite() {
-    override fun newClient(config: HttpClientConfig<*>.() -> Unit) = HttpClient(CIO) { followRedirects = false; config() }
+    // CIO's own requestTimeout defaults to 15 s for every request; off here, so only the limits under test cut.
+    override fun newClient(config: HttpClientConfig<*>.() -> Unit) = HttpClient(CIO) {
+        engine { requestTimeout = 0 }
+        followRedirects = false
+        config()
+    }
 
     /**
      * Why the feature exists: CIO's socket timeout does not measure silence. With the same value, the slowly
@@ -69,21 +74,36 @@ abstract class StallRealSocketSuite {
 
     private fun RealSocketTusServer.at(method: String, n: Int): Long = log.filter { it.method == method }[n].atMillis
 
+    /**
+     * A body that keeps moving is not cut by the send limit. Body progress comes in ~1 MiB steps (Ktor's buffer),
+     * so the gap between progress events is ~1 MiB ÷ the server's read speed: ~0.85 s on a Mac, but a slow CI
+     * runner (oversleeping the fixture's 50 ms pauses) can genuinely exceed the limit. What is pinned is the rule,
+     * not a speed: either the upload went through in one PATCH, or a real progress gap of at least the limit
+     * preceded the cut.
+     */
     @Test
-    fun aBodyThatKeepsMovingSlowly_forFiveTimesTheLimit_isNotCut() = runBlocking {
+    fun aBodyThatKeepsMovingSlowly_isOnlyCutAfterARealGap() = runBlocking {
         RealSocketTusServer().use { server ->
             server.faults = { method, _ -> if (method == "PATCH") Fault.SlowRead(SLOW_TICK_BYTES, SLOW_TICK_MILLIS) else Fault.None }
             val started = System.nanoTime()
-            withTimeout(60_000) {
+            fun now() = (System.nanoTime() - started) / 1_000_000
+            // The largest gap between progress events up to the first event of the first retry (the gap that
+            // spans the cut). After a cut the abandoned body still occupies the server and the link, so later
+            // gaps say nothing about the cut.
+            val gaps = ProgressGaps()
+            withTimeout(90_000) {
                 newClient().use { c ->
                     c.createAndUploadTus("${server.baseUrl}/files", InMemoryTusFile("f", testBytes(SLOW_SIZE)),
-                        options = opts(SLOW_SIZE.toLong(), send = SLOW_STALL))
+                        options = opts(SLOW_SIZE.toLong(), send = SLOW_STALL),
+                        onProgress = { sent, _ -> gaps.record(now(), sent) })
                 }
             }
-            val elapsed = (System.nanoTime() - started) / 1_000_000
-            assertEquals(1, server.log.count { it.method == "PATCH" }, "never cut: ${server.log}")
-            assertEquals(SLOW_SIZE.toLong(), server.offset)
-            assertTrue(elapsed >= 4 * SLOW_STALL, "the body took $elapsed ms")
+            val patches = server.arrivals.count { it.first == "PATCH" }
+            val measured = "patches=$patches maxProgressGapUpToTheFirstRetry=${gaps.maxGap} ms elapsed=${now()} ms " +
+                "stored=${server.offset}/$SLOW_SIZE log=${server.log}"
+            assertEquals(SLOW_SIZE.toLong(), server.offset, measured)
+            assertTrue(patches == 1 || gaps.maxGap >= SLOW_STALL, "a send stall without a progress gap of $SLOW_STALL ms: $measured")
+            assertTrue(now() >= 4 * SLOW_STALL, "the body moved for at least 4x the limit: $measured")
         }
     }
 
@@ -180,8 +200,12 @@ abstract class StallRealSocketSuite {
                         options = adaptive(target = 1_000))
                 }
             }
-            assertEquals(160L * 1024, server.offset)
-            assertEquals(1, server.arrivals.count { it.first == "HEAD" }, "no recovery HEAD, so no cut: ${server.log}")
+            val measured = "heads=${server.arrivals.count { it.first == "HEAD" }} patches=${server.arrivals.count { it.first == "PATCH" }} " +
+                "stored=${server.offset} log=${server.log}"
+            assertEquals(160L * 1024, server.offset, measured)
+            // Strict on purpose: the fixture's speed is set by its 250 ms pauses, and adaptive sizing measures
+            // whatever speed the runner really delivers, so a cut here is a real failure on any machine.
+            assertEquals(1, server.arrivals.count { it.first == "HEAD" }, "no recovery HEAD, so no cut: $measured")
         }
     }
 
@@ -198,7 +222,8 @@ abstract class StallRealSocketSuite {
                     }
                 }
             }
-            assertTrue(server.arrivals.count { it.first == "HEAD" } > 1, "cut: ${server.log}")
+            assertTrue(server.arrivals.count { it.first == "HEAD" } > 1,
+                "cut: heads=${server.arrivals.count { it.first == "HEAD" }} stored=${server.offset} log=${server.log}")
         }
     }
 
@@ -213,8 +238,30 @@ abstract class StallRealSocketSuite {
                         options = adaptive(target = 1_000))
                 }
             }
-            assertEquals(512L * 1024, server.offset)
-            assertEquals(2, server.arrivals.count { it.first == "HEAD" }, "one cut, one recovery HEAD: ${server.log}")
+            val measured = "heads=${server.arrivals.count { it.first == "HEAD" }} patches=${server.arrivals.count { it.first == "PATCH" }} " +
+                "stored=${server.offset} log=${server.log}"
+            assertEquals(512L * 1024, server.offset, measured)
+            assertEquals(2, server.arrivals.count { it.first == "HEAD" }, "one cut, one recovery HEAD: $measured")
         }
+    }
+}
+
+/**
+ * The largest gap between onProgress events up to and including the first event of the first retry (where the
+ * reported position goes back), so it includes the gap that spans the first cut and nothing after it.
+ */
+class ProgressGaps {
+    private var last = 0L
+    private var lastSent = -1L
+    private var retried = false
+    @Volatile var maxGap = 0L
+        private set
+
+    @Synchronized fun record(atMillis: Long, sent: Long) {
+        if (retried) return
+        maxGap = maxOf(maxGap, atMillis - last)
+        if (sent < lastSent) retried = true
+        last = atMillis
+        lastSent = sent
     }
 }

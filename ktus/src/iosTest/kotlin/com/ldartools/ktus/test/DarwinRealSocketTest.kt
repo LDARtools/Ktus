@@ -371,7 +371,11 @@ class DarwinRealSocketTest {
             val size = 96 * 64 * 1024 // ~5 s at 64 KiB per 50 ms, so a wrong cut at the limit would show
             val limit = 2_000L
             val clock = TimeSource.Monotonic.markNow()
+            // The largest gap between progress events up to the first event of the first retry (the gap that spans
+            // the cut); later gaps are disturbed by the abandoned body still occupying the server.
             var last = 0L
+            var lastSent = -1L
+            var retried = false
             var maxGap = 0L
             withTimeout(60_000) {
                 client().use {
@@ -379,15 +383,19 @@ class DarwinRealSocketTest {
                         options = TusUploadOptions(chunkSize = size.toLong(), activityHeartbeatMillis = null,
                             sendStallMillis = limit, replyTimeoutMillis = 30_000, finalReplyTimeoutMillis = 30_000,
                             retryOptions = quickRetry()),
-                        onProgress = { _, _ ->
-                            val now = clock.elapsedNow().inWholeMilliseconds
-                            maxGap = maxOf(maxGap, now - last)
-                            last = now
+                        onProgress = { sent, _ ->
+                            if (!retried) {
+                                val now = clock.elapsedNow().inWholeMilliseconds
+                                maxGap = maxOf(maxGap, now - last)
+                                if (sent < lastSent) retried = true
+                                last = now
+                                lastSent = sent
+                            }
                         })
                 }
             }
             val patches = server.arrivals.count { it.first == "PATCH" }
-            val measured = "patches=$patches maxProgressGap=$maxGap ms elapsed=${clock.elapsedNow().inWholeMilliseconds} ms " +
+            val measured = "patches=$patches maxProgressGapUpToTheFirstRetry=$maxGap ms elapsed=${clock.elapsedNow().inWholeMilliseconds} ms " +
                 "stored=${server.data.size}/$size log=${server.log}"
             assertEquals(size, server.data.size, measured)
             assertTrue(patches == 1 || maxGap >= limit, "a send stall without a progress gap of $limit ms: $measured")
