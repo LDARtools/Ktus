@@ -37,7 +37,7 @@ jobs:
         run: ./gradlew build --no-daemon --stacktrace
 
   ios:
-    name: iOS targets (compile, simulator tests)
+    name: macOS (iOS targets, simulator tests, JVM tests)
     runs-on: macos-latest
     steps:
       - name: Check out code
@@ -66,3 +66,8 @@ jobs:
       # Includes the Darwin-engine real-socket tests (a local POSIX socket server on the simulator).
       - name: Run iOS simulator tests
         run: ./gradlew --no-daemon --stacktrace :ktus:iosSimulatorArm64Test :ktus-okio:iosSimulatorArm64Test
+
+      # The publish workflow runs the JVM tests on macOS too; the real-socket tests depend on the runner's timing
+      # and buffers, so run them here as well and catch a difference before a release.
+      - name: Run JVM tests on macOS
+        run: ./gradlew --no-daemon --stacktrace :ktus:jvmTest :ktus-okio:jvmTest
