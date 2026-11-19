@@ -13,7 +13,12 @@ import kotlin.test.*
 
 /** The silence limits over real sockets on CIO (Chateau Mobile's Android engine). */
 class CioStallRealSocketTest : StallRealSocketSuite() {
-    override fun newClient(config: HttpClientConfig<*>.() -> Unit) = HttpClient(CIO) { followRedirects = false; config() }
+    // CIO's own requestTimeout defaults to 15 s for every request; off here, so only the limits under test cut.
+    override fun newClient(config: HttpClientConfig<*>.() -> Unit) = HttpClient(CIO) {
+        engine { requestTimeout = 0 }
+        followRedirects = false
+        config()
+    }
 
     /**
      * Why the feature exists: CIO's socket timeout does not measure silence. With the same value, the slowly

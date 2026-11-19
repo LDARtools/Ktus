@@ -13,6 +13,8 @@ test fixes; there is no library code change.
   events can genuinely exceed the limit. They now pin the rule instead: either no cut, or a real progress gap of
   at least the limit preceded the cut (measured up to the first retry). The same refinement applies to
   `noFalseSendStall_onDarwin`. Assertion messages print the measured values.
+- The CIO real-socket stall tests turn off CIO's own `requestTimeout` (15 s by default), which cut the slow
+  body on a slower runner before any Ktus limit could; the README's engine-timeouts note now mentions it.
 - PR CI runs the JVM tests on macOS as well, as the publish workflow does.
 
 ## 1.2.0
