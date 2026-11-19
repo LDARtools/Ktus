@@ -97,7 +97,8 @@ abstract class StallRealSocketSuite {
                     c.createAndUploadTus("${server.baseUrl}/files", InMemoryTusFile("f", testBytes(SLOW_SIZE)),
                         options = opts(SLOW_SIZE.toLong(), send = SLOW_STALL),
                         onProgress = { sent, _ -> probe.progress(now(), sent) },
-                        onActivity = { probe.activity(now()) })
+                        onActivity = { probe.activity(now()) },
+                        onConfirmed = { _, _ -> probe.confirmed(now()) })
                 }
             }
             val patches = server.arrivals.count { it.first == "PATCH" }

@@ -382,7 +382,8 @@ class DarwinRealSocketTest {
                             sendStallMillis = limit, replyTimeoutMillis = 30_000, finalReplyTimeoutMillis = 30_000,
                             retryOptions = quickRetry()),
                         onProgress = { sent, _ -> probe.progress(now(), sent) },
-                        onActivity = { probe.activity(now()) })
+                        onActivity = { probe.activity(now()) },
+                        onConfirmed = { _, _ -> probe.confirmed(now()) })
                 }
             }
             val patches = server.arrivals.count { it.first == "PATCH" }
