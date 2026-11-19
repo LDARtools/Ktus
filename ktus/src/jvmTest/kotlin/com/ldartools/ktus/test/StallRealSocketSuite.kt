@@ -65,6 +65,8 @@ abstract class StallRealSocketSuite {
         const val SLOW_TICK_MILLIS = 50L
         const val SLOW_SIZE = 250 * 64 * 1024
         const val SLACK = 700L
+        /** Allowed shortfall of the measured silence before a cut (clock and callback granularity). */
+        const val CUT_TOLERANCE = 100L
     }
 
     private fun opts(chunk: Long, send: Long? = null, reply: Long? = null, finalReply: Long? = null, maxRetries: Int = 5) =
@@ -87,22 +89,25 @@ abstract class StallRealSocketSuite {
             server.faults = { method, _ -> if (method == "PATCH") Fault.SlowRead(SLOW_TICK_BYTES, SLOW_TICK_MILLIS) else Fault.None }
             val started = System.nanoTime()
             fun now() = (System.nanoTime() - started) / 1_000_000
-            // The largest gap between progress events up to the first event of the first retry (the gap that
-            // spans the cut). After a cut the abandoned body still occupies the server and the link, so later
-            // gaps say nothing about the cut.
-            val gaps = ProgressGaps()
+            // How long the first cut attempt had been silent when it was cut (its last progress to its end),
+            // excluding the recovery after it.
+            val probe = CutGapProbe()
             withTimeout(90_000) {
                 newClient().use { c ->
                     c.createAndUploadTus("${server.baseUrl}/files", InMemoryTusFile("f", testBytes(SLOW_SIZE)),
                         options = opts(SLOW_SIZE.toLong(), send = SLOW_STALL),
-                        onProgress = { sent, _ -> gaps.record(now(), sent) })
+                        onProgress = { sent, _ -> probe.progress(now(), sent) },
+                        onActivity = { probe.activity(now()) })
                 }
             }
             val patches = server.arrivals.count { it.first == "PATCH" }
-            val measured = "patches=$patches maxProgressGapUpToTheFirstRetry=${gaps.maxGap} ms elapsed=${now()} ms " +
+            val silence = probe.silenceBeforeFirstCut()
+            val measured = "patches=$patches silenceBeforeFirstCut=$silence ms elapsed=${now()} ms " +
                 "stored=${server.offset}/$SLOW_SIZE log=${server.log}"
             assertEquals(SLOW_SIZE.toLong(), server.offset, measured)
-            assertTrue(patches == 1 || gaps.maxGap >= SLOW_STALL, "a send stall without a progress gap of $SLOW_STALL ms: $measured")
+            // A cut only after at least the limit of silence (less a little for clock granularity).
+            assertTrue(patches == 1 || (silence != null && silence >= SLOW_STALL - CUT_TOLERANCE),
+                "a send stall without $SLOW_STALL ms of silence: $measured")
             assertTrue(now() >= 4 * SLOW_STALL, "the body moved for at least 4x the limit: $measured")
         }
     }
@@ -243,25 +248,5 @@ abstract class StallRealSocketSuite {
             assertEquals(512L * 1024, server.offset, measured)
             assertEquals(2, server.arrivals.count { it.first == "HEAD" }, "one cut, one recovery HEAD: $measured")
         }
-    }
-}
-
-/**
- * The largest gap between onProgress events up to and including the first event of the first retry (where the
- * reported position goes back), so it includes the gap that spans the first cut and nothing after it.
- */
-class ProgressGaps {
-    private var last = 0L
-    private var lastSent = -1L
-    private var retried = false
-    @Volatile var maxGap = 0L
-        private set
-
-    @Synchronized fun record(atMillis: Long, sent: Long) {
-        if (retried) return
-        maxGap = maxOf(maxGap, atMillis - last)
-        if (sent < lastSent) retried = true
-        last = atMillis
-        lastSent = sent
     }
 }

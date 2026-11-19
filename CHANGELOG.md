@@ -11,7 +11,8 @@ test fixes; there is no library code change.
 - The real-socket send-stall tests (`aBodyThatKeepsMovingSlowly_isOnlyCutAfterARealGap` on CIO and OkHttp)
   assumed a link speed. Body progress comes in ~1 MiB steps, so on a slower runner the gap between progress
   events can genuinely exceed the limit. They now pin the rule instead: either no cut, or a real progress gap of
-  at least the limit preceded the cut (measured up to the first retry). The same refinement applies to
+  at least the limit preceded the cut, measured from the cut attempt's last `onProgress` to the end of that
+  attempt (its outcome `onActivity`), so the recovery after the cut is not counted. The same applies to
   `noFalseSendStall_onDarwin`. Assertion messages print the measured values.
 - The CIO real-socket stall tests turn off CIO's own `requestTimeout` (15 s by default), which cut the slow
   body on a slower runner before any Ktus limit could; the README's engine-timeouts note now mentions it.

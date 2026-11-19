@@ -371,34 +371,28 @@ class DarwinRealSocketTest {
             val size = 96 * 64 * 1024 // ~5 s at 64 KiB per 50 ms, so a wrong cut at the limit would show
             val limit = 2_000L
             val clock = TimeSource.Monotonic.markNow()
-            // The largest gap between progress events up to the first event of the first retry (the gap that spans
-            // the cut); later gaps are disturbed by the abandoned body still occupying the server.
-            var last = 0L
-            var lastSent = -1L
-            var retried = false
-            var maxGap = 0L
+            // How long the first cut attempt had been silent when it was cut (its last progress to its end),
+            // excluding the recovery after it.
+            val probe = CutGapProbe()
+            fun now() = clock.elapsedNow().inWholeMilliseconds
             withTimeout(60_000) {
                 client().use {
                     it.createAndUploadTus("${server.baseUrl}/files", TrackingFile(payload(size)),
                         options = TusUploadOptions(chunkSize = size.toLong(), activityHeartbeatMillis = null,
                             sendStallMillis = limit, replyTimeoutMillis = 30_000, finalReplyTimeoutMillis = 30_000,
                             retryOptions = quickRetry()),
-                        onProgress = { sent, _ ->
-                            if (!retried) {
-                                val now = clock.elapsedNow().inWholeMilliseconds
-                                maxGap = maxOf(maxGap, now - last)
-                                if (sent < lastSent) retried = true
-                                last = now
-                                lastSent = sent
-                            }
-                        })
+                        onProgress = { sent, _ -> probe.progress(now(), sent) },
+                        onActivity = { probe.activity(now()) })
                 }
             }
             val patches = server.arrivals.count { it.first == "PATCH" }
-            val measured = "patches=$patches maxProgressGapUpToTheFirstRetry=$maxGap ms elapsed=${clock.elapsedNow().inWholeMilliseconds} ms " +
+            val silence = probe.silenceBeforeFirstCut()
+            val measured = "patches=$patches silenceBeforeFirstCut=$silence ms elapsed=${now()} ms " +
                 "stored=${server.data.size}/$size log=${server.log}"
             assertEquals(size, server.data.size, measured)
-            assertTrue(patches == 1 || maxGap >= limit, "a send stall without a progress gap of $limit ms: $measured")
+            // A cut only after at least the limit of silence (less 100 ms for clock and callback granularity).
+            assertTrue(patches == 1 || (silence != null && silence >= limit - 100),
+                "a send stall without $limit ms of silence: $measured")
         }
     }
 
