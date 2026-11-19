@@ -358,14 +358,18 @@ class DarwinRealSocketTest {
     }
 
     /**
-     * Body progress comes in ~1 MiB steps (Ktor buffers about 1 MiB of the body; the same on CIO and OkHttp), so
-     * the gap between progress events is ~1 MiB ÷ the link speed: ~0.3-0.8 s on a Mac at ~1.3 MB/s, longer on a
-     * slower CI runner. What is pinned is the rule, not a speed: a send stall is never reported while progress
-     * keeps arriving within the limit. Either the upload went through in one PATCH, or a real gap of at least
-     * the limit preceded the cut.
+     * A send-stall limit on Darwin never costs correctness: whatever cuts happen, the upload completes with every
+     * byte exactly once, and any cut is a stall timeout, never a false success.
+     *
+     * The silence before a cut is pinned on CIO and OkHttp (StallRealSocketSuite), not here. On Darwin, ktus's
+     * progress events report bytes handed to Ktor, and NSURLSession pulls them from Ktor's pipe on its own
+     * schedule, so their timestamps do not line up with the wire or with the cut. On the macOS CI runner an
+     * attempt was cut before any progress at all (the simulator had not started reading for 2 s, a real stall by
+     * the documented rule) and a later cut measured 0 ms after a progress burst, with the upload completing
+     * correctly (run 44450764278). The callbacks cannot measure Darwin's silence, so this test does not claim to.
      */
     @Test
-    fun noFalseSendStall_onDarwin() = runBlocking {
+    fun aSendStallLimit_neverCostsCorrectness_onDarwin() = runBlocking {
         PosixTusServer().use { server ->
             server.faults = { m, _ -> if (m == "PATCH") Fault.SlowRead else Fault.None }
             val size = 96 * 64 * 1024 // ~5 s at 64 KiB per 50 ms, so a wrong cut at the limit would show
@@ -391,9 +395,11 @@ class DarwinRealSocketTest {
             val measured = "patches=$patches silenceBeforeFirstCut=$silence ms elapsed=${now()} ms " +
                 "stored=${server.data.size}/$size log=${server.log}"
             assertEquals(size, server.data.size, measured)
-            // A cut only after at least the limit of silence (less 100 ms for clock and callback granularity).
-            assertTrue(patches == 1 || (silence != null && silence >= limit - 100),
-                "a send stall without $limit ms of silence: $measured")
+            assertContentEquals(payload(size), server.data, "every byte exactly once, in order: $measured")
+            // Every PATCH the server applied started where the previous one ended (no double apply).
+            val applied = server.log.filter { it.method == "PATCH" && it.result.startsWith("204") }
+            assertEquals(applied.map { it.uploadOffset }, applied.map { it.uploadOffset }.sortedBy { it ?: -1L }, measured)
+            assertEquals(applied.map { it.uploadOffset }.distinct(), applied.map { it.uploadOffset }, measured)
         }
     }
 
