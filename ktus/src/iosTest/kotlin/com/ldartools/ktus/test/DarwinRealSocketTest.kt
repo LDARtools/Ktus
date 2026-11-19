@@ -358,47 +358,48 @@ class DarwinRealSocketTest {
     }
 
     /**
-     * Body progress comes in ~1 MiB steps (Ktor buffers about 1 MiB of the body; the same on CIO and OkHttp), so
-     * the gap between progress events is ~1 MiB ÷ the link speed: ~0.3-0.8 s on a Mac at ~1.3 MB/s, longer on a
-     * slower CI runner. What is pinned is the rule, not a speed: a send stall is never reported while progress
-     * keeps arriving within the limit. Either the upload went through in one PATCH, or a real gap of at least
-     * the limit preceded the cut.
+     * A send-stall limit on Darwin never costs correctness: whatever cuts happen, the upload completes with every
+     * byte exactly once, and any cut is a stall timeout, never a false success.
+     *
+     * The silence before a cut is pinned on CIO and OkHttp (StallRealSocketSuite), not here. On Darwin, ktus's
+     * progress events report bytes handed to Ktor, and NSURLSession pulls them from Ktor's pipe on its own
+     * schedule, so their timestamps do not line up with the wire or with the cut. On the macOS CI runner an
+     * attempt was cut before any progress at all (the simulator had not started reading for 2 s, a real stall by
+     * the documented rule) and a later cut measured 0 ms after a progress burst, with the upload completing
+     * correctly (run 44450764278). The callbacks cannot measure Darwin's silence, so this test does not claim to.
      */
     @Test
-    fun noFalseSendStall_onDarwin() = runBlocking {
+    fun aSendStallLimit_neverCostsCorrectness_onDarwin() = runBlocking {
         PosixTusServer().use { server ->
             server.faults = { m, _ -> if (m == "PATCH") Fault.SlowRead else Fault.None }
             val size = 96 * 64 * 1024 // ~5 s at 64 KiB per 50 ms, so a wrong cut at the limit would show
             val limit = 2_000L
             val clock = TimeSource.Monotonic.markNow()
-            // The largest gap between progress events up to the first event of the first retry (the gap that spans
-            // the cut); later gaps are disturbed by the abandoned body still occupying the server.
-            var last = 0L
-            var lastSent = -1L
-            var retried = false
-            var maxGap = 0L
+            // How long the first cut attempt had been silent when it was cut (its last progress to its end),
+            // excluding the recovery after it.
+            val probe = CutGapProbe()
+            fun now() = clock.elapsedNow().inWholeMilliseconds
             withTimeout(60_000) {
                 client().use {
                     it.createAndUploadTus("${server.baseUrl}/files", TrackingFile(payload(size)),
                         options = TusUploadOptions(chunkSize = size.toLong(), activityHeartbeatMillis = null,
                             sendStallMillis = limit, replyTimeoutMillis = 30_000, finalReplyTimeoutMillis = 30_000,
                             retryOptions = quickRetry()),
-                        onProgress = { sent, _ ->
-                            if (!retried) {
-                                val now = clock.elapsedNow().inWholeMilliseconds
-                                maxGap = maxOf(maxGap, now - last)
-                                if (sent < lastSent) retried = true
-                                last = now
-                                lastSent = sent
-                            }
-                        })
+                        onProgress = { sent, _ -> probe.progress(now(), sent) },
+                        onActivity = { probe.activity(now()) },
+                        onConfirmed = { _, _ -> probe.confirmed(now()) })
                 }
             }
             val patches = server.arrivals.count { it.first == "PATCH" }
-            val measured = "patches=$patches maxProgressGapUpToTheFirstRetry=$maxGap ms elapsed=${clock.elapsedNow().inWholeMilliseconds} ms " +
+            val silence = probe.silenceBeforeFirstCut()
+            val measured = "patches=$patches silenceBeforeFirstCut=$silence ms elapsed=${now()} ms " +
                 "stored=${server.data.size}/$size log=${server.log}"
             assertEquals(size, server.data.size, measured)
-            assertTrue(patches == 1 || maxGap >= limit, "a send stall without a progress gap of $limit ms: $measured")
+            assertContentEquals(payload(size), server.data, "every byte exactly once, in order: $measured")
+            // Every PATCH the server applied started where the previous one ended (no double apply).
+            val applied = server.log.filter { it.method == "PATCH" && it.result.startsWith("204") }
+            assertEquals(applied.map { it.uploadOffset }, applied.map { it.uploadOffset }.sortedBy { it ?: -1L }, measured)
+            assertEquals(applied.map { it.uploadOffset }.distinct(), applied.map { it.uploadOffset }, measured)
         }
     }
 

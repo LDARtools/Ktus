@@ -11,8 +11,11 @@ test fixes; there is no library code change.
 - The real-socket send-stall tests (`aBodyThatKeepsMovingSlowly_isOnlyCutAfterARealGap` on CIO and OkHttp)
   assumed a link speed. Body progress comes in ~1 MiB steps, so on a slower runner the gap between progress
   events can genuinely exceed the limit. They now pin the rule instead: either no cut, or a real progress gap of
-  at least the limit preceded the cut (measured up to the first retry). The same refinement applies to
-  `noFalseSendStall_onDarwin`. Assertion messages print the measured values.
+  at least the limit preceded the cut, measured from the cut attempt's last `onProgress` to the end of that
+  attempt (its outcome `onActivity`), so the recovery after the cut is not counted. On Darwin the callbacks
+  cannot measure that silence (NSURLSession pulls the body from Ktor's pipe on its own schedule), so
+  `aSendStallLimit_neverCostsCorrectness_onDarwin` pins correctness instead: every byte exactly once, no
+  double apply, no false success. Assertion messages print the measured values.
 - The CIO real-socket stall tests turn off CIO's own `requestTimeout` (15 s by default), which cut the slow
   body on a slower runner before any Ktus limit could; the README's engine-timeouts note now mentions it.
 - PR CI runs the JVM tests on macOS as well, as the publish workflow does.
