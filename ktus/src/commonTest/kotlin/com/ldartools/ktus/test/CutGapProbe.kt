@@ -7,7 +7,8 @@ package com.ldartools.ktus.test
  * Ktus calls `onActivity` when a request starts and when it gets its outcome (an answer or a failure, a cut
  * included), and on every body progress event just before `onProgress`. So the first `onActivity` after an
  * attempt's last `onProgress` is the end of that attempt. A PATCH that succeeded is followed IMMEDIATELY by
- * `onConfirmed` (Ktus calls nothing else between the 204 and it); a cut one is not: the next event is the
+ * `onConfirmed` (Ktus calls nothing else between the 204 and it; a late progress report from the engine,
+ * as NSURLSession can deliver, is skipped); a cut one is not: the next event is the
  * recovery HEAD's `onActivity`, even when that HEAD then shows more data (an abandoned PATCH the server still
  * applied) and fires its own `onConfirmed`. Attempt boundaries are therefore read from the callbacks, never
  * from the reported position, which a retry can repeat or exceed. Use with `activityHeartbeatMillis = null`,
@@ -47,9 +48,13 @@ class CutGapProbe {
                     j++
                 }
                 if (end < 0) return null
-                val succeeded = end + 1 < all.size && all[end + 1] is Event.Confirmed
+                // NSURLSession can report body progress AFTER the answer: skip (activity, progress) pairs that arrive
+                // after the end before looking for the 204's onConfirmed.
+                var k = end + 1
+                while (k + 1 < all.size && all[k] is Event.Activity && all[k + 1] is Event.Progress) k += 2
+                val succeeded = k < all.size && all[k] is Event.Confirmed
                 if (!succeeded) return all[end].atMillis - all[lastProgress].atMillis
-                i = end + 1
+                i = k + 1
             }
             return null
         }

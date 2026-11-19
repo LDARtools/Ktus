@@ -47,6 +47,21 @@ class CutGapProbeTest {
     }
 
     @Test
+    fun aLateProgressReportAfterTheAnswer_isNotACut() {
+        // NSURLSession can report body progress after the 204 has been received.
+        val events = attempt(0, 10L to 100, end = 50) + Activity(55) + Progress(55, 120) + Confirmed(56) +
+            attempt(60, 70L to 200, end = 90) + Confirmed(90)
+        assertNull(CutGapProbe.silenceBeforeFirstCut(events))
+    }
+
+    @Test
+    fun aLateProgressReportAfterACut_isStillACut() {
+        val events = attempt(0, 10L to 100, end = 2_510) + Activity(2_512) + Progress(2_512, 120) + head(2_520) +
+            attempt(2_530, 2_540L to 120, end = 2_600) + Confirmed(2_600)
+        assertEquals(2_500, CutGapProbe.silenceBeforeFirstCut(events))
+    }
+
+    @Test
     fun noCut_isNull() {
         val events = attempt(0, 10L to 100, end = 50) + Confirmed(50) + attempt(60, 70L to 200, end = 90) + Confirmed(90)
         assertNull(CutGapProbe.silenceBeforeFirstCut(events))
